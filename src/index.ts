@@ -4,8 +4,10 @@
 import { createRequire } from 'node:module';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { XianyuError } from './errors.ts';
 import { getSession } from './browser.ts';
-import { describe } from './errors.ts';
+import { executeTool, OUTPUT_SCHEMA } from './response.ts';
 import { TOOLS } from './tools.ts';
 
     // Read the handshake version from package.json to keep it in sync with releases. This path works
@@ -13,22 +15,27 @@ import { TOOLS } from './tools.ts';
 const { version } = createRequire(import.meta.url)('../package.json') as { version: string };
 
 const mcp = new McpServer({ name: 'xianyu', version }, {
-  instructions: 'Read-only access to Xianyu/Goofish with NO Xianyu account required. All ten tools -- capabilities, browse_feed, search_count, search_suggest, search_items, related_items, item_view, recommendations, seller_profile, seller_items -- work logged out. Search is a keystroke rather than a URL and is declined by goofish on some page loads, so search_items retries and refuses to return the recommendation rail as results; item_view and search_items read the calls the page makes for itself, which is the only way those two answer. The mtop-only tools run on their own page and do not queue behind a search. seller_profile and seller_items take either a seller id (one cheap mtop call) or a listing id, meaning the seller of that listing, which costs one page load and also yields their city, tenure and sales history. Call capabilities for the current verified picture.',
+  instructions: 'Read-only public Xianyu/Goofish tools; no account or login is required. Check ok and status on every response: empty is a confirmed answer, partial retains validated cards, and error has diagnostics and retry_after_s. Listings are in data.items; numeric fields are under typed. Every response names its build and implementation fingerprint. Use capabilities with probe:false for fast limits and build checks. Search filters run on fetched cards; inspect diagnostics and observation ages before relying on results.',
 });
 
 for (const t of TOOLS) {
-  mcp.registerTool(t.name, { description: t.description, inputSchema: t.schema }, async (args: any) => {
+  mcp.registerTool(t.name, { description: t.description, inputSchema: t.schema, outputSchema: OUTPUT_SCHEMA }, async (args: any) => {
     // DOM tools lock the shared navigating page in tools.ts. Mtop-only calls remain concurrent so a
     // slow search does not block feed requests.
-    let envelope: any;
-    try {
-      envelope = { ok: true, data: await t.run(args) };
-    } catch (e) {
-      envelope = { ok: false, ...describe(e) };
-    }
-    return { content: [{ type: 'text', text: JSON.stringify(envelope) }], structuredContent: envelope };
+    const envelope = await executeTool(t, args);
+    return { content: [{ type: 'text', text: JSON.stringify(envelope) }], structuredContent: envelope, isError: !envelope.ok };
   });
 }
+
+// The SDK's default validation errors contain only plain text. Route calls through the
+// same validator as execution errors so bad arguments also have the published schema.
+mcp.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const tool = TOOLS.find(t => t.name === request.params.name) ?? {
+    name: request.params.name, schema: {}, run: async () => { throw new XianyuError(`Unknown tool: ${request.params.name}`); },
+  };
+  const envelope = await executeTool(tool, request.params.arguments ?? {});
+  return { content: [{ type: 'text', text: JSON.stringify(envelope) }], structuredContent: envelope, isError: !envelope.ok };
+});
 
     // Warm the browser in the background so the first tool call does not pay the cold-load delay.
     // Session.warmUp uses a separate page and is intentionally not awaited.
@@ -45,7 +52,7 @@ let closing = false;
 const shutdown = (code: number): void => {
   if (closing) return;                 // a teardown is already running and will exit when it is done
   closing = true;
-  void getSession().close().catch(() => {}).finally(() => process.exit(code));
+  void getSession().shutdown().catch(() => {}).finally(() => process.exit(code));
 };
 transport.onclose = () => shutdown(0);
 // The stdio transport does not handle stdin's end event, so close the browser when the client exits.

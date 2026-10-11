@@ -15,6 +15,21 @@ From here on, each release gets a commit behind it and this file grows normally.
 The Python implementation this is a port of is not in this history at all: it lives on the
 `python-original` branch as a single commit (`cfe401d`, 2026-09-27).
 
+## [0.3.0] — Unreleased
+
+- Add a stable response schema, MCP error flags, structured diagnostics, retry hints, call deadlines
+  including queue time, and build fingerprints on every tool response.
+- Add price/location/title exclusions and conservative PCIe/SXM/bare-card filters to search. Normalize
+  CPU model punctuation and Xeon/至强 title matching; explain unmatched tokens and related categories.
+- Preserve partial search cards and opaque continuations, including cards omitted by small limits.
+  Report observation age and recheck filters after full detail reads.
+- Normalize numeric magnitudes and original prices/image counts on every listing route, including
+  seller cards; retain raw text and distinguish approximate, range and negotiable prices.
+- Start private Xvfb automatically when no display exists, and clean up in-flight launch on shutdown.
+- Reject malformed success payloads and unsafe inventory counts. Stop known throttles immediately,
+  enforce a visible process cooldown, and avoid redundant DOM polling of rejected API results.
+- Publish effective limits, cap seller pages at 20 cards, and shorten tool descriptions.
+
 ## [0.2.1] — 2026-10-08
 
 ### Added

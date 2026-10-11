@@ -73,7 +73,7 @@ test('a number the site dressed up is a number, and one that is not is null rath
   assert.equal(numberOrNull(null), null);
   assert.equal(numberOrNull(undefined), null);
   assert.equal(numberOrNull('面议'), null, 'a price nobody has agreed is not a number');
-  assert.equal(numberOrNull('1.2万'), null, 'a rounded approximation would be a fabricated price');
+  assert.equal(numberOrNull('1.2万'), 12000, 'normalize the displayed magnitude; price_info marks its precision');
   // the epoch is milliseconds on some payloads and seconds on others; the digit count decides
   assert.equal(isoOrNull('1784640276000'), '2026-07-21T13:24:36.000Z');
   assert.equal(isoOrNull('1784640276'), '2026-07-21T13:24:36.000Z');
@@ -100,12 +100,12 @@ test('the typed block reads a listing as types, and `missing` names every value 
   }, '42');
   assert.ok(full, 'the payload is a listing');
   assert.deepEqual(listingTyped(full), {
-    price_amount: 366, want_count: 1, view_count: 34, collect_count: 0, condition: '明显使用痕迹',
+    price_amount: 366, original_price_amount: null, image_count: null, want_count: 1, view_count: 34, collect_count: 0, condition: '明显使用痕迹',
     published_at: '2026-07-21T13:24:36.000Z', updated_at: '2026-07-21T13:36:39.000Z',
     location: { province: '浙江省', city: '台州' }, shipping: { fee: 0, free_shipping: true },
     seller_stats: { tenure_years: 6, items_sold: 369, positive_rate: 80, reply_rate_24h: 97, zhima_verified: true },
   });
-  assert.deepEqual(missingPaths(listingTyped(full)), [], 'the site rendered all of it');
+  assert.deepEqual(missingPaths(listingTyped(full)), ['original_price_amount', 'image_count'], 'no original price was supplied');
   // collect_count 0 above is the load-bearing case: nobody has favourited it, which is a fact the
   // site stated, and rounding it to null would report a missing number instead of a real one.
 
@@ -113,9 +113,9 @@ test('the typed block reads a listing as types, and `missing` names every value 
   // else is a null in the block and a name in the list -- never inferred from a sibling, because the
   // one thing this server will not do is publish a field it did not read.
   const card = enrichListing(FEED_NORMALIZE_JS({ rows: [{ cardData: { detailParams: { itemId: '111', title: 'A', soldPrice: '12.5', userNick: 'sellerA' }, attributeMap: { wantNum: 0, city: '杭州' } } }] })[0]);
-  assert.deepEqual(card.typed, { price_amount: 12.5, want_count: 0, view_count: null, collect_count: null, condition: null,
+  assert.deepEqual(card.typed, { price_amount: 12.5, original_price_amount: null, image_count: null, want_count: 0, view_count: null, collect_count: null, condition: null,
     published_at: null, updated_at: null, location: { province: null, city: '杭州' }, shipping: null, seller_stats: null });
-  assert.deepEqual(card.missing, ['view_count', 'collect_count', 'condition', 'published_at', 'updated_at', 'location.province', 'shipping', 'seller_stats']);
+  assert.deepEqual(card.missing, ['original_price_amount', 'image_count', 'view_count', 'collect_count', 'condition', 'published_at', 'updated_at', 'location.province', 'shipping', 'seller_stats']);
   assert.ok(card.missing.includes('location.province') && !card.missing.includes('location.city'),
     'the city was read, so only the province is absent -- the list is per-leaf, not per-object');
 

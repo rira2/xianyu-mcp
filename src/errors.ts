@@ -17,7 +17,10 @@
  * renders "nothing found" plus the 猜你喜欢 rail. So a declined search raises instead of returning
  * that rail, which would read as results and is not one.
  */
-export class XianyuError extends Error {}
+export class XianyuError extends Error {
+  details?: Record<string, any>;
+  partial?: Record<string, any>;
+}
 export class GatedError extends XianyuError {} export class SearchUnavailableError extends GatedError {} export class DetailUnavailableError extends GatedError {}
 export class BrowserError extends XianyuError {} export class ParseError extends XianyuError {} export class NavigationError extends XianyuError {}
 /** The complete set of `error_type` values this server can publish, so a caller matching on the name never sees anything else: a raw Playwright or TypeError from a path we did not guard, or a `String`/`Number`/`Object`/`Symbol` throw, is reported as `Error`. */

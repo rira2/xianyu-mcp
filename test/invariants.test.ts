@@ -38,7 +38,7 @@ test('no credential access anywhere in the tree', () => {
   // credential scan below has to be able to see them. `src/cache.ts` is in it for the same reason one
   // layer down: a module that holds what this server has read off goofish is exactly the module the
   // scans must cover, and a scan that quietly does not cover it is worse than no scan.
-  assert.deepEqual(sources.map((p) => p.replace(`${ROOT}/`, '')).sort(), ['src/browser.ts', 'src/build-info.ts', 'src/build.ts', 'src/cache.ts', 'src/errors.ts', 'src/extract.ts', 'src/index.ts', 'src/tools.ts', 'test/build-info.test.ts', 'test/cache.test.ts', 'test/check-deploy.test.ts', 'test/extract.test.ts', 'test/invariants.test.ts', 'test/serve.test.ts', 'test/tools.test.ts']);
+  assert.deepEqual(sources.map((p) => p.replace(`${ROOT}/`, '')).sort(), ['src/browser.ts', 'src/build-info.ts', 'src/build.ts', 'src/cache.ts', 'src/display.ts', 'src/errors.ts', 'src/extract.ts', 'src/index.ts', 'src/response.ts', 'src/runtime.ts', 'src/search-policy.ts', 'src/tools.ts', 'test/build-info.test.ts', 'test/cache.test.ts', 'test/check-deploy.test.ts', 'test/extract.test.ts', 'test/invariants.test.ts', 'test/response.test.ts', 'test/search-policy.test.ts', 'test/serve.test.ts', 'test/tools.test.ts']);
   // `.cookies(` rather than `context.cookies(`, and matched with the whitespace stripped: matching
   // the literal missed `page.context().cookies()` and any call split across lines.
   const forbidden = [
@@ -146,18 +146,18 @@ test('the detail fan-out is reachable only from inside the lock its caller alrea
   // shared lock. A second search, an `item_view` and a `recommendations` call therefore cannot be in
   // flight beside a fan-out, and the pool pages are invisible to every other tool. That property is
   // entirely about where this is called from, so it is asserted here rather than trusted: the fan-out
-  // has exactly one caller, that caller has exactly two call sites, and both are inside the tool that
+  // has exactly one caller, that caller has three call sites (live, cache and cursor), all inside the tool that
   // holds the lock.
   const toolsSrc = read(join(ROOT, 'src', 'tools.ts'));
   const fanout = toolsSrc.match(/const enrichDetails = [\s\S]*?\n};/)?.[0] ?? '';
   assert.match(fanout, /session\.fanoutSurface\(/, 'the fan-out leases its pages from the session');
   assert.equal((toolsSrc.match(/enrichDetails\(/g) ?? []).length, 1, 'exactly one call site');
-  assert.equal((toolsSrc.match(/publishSearch\(/g) ?? []).length, 2, 'and exactly two call sites for its publisher');
+  assert.equal((toolsSrc.match(/publishSearch\(/g) ?? []).length, 3, 'all three routes use its publisher');
   assert.equal((toolsSrc.match(/session\.fanoutSurface\(/g) ?? []).length, 1, 'so nothing else leases a pool page');
-  // both routes into a pooled answer -- the cache fast path and the live walk -- go through that one
+  // all routes into a pooled answer -- the cache fast path, cursor and live walk -- go through that one
   // publisher, so there is no way to reach the fan-out that skips the lock
   const search = toolsSrc.match(/const searchItems = async[\s\S]*?\n};/)?.[0] ?? '';
-  assert.equal((search.match(/publishSearch\(/g) ?? []).length, 2, 'both are inside search_items');
+  assert.equal((search.match(/publishSearch\(/g) ?? []).length, 3, 'all three are inside search_items');
   assert.match(toolsSrc, /run: locked\(searchItems\)/, 'and the tool that reaches it holds the shared lock');
   // The fallback is not a silent one: the fan-out either ran or says why it did not, and both are in
   // the envelope rather than in a comment above this function.
@@ -222,7 +222,7 @@ test('the published argument names and defaults are exactly these', () => {
     browse_feed: { page_number: 1, pages: 1, limit: 60 },
     search_count: { query: '<required>' },
     search_suggest: { query: '<required>', limit: 20 },
-    search_items: { query: '<required>', limit: 120, attempts: 4, pages: 1, detail: 0 },
+    search_items: { query: '<required>', limit: 120, attempts: 4, pages: 1, detail: 0, timeout_s: '<optional>', expand_synonyms: true, min_price: '<optional>', max_price: '<optional>', city: '<optional>', province: '<optional>', exclude_keywords: '<optional>', form_factor: '<optional>', bare_card_only: '<optional>', cursor: '<optional>' },
     related_items: { item_id: '<optional>', limit: 30, page: 1 },
     item_view: { item_id: '<required>' },
     recommendations: { limit: 30, url: '<optional>' },

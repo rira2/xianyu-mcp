@@ -1,6 +1,6 @@
 {
   "name": "xianyu-mcp",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Read-only Xianyu (Goofish) MCP server. No account, cookies, stored credentials, or write tools required.",
   "license": "Apache-2.0",
   "private": false,

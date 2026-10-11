@@ -56,7 +56,7 @@ export const SEARCH_MARK = 'data-xianyu-search';
  * rail back in.
  */
 export const queryTerms = (query: string): string[] => {
-  const q = String(query ?? '').toLowerCase().trim();
+  const q = String(query ?? '').normalize('NFKC').toLowerCase().trim();
   if (!q) return [];
   const CJK = '\\u3400-\\u9fff';
   // whitespace, and every CJK<->Latin boundary, so `i350网卡` splits into `i350` + `网卡`
@@ -80,8 +80,9 @@ export const queryTerms = (query: string): string[] => {
  * is an exact match, so the two rules only differ on multi-term ones.
  */
 export const hasAllTerms = (title: string, terms: string[]): boolean => {
-  const t = String(title ?? '').toLowerCase();
-  return terms.every((x) => t.includes(x));
+  const clean = (s: string) => String(s ?? '').normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+  const t = clean(title);
+  return terms.every((x) => t.includes(clean(x)));
 };
 /**
  * Search step 1: find the SPA's own input, mark it, focus it.
@@ -184,7 +185,7 @@ const firstText = (...vals: any[]): string => { for (const v of vals) { const s 
  * goofish reports a count of 0 both when it genuinely has none and when it has nothing to report, and
  * the two read the same, so a 0 is published as a number and a missing key as an empty string.
  */
-const countOf = (v: any): string => { const n = Number(v); return Number.isFinite(n) && n >= 0 ? String(Math.trunc(n)) : ''; };
+const countOf = (v: any): string => { if (v === null || v === undefined || String(v).trim() === '') return ''; const n = Number(v); return Number.isFinite(n) && n >= 0 ? String(Math.trunc(n)) : ''; };
 
     // Typed views of a listing. Everything above hands back the site's own strings, and those are what
     // the flat fields publish and every existing consumer reads; they are not retyped, because a field
@@ -192,6 +193,8 @@ const countOf = (v: any): string => { const n = Number(v); return Number.isFinit
     // the same values beside them: `366` next to `"366"`. Never called from inside an in-page script.
 export type ListingTyped = {
   price_amount: number | null;
+  original_price_amount: number | null;
+  image_count: number | null;
   want_count: number | null;
   view_count: number | null;
   collect_count: number | null;
@@ -203,7 +206,7 @@ export type ListingTyped = {
   seller_stats: { tenure_years: number | null; items_sold: number | null; positive_rate: number | null; reply_rate_24h: number | null; zhima_verified: boolean | null } | null;
 };
 /** A flat listing, the typed view of it, and the leaves of that view the site left out. */
-export type TypedListing<T> = T & { typed: ListingTyped; missing: string[] };
+export type TypedListing<T> = T & { price_info: PriceInfo; typed: ListingTyped; missing: string[] };
 
 /**
  * A number, or null. The site sends numbers as strings and decorates them -- `"1,299"`, `"¥9"`,
@@ -217,10 +220,28 @@ export type TypedListing<T> = T & { typed: ListingTyped; missing: string[] };
  */
 export const numberOrNull = (v: unknown): number | null => {
   if (v === null || v === undefined || v === '') return null;
-  const s = String(v).replace(/[,，\s¥￥%]/g, '');
-  if (!/^[+-]?(\d+(\.\d*)?|\.\d+)$/.test(s)) return null;
-  const n = Number(s);
+  const s = String(v).normalize('NFKC').replace(/[,，\s¥￥%]/g, '');
+  const match = s.match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))([万千亿kKmM]?)$/);
+  if (!match) return null;
+  const units: Record<string, number> = { '': 1, 千: 1000, 万: 10000, 亿: 100000000, k: 1000, m: 1000000 };
+  const n = Number(match[1]) * units[match[2].toLowerCase()];
   return Number.isFinite(n) ? n : null;
+};
+
+/** Only explicit amounts normalize; prose, deposits, and ambiguous offers stay unknown. */
+export type PriceInfo = { raw: string; currency: 'CNY'; kind: 'exact' | 'approximate' | 'range' | 'negotiable' | 'unknown'; amount: number | null; min_amount: number | null; max_amount: number | null };
+export const priceOf = (raw: unknown): PriceInfo => {
+  const text = asText(raw), clean = text.normalize('NFKC').replace(/(?:元|人民币|RMB|CNY)$/i, '').trim();
+  const amount = numberOrNull(clean);
+  const base = { raw: text, currency: 'CNY' as const, amount: null, min_amount: null, max_amount: null };
+  if (amount !== null && amount >= 0) return { ...base, kind: /[万千亿kKmM]/.test(clean) ? 'approximate' : 'exact', amount };
+  if (/^(面议|议价|negotiable)$/i.test(text)) return { ...base, kind: 'negotiable' };
+  const range = clean.match(/^([¥￥]?\s*\d[\d,.]*(?:万|千)?)\s*[-~～至]\s*([¥￥]?\s*\d[\d,.]*(?:万|千)?)$/);
+  if (range) {
+    const min = numberOrNull(range[1]), max = numberOrNull(range[2]);
+    if (min !== null && max !== null && min <= max) return { ...base, kind: 'range', min_amount: min, max_amount: max };
+  }
+  return { ...base, kind: 'unknown' };
 };
 
 /**
@@ -277,7 +298,9 @@ const shippingOf = (fee: unknown): ListingTyped['shipping'] => {
  * search card and a DOM-scraped card each hand it a different subset of the same names.
  */
 export const listingTyped = (row: any): ListingTyped => ({
-  price_amount: numberOrNull(row.price),
+  price_amount: priceOf(row.price).amount,
+  original_price_amount: priceOf(row.original_price).amount,
+  image_count: numberOrNull(row.image_count) ?? (Array.isArray(row.image_urls) && row.image_urls.length ? row.image_urls.length : null),
   want_count: numberOrNull(row.want_count),
   view_count: numberOrNull(row.browse_count),
   collect_count: numberOrNull(row.collect_count),
@@ -310,7 +333,7 @@ export const missingPaths = (typed: any, prefix = ''): string[] => {
  */
 export const enrichListing = <T extends Record<string, any>>(row: T): TypedListing<T> => {
   const typed = listingTyped(row);
-  return { ...row, typed, missing: missingPaths(typed) };
+  return { ...row, price_info: priceOf(row.price), typed, missing: missingPaths(typed) };
 };
 
 /**
@@ -766,7 +789,7 @@ export const ITEM_SCRAPE_JS = (spec: { item_id: string; rails: string[] }): any 
  * titles containing every query term in any order. Counts cover the whole page even when `items` is
  * limited. The selector table stays inside this function because Playwright serializes it on its own.
  * Reading `innerText` and querying the DOM does not require dismissing the login overlay. */
-export const SCRAPE_CARDS_JS = (spec: { query: string; terms: string[]; limit: number; rails: string[] }): any => {
+export const SCRAPE_CARDS_JS = (spec: { query: string; terms: string[]; groups?: string[][]; limit: number; rails: string[] }): any => {
   const { document } = globalThis as any;
   const clean = (v: any) => String(v ?? '').replace(/\s+/g, ' ').trim();
   const sel = { card: 'a[href*="/item?id="]', title: '[class*="row1-wrap-title"], [class*="main-title"]', attrs: '[class*="row2-wrap-cpv"] span[class*="cpv--"]', priceWrap: '[class*="price-wrap"]', priceNum: '[class*="number"]', priceDec: '[class*="decimal"]', sellerWrap: '[class*="row4-wrap-seller"]', sellerText: '[class*="seller-text"]' };
@@ -790,7 +813,9 @@ export const SCRAPE_CARDS_JS = (spec: { query: string; terms: string[]; limit: n
     // query as one phrase, or every term of it in any order. On this site the second is the one that
     // matches real listings, because sellers do not use the searcher's word order.
     const has_phrase = Boolean(q) && low.includes(q);
-    const has_terms = terms.length > 0 && terms.every((t: string) => low.includes(t));
+    const normalized = low.normalize('NFKC').replace(/[^\p{L}\p{N}]/gu, '');
+    const groups = spec.groups || terms.map((t: string) => [t]);
+    const has_terms = groups.length > 0 && groups.every((g: string[]) => g.some(t => normalized.includes(t.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, ''))));
     if (has_phrase) queryHits++;
     if (has_terms) tokenHits++;
     if (items.length >= spec.limit) continue;   // keep counting, stop collecting: the fraction needs the whole page

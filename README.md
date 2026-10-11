@@ -15,7 +15,8 @@ It drives its own throwaway Chromium with Playwright and reads goofish the way a
 browser does -- including calling goofish's own JS client (`window.lib.mtop.request`) rather than
 re-implementing token minting and request signing, which is the whole reason a browser is involved.
 
-It launches **windowed**, and needs a display (`DISPLAY=:0`, or Xvfb). That is a measurement, not a
+It launches **windowed**. On Linux, it starts a private Xvfb display automatically when no display
+is configured; a monitor and `DISPLAY=:0` are not required. That is a measurement, not a
 preference: [headless gets served goofish's risk-control page](#headless-vs-headed) instead of the app.
 It never clicks anything in the page, and [the login dialog is left alone on purpose](#the-login-dialog-is-left-alone-on-purpose).
 
@@ -24,7 +25,7 @@ It never clicks anything in the page, and [the login dialog is left alone on pur
 From a clone:
 
 ```bash
-npm install                      # deps: @modelcontextprotocol/sdk, zod
+npm ci                           # install the locked dependencies
 npx playwright install chromium  # or point XIANYU_BROWSER_PATH at a Chrome/Chromium binary
 ```
 
@@ -40,7 +41,10 @@ TypeScript types from files under `node_modules/`, so shipping `src/*.ts` would 
 fail on first run.
 
 Requires **Node 22.18+** (the server runs TypeScript directly, natively). It launches a windowed
-Chromium, so it needs a display -- on a headless box, `xvfb-run -a node src/index.ts` or an X server.
+Chromium. On a Linux server install Xvfb (`sudo apt-get install -y xvfb`); the server starts it
+automatically and stops its private display on shutdown. An explicit recipe is
+`xvfb-run -a node src/index.ts`. To use an existing display, set `XIANYU_DISPLAY=:99` or `DISPLAY=:99`.
+Use `XIANYU_XVFB_PATH` when Xvfb is installed outside PATH. These are stdio commands for an MCP client.
 See [Headless vs headed](#headless-vs-headed) for what `XIANYU_HEADLESS=1` costs you.
 
 ## MCP client config
@@ -89,7 +93,10 @@ full answer, base ref and fetch included, is what it runs when it has to rebuild
 | Env var | Default | Purpose |
 |---|---|---|
 | `XIANYU_BROWSER_PATH` | Playwright's Chromium | use a specific Chrome/Chromium binary |
-| `XIANYU_HEADLESS` | `0` (windowed) | `1` runs headless. Headed is the default because goofish serves headless Chromium its risk-control page instead of the app -- see [Headless vs headed](#headless-vs-headed). Needs a display (`DISPLAY=:0`, or Xvfb). |
+| `XIANYU_HEADLESS` | `0` (windowed) | `1` runs headless. Headed is the default because goofish serves headless Chromium its risk-control page instead of the app -- see [Headless vs headed](#headless-vs-headed). Uses an existing display or automatically starts Xvfb. |
+| `XIANYU_DISPLAY` | `DISPLAY`, then automatic Xvfb | explicit display override |
+| `XIANYU_XVFB_PATH` | `Xvfb` on PATH | virtual display executable |
+| `XIANYU_CALL_TIMEOUT_S` | 90 (longer for requested search detail) | default total call deadline, 1–600s; `search_items.timeout_s` overrides it |
 | `XIANYU_SEARCH_BUDGET_S` | 90 | wall-clock budget for the `search_items` retry loop (5–600s) |
 | `XIANYU_ITEM_VIEW_BUDGET_S` | 90 | wall-clock budget for the `item_view` retry loop (5–600s) |
 | `XIANYU_RECOMMENDATIONS_BUDGET_S` | 45 | wall-clock budget for the `recommendations` retry loop (5–600s) |
@@ -100,9 +107,10 @@ full answer, base ref and fetch included, is what it runs when it has to rebuild
 | `XIANYU_CACHE_ITEM_TTL_S` | 45 | how long a listing read in full may be served again (1–600) |
 | `XIANYU_CACHE_SEARCH_TTL_S` | 120 | how long one page of search results may be served again (1–600) |
 
-The budget bounds the *loop*, not the call. It is checked between attempts, so a page load already in
-flight runs to completion: at the 90s default and a 10–25s load you get several attempts, and a call
-can overshoot its budget by roughly one page load.
+Each MCP call now has a total deadline, including time in the DOM queue. `search_items.timeout_s`
+overrides the default; browser waits and navigation are capped by the remaining time. Expired work
+cannot start another page load. Response scheduling and serialization can add a small overhead.
+Validated cards survive a deadline as partial results. The environment budgets still control retry loops.
 
 The server runs windowed and needs a display. goofish serves headless Chromium its risk-control
 page instead of the app, which leaves the three DOM tools with nothing to read, so headed is the
@@ -110,7 +118,24 @@ default and a headless machine needs `xvfb-run` or an X server. The mtop-only to
 
 ## Tools
 
-Every tool returns `{"ok": true, "data": …}` or `{"ok": false, "error_type": …, "message": …}`.
+Every response has `schema_version: 2`, `ok`, `status`, `count`, `data`, `error_type`, `message`,
+`diagnostics`, `retryable`, `retry_after_s`, `elapsed_ms`, and `build`. `build` includes the version,
+commit, dirty state, TypeScript implementation identity and a fingerprint of the loaded modules.
+The result appears in both MCP text content and `structuredContent`; failures set MCP `isError: true`.
+
+- `success`: a completed response. Listings are in `data.items`.
+- `empty`: confirmed zero returned rows, including cards removed by explicit filters. Inspect
+  `data.empty_reason` and `data.filters`; this does not necessarily mean zero upstream inventory.
+- `partial`: validated cards survived a later failure or deadline. Inspect `data.stop_reason`,
+  `data.next_cursor`, page reports, and retry hints.
+- `error`: no validated result set is available. `data` is null, `count` is 0, and the error and
+  diagnostics identify the failure. **Check status before interpreting count as inventory.**
+
+`count` counts returned cards or suggestions (0 for non-collection tools); keyword inventory is
+`search_count.data.match_count`. A positive inventory estimate can coexist with an unavailable search.
+Missing lists and malformed payloads are errors. Only an explicit empty search reply confirmed by a
+zero inventory count becomes a successful upstream empty search.
+
 `error_type` is the class name, and the list is exhaustive: `BrowserError`, `GatedError`,
 `SearchUnavailableError`, `DetailUnavailableError`, `ParseError`, `NavigationError` or `XianyuError`,
 plus `Error` for a throw that is none of ours (a test pins the list against the classes in `errors.ts`).
@@ -125,6 +150,62 @@ their own data.
 | `search_suggest` | `query`, `limit` (d20) | `suggestions[]` of `text, bucket_num`, `total_count`, `count`, `source: search_suggest` |
 | `seller_profile` | `user_id` **or** `item_id` (exactly one) | `display_name, avatar_url, signature, seller_credit, buyer_credit, level, level_score, praise_ratio, review_count, listings_count, ratings_count, followers, following, verified_real_name, verified_real_person, verified_zhima`, plus `city, tenure_years, items_sold, items_listed, positive_rate, reply_rate_24h, last_active` **only when given an `item_id`**, `profile_url`, `item_id`, `fields_present` / `fields_missing`, and `source`: **`idle_user_page_head`** (given a `user_id`, one mtop call, no page load) or **`item_detail+idle_user_page_head`** (given an `item_id`, one item page load). A seller that does not exist raises `DetailUnavailableError`; a throttle raises `GatedError`. See [seller tools](#the-two-seller-tools). |
 | `seller_items` | `user_id` **or** `item_id` (exactly one), `limit` (d20), `page` (1–50, d1) | `items[]` of `rank, item_id, title, price, category_id, want_count, tags, image_urls, url`, `has_more` (from goofish's own `nextPage` -- walk `page`, do not assume 20), `raw_cards`, `count`, `profile_url`, `source: idle_xyh_item_list`. An empty shop and a page past the end are both `count: 0`, not an error; a payload carrying none of the endpoint's own keys is a `ParseError`. goofish serves at most 50 pages of 20, so walk `has_more` rather than asking for a page number up front. |
+
+## Search controls
+
+```json
+{
+  "query": "P100",
+  "pages": 3,
+  "limit": 60,
+  "timeout_s": 30,
+  "min_price": 300,
+  "max_price": 2000,
+  "city": "北京",
+  "exclude_keywords": ["散热", "转接", "线"],
+  "form_factor": "pcie",
+  "bare_card_only": true
+}
+```
+
+These filters run in the server **after fetching cards**; no verified Goofish upstream filtering API
+is available for this workflow. Unknown facts fail a requested filter. `bare_card_only` requires
+explicit “裸卡/单卡/bare card/card only” title evidence and excludes accessory titles. Form factors
+come from explicit PCIe/SXM2–SXM5 title text; conflicting or absent evidence stays unknown. Verify
+photos before buying. City/province filters accept standard suffix differences such as 北京/北京市.
+
+Title matching ignores spacing, punctuation and case, so `E5-2680v4` matches `E5-2680 v4`.
+`Xeon`/`至强` are equivalent in title matching (`expand_synonyms:false` disables that expansion).
+The query sent to Goofish remains the requested string. `diagnostics.tokens` reports alternatives
+and title match counts; `unmatched_tokens` names misses. 服务器/工控 and 显卡/计算卡 are related-query
+suggestions, not automatic equivalents. The relevance guard still refuses recommendation rails.
+
+Continue with `{"query":"P100","cursor":"<next_cursor>","timeout_s":30}`. The opaque cursor
+preserves filters, limit, page depth and detail settings, plus matches omitted by a small limit.
+It resumes at the first unread page after those saved cards are returned. Cursors survive for up to
+10 minutes in the same process (64 stored continuations); restart or eviction invalidates them.
+Repeated use of a token repeats that continuation, so deduplicate by `item_id`. A null cursor means
+there is no continuation available within this server’s page cap; it does not prove the whole site
+was exhausted. DOM-only fallback results currently have no continuation.
+
+`freshness.oldest_observation_age_s` and per-page cache ages measure **when this server read cards**.
+`price_last_changed_at` remains null because the seller’s last price change is unknown. Raw numeric
+strings remain compatible; consume `typed.price_amount`, `typed.original_price_amount`,
+`typed.image_count`, `typed.want_count`, and `typed.shipping.fee`. `price_info` distinguishes exact,
+approximate (e.g. 1.2万 → 12000), range, negotiable and unknown prices. Prose such as deposits is
+never guessed into a price. Range/negotiable/unknown prices fail a numeric price-band filter.
+
+Observed rate-limit or risk-control failures recommend an initial 60-second pause and establish a
+process-wide cooldown; another measured failure after cooldown increases it, capped at 300 seconds.
+No blind sleeps occur inside a tool call. Static `capabilities(probe:false)` remains available.
+This process cannot measure other clients sharing its public IP.
+
+`capabilities(probe:false).data.limits` reports effective ceilings. Search allows at most 300 cards,
+further capped by `XIANYU_SEARCH_MAX_ITEMS`; seller pages contain at most 20 cards and accept
+`limit <= 20`. Use `has_more` and `page` for seller pagination. Full seller sales/trust data is not
+present on every card; shortlist with `detail` or use `seller_profile` rather than treating null as zero.
+
+See [the issue audit](docs/issue-audit.md) for the scope and remaining limitations.
 
 ## The two seller tools
 
@@ -498,9 +579,10 @@ input of the page already showing results, which is an SPA route change, 13–15
 load. `item_view` reads the call the page makes for itself, which is both the only route that works and
 far cheaper than the reload-and-retry loop it replaced.
 
-The budget bounds the *loop*, not the call. It is checked between attempts, so a page load already in
-flight runs to completion: at the 90s default and a 10–25s load you get several attempts, and a call
-can overshoot its budget by roughly one page load. At that default `attempts: 4` is reachable without
+Each MCP call now has a total deadline, including time in the DOM queue. `search_items.timeout_s`
+overrides the default; browser waits and navigation are capped by the remaining time. Expired work
+cannot start another page load. Response scheduling and serialization can add a small overhead.
+Validated cards survive a deadline as partial results. The environment budgets still control retry loops. At that default `attempts: 4` is reachable without
 raising anything. Note that raising the budget alone does not help when the site is declining every
 load: a 280s budget with the default 4 attempts still stopped at 90s on the attempt cap, and 200s of
 continuous polling on one page load never produced a result.
@@ -643,7 +725,7 @@ page -- named as `site_error`, and retried rather than waited on.
 ## Development
 
 ```bash
-npm test                 # 141 tests, no network, no browser
+npm test                 # offline unit, protocol-contract and regression tests
 npm run typecheck        # tsc --noEmit over src and test
 npm run build            # src/*.ts -> dist/*.js, what the tarball ships
 npm run serve            # dist/index.js, rebuilt first if it is not the build of this checkout

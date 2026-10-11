@@ -27,6 +27,8 @@
  */
 import type { Browser, BrowserContext, Page } from 'playwright';
 import { BrowserError, NavigationError } from './errors.ts';
+import { acquireDisplay, stopDisplay } from './display.ts';
+import { checkpoint, remainingMs } from './runtime.ts';
 import { MTOP_CALL_JS, MTOP_READY_JS } from './extract.ts';
 const ALLOWED_HOSTS = ['www.goofish.com', 'goofish.com'];
 
@@ -102,6 +104,7 @@ export class MtopTap {
   }
   /** The next unhanded reply for `api`, or wait up to `timeoutMs` for one. null means none came. */
   async take(api: string, timeoutMs: number): Promise<MtopReply | null> {
+    timeoutMs = remainingMs(timeoutMs);
     const pending = this.replies.get(api) ?? [];
     if (pending.length) return pending.shift()!;
     if (!(timeoutMs > 0)) return null;
@@ -137,7 +140,8 @@ let queue: Promise<unknown> = Promise.resolve();
 /** Serialize DOM tools that share the navigating page. Mtop-only tools use `apiPage` and do not
  * take this lock. */
 export function exclusive<T>(fn: () => Promise<T>): Promise<T> {
-  const run = queue.then(fn, fn);
+  const checked = () => { checkpoint(); return fn(); };
+  const run = queue.then(checked, checked);
   queue = run.then(() => {}, () => {});
   return run;
 }
@@ -154,7 +158,7 @@ async function race<T>(p: Promise<T>, ms: number): Promise<T> {
 export async function evaluate<T = any>(page: Page, fn: any, arg?: any, what = 'in-page script', timeoutS = EVALUATE_TIMEOUT_S): Promise<T> {
   let last: any;
   for (let attempt = 0; attempt < 2; attempt++) {
-    try { return await race<T>(page.evaluate(fn, arg), timeoutS * 1000); }
+    try { checkpoint(); return await race<T>(page.evaluate(fn, arg), remainingMs(timeoutS * 1000)); }
     catch (e) {
       last = e;
       if (attempt || !TRANSIENT.some((m) => String(last).toLowerCase().includes(m))) break;
@@ -168,11 +172,14 @@ export async function evaluate<T = any>(page: Page, fn: any, arg?: any, what = '
 }
 
 export async function settle(page: Page, ms: number): Promise<void> {
-  try { await page.waitForTimeout(ms); } catch (e) { throw new BrowserError(`the browser went away while waiting: ${e}`); }
+  checkpoint();
+  try { await page.waitForTimeout(remainingMs(ms)); } catch (e) { throw new BrowserError(`the browser went away while waiting: ${e}`); }
+  checkpoint();
 }
 /** The only place a URL we chose is loaded from. */
 async function load(page: Page, url: string, timeoutMs = NAV_TIMEOUT_MS): Promise<void> {
-  try { await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs }); }
+  checkpoint();
+  try { await page.goto(url, { waitUntil: 'domcontentloaded', timeout: remainingMs(timeoutMs) }); }
   catch (e) { throw new BrowserError(`could not load ${url}: ${e}`); }
 }
 
@@ -308,11 +315,16 @@ export class Session {
   }
 
   private async launch(): Promise<void> {
+    checkpoint();
+    const display = process.env.XIANYU_HEADLESS === '1' ? '' : await acquireDisplay();
+    if (this.stopping) { stopDisplay(); throw new BrowserError('Server is shutting down'); }
     // Windowed by default, and that is a measurement: headed gets goofish's real app, headless gets the
     // same URL served as the risk-control page ("非法访问 ... 请使用正常浏览器访问闲鱼") with zero cards and 35 bytes
     // of text for as long as you watch. So the three DOM tools need a display; the mtop-only tools do
     // not, because the page's own client boots on the risk-control page too. XIANYU_HEADLESS=1 opts in.
     const opts = { headless: process.env.XIANYU_HEADLESS !== '1',
+      ...(display ? { env: { ...process.env, DISPLAY: display } as Record<string, string> } : {}),
+      timeout: remainingMs(30_000),
       ...(process.env.XIANYU_BROWSER_PATH ? { executablePath: process.env.XIANYU_BROWSER_PATH } : {}),
       args: ['--no-sandbox', '--disable-blink-features=AutomationControlled', '--no-first-run', '--no-default-browser-check', '--disable-gpu'] };
     // Playwright is imported here rather than at module scope: it is the heaviest thing this server
@@ -324,6 +336,7 @@ export class Session {
     catch (e) { throw new BrowserError(`playwright could not be loaded: ${e}\n${LAUNCH_HINT}`); }
     try { this.browser = await chromium.launch(opts); }
     catch (e) { await this.close(); throw new BrowserError(`could not launch Chromium: ${e}\n${LAUNCH_HINT}`); }
+    if (this.stopping) { await this.close(); throw new BrowserError('Server is shutting down'); }
     try {   // a brand-new context every time: no profile directory, nothing persisted
       this.context = await this.browser!.newContext({
         locale: 'zh-CN', timezoneId: 'Asia/Shanghai', viewport: { width: 1440, height: 900 },
@@ -346,7 +359,7 @@ export class Session {
    *  orphaned browser processes per session, invisible to a client that had already exited. */
   async close(): Promise<void> {
     const context = this.context, browser = this.browser;
-    if (!browser) { this.context = this.browser = this.apiPage = this.domPage = null; this.apiTap.clear(); this.domTap.clear(); this.pool.length = 0; return; }
+    if (!browser) { this.context = this.browser = this.apiPage = this.domPage = null; this.apiTap.clear(); this.domTap.clear(); this.pool.length = 0; stopDisplay(); return; }
     this.context = this.browser = this.apiPage = this.domPage = null;
     this.apiTap.clear(); this.domTap.clear(); this.pool.length = 0;   // the handles are dead with the context, and keeping them would hand a dead page to the next fan-out
     await Promise.race([
@@ -356,6 +369,16 @@ export class Session {
     // the captured handle, not `this.browser`: it was nulled above so a concurrent caller cannot get
     // a page off a context that is being closed, and that same nulling would leave nothing to kill
     killProcessOf(browser);
+    stopDisplay();
+  }
+
+  private stopping = false;
+  /** A client can disconnect while launch is in flight. Wait for that handle before
+   * closing, so a late Chromium cannot appear after the shutdown already completed. */
+  async shutdown(): Promise<void> {
+    this.stopping = true;
+    await this.booting?.catch(() => {});
+    await this.close();
   }
 
   /** The browser's own process, or null. Playwright types `process()` off `BrowserServer` rather than a
@@ -367,7 +390,7 @@ export class Session {
   /** SIGKILL the browser, synchronously. Covers the two cases `await close()` cannot: a teardown that
    *  was cut short, and an `exit` handler, where the event loop has already stopped. Tolerates a
    *  browser that is already gone, because throwing on the way out of a process helps nobody. */
-  killBrowser(): void { if (this.browser) killProcessOf(this.browser); }
+  killBrowser(): void { if (this.browser) killProcessOf(this.browser); stopDisplay(); }
 
   /** Make sure there is a live browser, launching it at most once however many tools arrive at once.
    *  Two callers used to race here: both saw no page, both closed and relaunched, and the second
@@ -375,6 +398,8 @@ export class Session {
    *  no longer queue behind the DOM tools, so they really do arrive together. */
   private booting: Promise<void> | null = null;
   private async ensureLaunched(): Promise<void> {
+    checkpoint();
+    if (this.stopping) throw new BrowserError('Server is shutting down');
     // A live page is proof enough that the browser is alive. Treating a missing `Browser` handle as
     // death instead would relaunch on every call that runs before the first launch finishes -- and,
     // worse, the second of two overlapping launches closes the browser the first one is using.

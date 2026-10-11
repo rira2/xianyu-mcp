@@ -13,10 +13,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { BOOT_URL, DETAIL_POOL_MAX, exclusive, HOME, reloadFresh, Session, setSession } from '../src/browser.ts';
 import { BrowserError, DetailUnavailableError, GatedError, NavigationError, ParseError, SearchUnavailableError, XianyuError } from '../src/errors.ts';
-import { FEED_NORMALIZE_JS, ITEM_SCRAPE_JS, MTOP_READY_JS, PAGER_CLICK_JS, SCRAPE_CARDS_JS, SEARCH_INPUT_JS, SEARCH_STATE_JS } from '../src/extract.ts';
+import { FEED_NORMALIZE_JS, ITEM_SCRAPE_JS, MTOP_READY_JS, PAGER_CLICK_JS, PAGER_STATE_JS, SCRAPE_CARDS_JS, SEARCH_INPUT_JS, SEARCH_STATE_JS } from '../src/extract.ts';
 import { budget, fanoutSize, ITEM_FIELDS, resetCardCache, TOOLS } from '../src/tools.ts';
 import { reset as resetCaches } from '../src/cache.ts';
 import { z } from 'zod';
+import { executeTool, resetCooldown } from '../src/response.ts';
+import { putSearchPage } from '../src/cache.ts';
 
 const run = (name: string) => {
   const t = TOOLS.find((x) => x.name === name);
@@ -68,7 +70,8 @@ const makeSession = (payloads: { cards?: any[]; item?: any[]; scrape?: any[]; se
       if (fn === SEARCH_INPUT_JS) return search.mounted
         ? { found: true, focused: true, value: search.value, inputs: 1, chars: 1200, path: '/' }
         : { found: false, inputs: 0, chars: 512, path: '/', value: '' };
-      if (fn === PAGER_CLICK_JS) { s.pagers.push(String(arg.page)); return { ok: s.max_page >= Number(arg.page), on_page: arg.page }; }
+      if (fn === PAGER_STATE_JS) return { on_page: s.on_page };
+      if (fn === PAGER_CLICK_JS) { s.pagers.push(String(arg.page)); if (s.max_page >= Number(arg.page)) s.on_page = String(arg.page); return { ok: s.max_page >= Number(arg.page), on_page: arg.page }; }
       // The real normaliser, on the rows the tool actually passed. A canned queue cannot express this:
       // how many cards come out of the pool depends on how many pages were walked, which is the thing
       // under test.
@@ -83,7 +86,7 @@ const makeSession = (payloads: { cards?: any[]; item?: any[]; scrape?: any[]; se
     },
   };
   const s: any = {
-    launches: 0, opened: [] as string[], specs: [] as any[][], raw, search, pagers: [] as string[], max_page: 99, runRealNormalizer: false,
+    launches: 0, opened: [] as string[], specs: [] as any[][], raw, search, pagers: [] as string[], max_page: 99, on_page: '1', runRealNormalizer: false,
     ensureReady: async () => page,
     domReady: async () => page,
     // The dom page is a separate page from the api page, so the four mtop-only tools never wait on a
@@ -134,7 +137,7 @@ const poolPage = (ms: number) => {
 
 /** A `mtop.taobao.idle.pc.detail` reply for one listing, in the shape the page's own call returns --
  *  which is the shape the pool's tap answers about whatever that page was asked to load. */
-const detailReply = (id: string) => ok({ itemDO: { itemId: id, title: `详情 ${id}`, soldPrice: '123', wantCnt: 4, browseCnt: 900, desc: '成色好，功能正常' }, sellerDO: { nick: '卖家', city: '北京', hasSoldNumInteger: 12, userRegDay: 730, newGoodRatioRate: '99%' } });
+const detailReply = (id: string) => ok({ itemDO: { itemId: id, title: `联想 X220 详情 ${id}`, soldPrice: '123', wantCnt: 4, browseCnt: 900, desc: '成色好，功能正常' }, sellerDO: { nick: '卖家', city: '北京', hasSoldNumInteger: 12, userRegDay: 730, newGoodRatioRate: '99%' } });
 
 /**
  * A Page fake for the *real* Session, which does touch everything on this object: url, goto,
@@ -458,7 +461,8 @@ test('a wall-clock budget stops search_items instead of letting it hold the call
     // between the two words -- an assertion about message layout, not about the budget stopping it.
     assert.match(e.message, /\b1 attempt\(s\)/);
     assert.match(e.message, /in \d+s/);
-    assert.match(e.message, /stopped on: time budget reached/);
+    assert.equal(e.details!.reason, 'timeout');
+    assert.ok(e.details!.attempt_log.some((entry: any) => entry.stopped === 'time budget reached'));
     return true;
   });
   assert.equal(s.opened.length, 1, 'it stopped on the clock, not on the attempt count');
@@ -518,12 +522,12 @@ test('item_view answers from the page\'s own detail reply, with the fields the D
   assert.deepEqual(Object.entries(out.attributes).map(([k, v]) => `${k}=${v}`), ['品牌=Toua/腾亚', '成色=明显使用痕迹', '已用年限=1年(含)-3年(不含)']);
   // and the same listing as types, beside those strings rather than instead of them
   assert.deepEqual(out.typed, {
-    price_amount: 366, want_count: 1, view_count: 34, collect_count: 2, condition: '明显使用痕迹',
+    price_amount: 366, original_price_amount: null, image_count: 2, want_count: 1, view_count: 34, collect_count: 2, condition: '明显使用痕迹',
     published_at: null, updated_at: null, location: { province: null, city: '台州' },
     shipping: { fee: 0, free_shipping: true },
     seller_stats: { tenure_years: 6, items_sold: 369, positive_rate: 80, reply_rate_24h: 97, zhima_verified: true },
   });
-  assert.deepEqual(out.missing, ['published_at', 'updated_at', 'location.province'],
+  assert.deepEqual(out.missing, ['original_price_amount', 'published_at', 'updated_at', 'location.province'],
     'the three the payload genuinely has no value for, and nothing else');
   assert.equal(out.price, '366', 'the flat field is still the string every existing caller reads');
   // the page was still loaded: that is where the call comes from
@@ -536,12 +540,12 @@ test('every listing route publishes the same typed block, and names what its own
   // only the values differ, which is the honest difference between what goofish told us.
   const feed = use(makeSession({ cards: [listed(['1', '2'])] }, { p1: cards(['1', '2']) }));
   const fromFeed = (await run('browse_feed')({ page_number: 1, pages: 1 })).items[0];
-  assert.deepEqual(Object.keys(fromFeed.typed), ['price_amount', 'want_count', 'view_count', 'collect_count', 'condition', 'published_at', 'updated_at', 'location', 'shipping', 'seller_stats']);
-  assert.deepEqual(fromFeed.typed, { price_amount: 5, want_count: 1, view_count: null, collect_count: null, condition: null,
+  assert.deepEqual(Object.keys(fromFeed.typed), ['price_amount', 'original_price_amount', 'image_count', 'want_count', 'view_count', 'collect_count', 'condition', 'published_at', 'updated_at', 'location', 'shipping', 'seller_stats']);
+  assert.deepEqual(fromFeed.typed, { price_amount: 5, original_price_amount: null, image_count: null, want_count: 1, view_count: null, collect_count: null, condition: null,
     published_at: null, updated_at: null, location: { province: null, city: '杭州' }, shipping: null, seller_stats: null });
   // a homepage feed card names no province and quotes no fee; saying so by name is the answer, and
   // guessing either from the city or from the tag strip would be a fact this server never read
-  assert.deepEqual(fromFeed.missing, ['view_count', 'collect_count', 'condition', 'published_at', 'updated_at', 'location.province', 'shipping', 'seller_stats']);
+  assert.deepEqual(fromFeed.missing, ['original_price_amount', 'image_count', 'view_count', 'collect_count', 'condition', 'published_at', 'updated_at', 'location.province', 'shipping', 'seller_stats']);
   assert.equal(fromFeed.price, '5', 'and the string fields are exactly what they were before the block existed');
 
   use(makeSession({ item: [RENDERED] }));
@@ -550,10 +554,10 @@ test('every listing route publishes the same typed block, and names what its own
   // The rendered item page prints a title, a price, the counts and the seller, and no epoch, no
   // province and no fee. So most of the block is null here, and `missing` says which -- which is a
   // more useful answer than the thinner listing this used to publish.
-  assert.deepEqual(fromDom.typed, { price_amount: 1999, want_count: 2, view_count: 110, collect_count: null, condition: null,
+  assert.deepEqual(fromDom.typed, { price_amount: 1999, original_price_amount: null, image_count: 1, want_count: 2, view_count: 110, collect_count: null, condition: null,
     published_at: null, updated_at: null, location: null, shipping: null,
     seller_stats: { tenure_years: 4, items_sold: 27, positive_rate: 100, reply_rate_24h: null, zhima_verified: null } });
-  assert.deepEqual(fromDom.missing, ['collect_count', 'condition', 'published_at', 'updated_at', 'location', 'shipping', 'seller_stats.reply_rate_24h', 'seller_stats.zhima_verified']);
+  assert.deepEqual(fromDom.missing, ['original_price_amount', 'collect_count', 'condition', 'published_at', 'updated_at', 'location', 'shipping', 'seller_stats.reply_rate_24h', 'seller_stats.zhima_verified']);
   // ... and the pre-existing honesty contract is untouched by any of it
   assert.deepEqual(fromDom.fields_missing, []);
   assert.deepEqual(fromDom.fields_present.length, ITEM_FIELDS.length);
@@ -677,7 +681,7 @@ test('item_view reads the page for a listing a search already returned, and fall
   // carries are null here and named. `want_count` is in the list even though the card held one --
   // that route blanks the card fields it cannot vouch for, and `missing` is where that shows up
   // rather than being quietly indistinguishable from "the site sent none".
-  assert.deepEqual(fallback.missing, ['want_count', 'view_count', 'collect_count', 'condition', 'published_at', 'updated_at', 'location.province', 'shipping', 'seller_stats']);
+  assert.deepEqual(fallback.missing, ['original_price_amount', 'want_count', 'view_count', 'collect_count', 'condition', 'published_at', 'updated_at', 'location.province', 'shipping', 'seller_stats']);
   assert.equal(fallback.typed.want_count, null, 'blanked on this route, and named as such');
   assert.equal(fallback.typed.price_amount, 329, 'but the price the card does carry is still typed');
   assert.equal(fallback.typed.location?.city, '北京', 'and the city the search reply gave it');
@@ -703,7 +707,7 @@ test('search_items answers from the page\'s own search reply, and holds it to th
 
 test('search_items refuses a search reply that is really the recommendation rail', async () => {
   // A declined anonymous search answers SUCCESS with 30 recommendations and no matches. A `hits > 0`
-  // test would pass that; a fraction over the whole reply does not, and the DOM fallback still runs.
+  // test would pass that; a fraction over the whole reply does not. A known rejected API set is retried without another DOM poll.
   const cards = Array.from({ length: 30 }, (_, i) => [`推荐商品 ${i}`, String(1000 + i), '5', '北京', '0']);
   const c = searchCase('thinkpad x220', cards);
   use(makeSession({ cards: [c.rows], scrape: [{ items: [], cards_scanned: 0, rendered: false, rail: '猜你喜欢' }], mtop: c.mtop }));
@@ -861,10 +865,11 @@ test('the deeper walk stops at XIANYU_SEARCH_MAX_ITEMS, and the rail is still ne
   // The cap does not weaken the relevance guard: a search reply that is really the recommendation
   // rail is still refused as results, end to end, through the same walk.
   delete process.env.XIANYU_SEARCH_MAX_ITEMS;
+  resetCaches();
   const railReply = ok(searchReply('x220', Array.from({ length: 30 }, (_, i) => [`推荐商品 ${i}`, String(2000 + i), '5', '北京', '0'])));
   const railDom = { rendered: true, query_hits: 0, cards_scanned: 40, rail: '猜你喜欢', says_no_results: true, text_preview: '猜你喜欢', items: [] };
   use(makeSession({ scrape: [railDom], mtop: { 'mtop.taobao.idlemtopsearch.pc.search': [railReply, railReply] } }));
-  await assert.rejects(run('search_items')({ query: 'x220', pages: 3, attempts: 1 }), (e: any) => e instanceof SearchUnavailableError && /"rail":"猜你喜欢"/.test(e.message));
+  await assert.rejects(run('search_items')({ query: 'x220', pages: 3, attempts: 1 }), (e: any) => e instanceof SearchUnavailableError && e.details?.reason === 'query_mismatch' && e.details.unmatched_tokens.includes('x220'));
 });
 
 test('the `detail` argument reads the top N in full, and reports which ones it could not', async () => {
@@ -875,7 +880,7 @@ test('the `detail` argument reads the top N in full, and reports which ones it c
   const rows = Array.from({ length: 8 }, (_, i) => [`联想 X220 ${i}`, String(300 + i), String(100 + i * 10), '北京', '2']);
   const c = searchCase('x220', rows);
   // the detail reply comes back for three of the four requested, and the fourth is refused
-  const detail = (id: string) => ok({ itemDO: { itemId: id, title: `详情 ${id}`, soldPrice: '123', wantCnt: 4, browseCnt: 900, desc: '成色好，功能正常' }, sellerDO: { nick: '卖家', city: '北京', hasSoldNumInteger: 12, userRegDay: 730, newGoodRatioRate: '99%' } });
+  const detail = (id: string) => ok({ itemDO: { itemId: id, title: `联想 X220 详情 ${id}`, soldPrice: '123', wantCnt: 4, browseCnt: 900, desc: '成色好，功能正常' }, sellerDO: { nick: '卖家', city: '北京', hasSoldNumInteger: 12, userRegDay: 730, newGoodRatioRate: '99%' } });
   // one tap for both: the search reply that produces the cards, and the detail replies that deepen them
   use(makeSession({ cards: [c.rows], mtop: {
     'mtop.taobao.idlemtopsearch.pc.search': c.mtop['mtop.taobao.idlemtopsearch.pc.search'],
@@ -965,7 +970,7 @@ test('a fan-out batch that goofish answers nothing for falls back to serial, and
   const rows = Array.from({ length: 8 }, (_, i) => [`联想 X220 ${i}`, String(300 + i), '199', '北京', '2']);
   // The pool pages refuse everything. The shared page's tap answers for the two listings the serial
   // route goes on to read, which is the serial route still working -- exactly run 2 of the measurement.
-  const live = (id: string) => ok({ itemDO: { itemId: id, title: `详情 ${id}`, soldPrice: '123', desc: '成色好，功能正常' }, sellerDO: { nick: '卖家', city: '北京' } });
+  const live = (id: string) => ok({ itemDO: { itemId: id, title: `联想 X220 详情 ${id}`, soldPrice: '123', desc: '成色好，功能正常' }, sellerDO: { nick: '卖家', city: '北京' } });
   const s = deepenable(rows, { 'mtop.taobao.idle.pc.detail': [live('302'), live('303')] }, 0, true);
   const out = await run('search_items')({ query: 'x220', detail: 4, limit: 8, attempts: 1 });
   assert.equal(out.detail_fanout.batches, 1, 'only the first batch ran: the guard stopped the rest');
@@ -1369,7 +1374,10 @@ test('seller_items reads a seller\'s own listings, with nextPage as the only hon
   assert.equal(out.has_more, true);
   assert.equal(out.raw_cards, 3);
   assert.equal(out.source, 'idle_xyh_item_list');
-  assert.deepEqual(out.items[0], { item_id: '1045171414271', title: '专柜入手，穿过几次', price: '1999', category_id: '50106003', want_count: '2', tags: ['2人想要'], image_urls: ['https://img.alicdn.com/bao/uploaded/i4/1045171414271.jpg'], url: 'https://www.goofish.com/item?id=1045171414271', rank: 1 });
+  const { typed, missing, price_info, ...rawCard } = out.items[0];
+  assert.equal(typed.price_amount, 1999); assert.equal(typed.want_count, 2); assert.equal(typed.image_count, 1);
+  assert.equal(price_info.kind, 'exact'); assert.ok(missing.includes('seller_stats'));
+  assert.deepEqual(rawCard, { item_id: '1045171414271', title: '专柜入手，穿过几次', price: '1999', category_id: '50106003', want_count: '2', tags: ['2人想要'], image_urls: ['https://img.alicdn.com/bao/uploaded/i4/1045171414271.jpg'], url: 'https://www.goofish.com/item?id=1045171414271', rank: 1 });
   assert.deepEqual(out.items.map((i: any) => i.rank), [1, 2, 3]);
   // `totalCount` is in the payload and is always 0 -- measured at two page sizes against a seller with
   // six live listings -- so it is never published as if it meant anything.
@@ -1595,7 +1603,9 @@ test('a repeat search is answered from the cached pages, with no page, no keystr
   const first = await run('search_items')({ query: 'x220', limit: 5, attempts: 1 });
   assert.equal(first.source, 'search_api');
   assert.equal(first.cache.hits, 0, 'nothing was cached before the first call');
-  assert.deepEqual(first.cache.pages, [{ page: 1, hit: false, age_s: null }]);
+  assert.deepEqual(first.cache.pages.map(({ page, hit, age_s }: any) => ({ page, hit, age_s })), [{ page: 1, hit: false, age_s: null }]);
+  assert.ok(Number.isFinite(Date.parse(first.cache.pages[0].observed_at)));
+  assert.ok(first.cache.pages[0].observation_age_s >= 0);
 
   const blind = use(makeSession());
   const second = await run('search_items')({ query: 'x220', limit: 5, attempts: 1 });
@@ -1661,7 +1671,7 @@ test('a deeper search reuses the pages it has and only walks the new ones', asyn
 test('`detail` reports which of its listings came from the cache rather than a page load', async () => {
   const rows = Array.from({ length: 4 }, (_, i) => [`联想 X220 ${i}`, String(300 + i), '100', '北京', '2']);
   const c = searchCase('x220', rows);
-  const detail = (id: string) => ok({ itemDO: { itemId: id, title: `详情 ${id}`, soldPrice: '123', desc: '成色好' }, sellerDO: { nick: '卖家', city: '北京' } });
+  const detail = (id: string) => ok({ itemDO: { itemId: id, title: `联想 X220 详情 ${id}`, soldPrice: '123', desc: '成色好' }, sellerDO: { nick: '卖家', city: '北京' } });
   const one = { cards: [c.rows], mtop: { 'mtop.taobao.idlemtopsearch.pc.search': c.mtop['mtop.taobao.idlemtopsearch.pc.search'], 'mtop.taobao.idle.pc.detail': [detail('300')] } };
   use(makeSession(one));
   const cold = await run('search_items')({ query: 'x220', detail: 1, limit: 4, attempts: 1 });
@@ -1688,4 +1698,123 @@ test('tool calls are serialised, so two in flight cannot navigate one page out f
   // a rejected tool releases the lock rather than wedging every call after it
   await assert.rejects(exclusive(async () => { throw new XianyuError('boom'); }), XianyuError);
   assert.equal(await exclusive(async () => 'after'), 'after');
+});
+
+test('a later-page refusal preserves valid cards and resumes without repeating completed pages', async () => {
+  resetCaches(); resetCooldown();
+  const q = 'Xeon E5-2680 v4';
+  const one = searchReply(q, [['至强 E5-2680v4', '1', '500', '北京', '1']]);
+  const two = searchReply(q, [['Xeon E5-2680 v4', '2', '600', '北京', '2']]);
+  const s = use(makeSession({ mtop: { 'mtop.taobao.idlemtopsearch.pc.search': [ok(one), refused('RGV587')] } }));
+  s.runRealNormalizer = true;
+  const out = await run('search_items')({ query: q, pages: 2, limit: 10, attempts: 1 });
+  assert.equal(out.partial, true); assert.equal(out.stop_reason, 'rate_limited'); assert.equal(out.retry_after_s, 60);
+  assert.deepEqual(out.items.map((i: any) => i.item_id), ['1']); assert.ok(out.next_cursor);
+  const resumed = use(makeSession({ mtop: { 'mtop.taobao.idlemtopsearch.pc.search': [ok(one), ok(two)] } }));
+  resumed.runRealNormalizer = true;
+  const next = await run('search_items')({ query: q, cursor: out.next_cursor, attempts: 1 });
+  assert.deepEqual(next.items.map((i: any) => i.item_id), ['2']);
+  assert.equal(resumed.pagers[0], '2');
+  resetCaches();
+});
+
+test('a small limit preserves the other matched cards inside the continuation', async () => {
+  resetCaches();
+  const q = 'P100';
+  const data = searchReply(q, [['P100 PCIe 裸卡', '1', '500', '北京', '1'], ['P100 SXM2 裸卡', '2', '600', '北京', '1'], ['P100 PCIe 裸卡', '3', '700', '北京', '1']]);
+  putSearchPage(q, 1, data);
+  const s = use(makeSession());
+  const first = await run('search_items')({ query: q, limit: 1 });
+  const second = await run('search_items')({ query: q, cursor: first.next_cursor });
+  const third = await run('search_items')({ query: q, cursor: second.next_cursor });
+  assert.deepEqual([first.items[0].item_id, second.items[0].item_id, third.items[0].item_id], ['1', '2', '3']);
+  assert.equal(s.opened.length, 0); assert.equal(second.via, 'cursor');
+  assert.equal(second.freshness.cached, true);
+  resetCaches();
+});
+
+test('cached searches apply filters before limiting, and distinguish filtered empty sets', async () => {
+  resetCaches();
+  putSearchPage('P100', 1, searchReply('P100', [['P100 PCIe 散热转接', '1', '50', '北京', '1'], ['P100 SXM2 裸卡', '2', '500', '北京', '2'], ['P100 PCIe 裸卡', '3', '600', '北京', '3']]));
+  const s = use(makeSession());
+  const out = await run('search_items')({ query: 'P100', limit: 1, form_factor: 'pcie', bare_card_only: true, min_price: 100, max_price: 700, exclude_keywords: ['转接'] });
+  assert.deepEqual(out.items.map((i: any) => i.item_id), ['3']); assert.equal(out.filters.excluded_count, 2);
+  const empty = await run('search_items')({ query: 'P100', min_price: 1000 });
+  assert.equal(empty.count, 0); assert.equal(empty.empty_reason, 'filtered_out'); assert.equal(empty.partial, false);
+  assert.equal(s.opened.length, 0); assert.equal(out.effective_max_items, 300);
+  resetCaches();
+});
+
+test('inventory contradictions, token mismatches and throttling are structured errors rather than empty results', async () => {
+  resetCaches(); resetCooldown();
+  const q = 'Xeon E5-2680 v4';
+  const s = use(makeSession({ mtop: { 'mtop.taobao.idlemtopsearch.pc.search': [refused('RGV587')] } }, { hitnum: ok({ hitnum: 12338 }) }));
+  const def = TOOLS.find(t => t.name === 'search_items')!;
+  const failed = await executeTool(def, { query: q, attempts: 10, timeout_s: 2 });
+  assert.equal(failed.ok, false); assert.equal(failed.count, 0); assert.equal(failed.diagnostics.reason, 'rate_limited');
+  assert.equal(failed.diagnostics.inventory.match_count, 12338); assert.equal(failed.retry_after_s, 60);
+  assert.equal(s.opened.length, 1, 'a measured throttle stops the retry loop immediately');
+  resetCooldown(); resetCaches();
+});
+
+test('only confirmed zero inventory makes an empty upstream search successful', async () => {
+  resetCaches();
+  use(makeSession({ mtop: { 'mtop.taobao.idlemtopsearch.pc.search': [ok({ resultList: [] })] } }, { hitnum: ok({ hitnum: 0 }) }));
+  const out = await run('search_items')({ query: 'nonexistent', attempts: 1 });
+  assert.equal(out.count, 0); assert.equal(out.empty_reason, 'no_inventory'); assert.equal(out.next_cursor, null);
+  resetCaches();
+});
+
+test('a queued search deadline produces a typed error without launching a browser', async () => {
+  resetCooldown();
+  const s = use(makeSession());
+  let release!: () => void;
+  const held = exclusive(() => new Promise<void>(r => { release = r; }));
+  await new Promise(r => setImmediate(r));
+  const out = await executeTool(TOOLS.find(t => t.name === 'search_items')!, { query: 'P100', timeout_s: 1 });
+  assert.equal(out.ok, false); assert.equal(out.diagnostics.reason, 'timeout'); assert.equal(s.opened.length, 0);
+  release(); await held; await exclusive(async () => {});
+});
+
+test('missing autocomplete lists and nonnumeric inventory cannot look empty', async () => {
+  use(makeSession({}, { sug: ok({}) }));
+  await assert.rejects(run('search_suggest')({ query: 'P100' }), ParseError);
+  for (const hitnum of [false, true, [], {}, Infinity, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    use(makeSession({}, { hitnum: ok({ hitnum }) }));
+    await assert.rejects(run('search_count')({ query: 'P100' }), ParseError);
+  }
+});
+
+test('a partial feed has valid rows, failed pages and an explicit retry hint', async () => {
+  use(makeSession({ cards: [listed(['1'])] }, { p1: cards(['1']), p2: refused('RGV587') }));
+  const out = await run('browse_feed')({ pages: 2 });
+  assert.equal(out.partial, true); assert.deepEqual(out.retry_pages, [2]); assert.equal(out.retry_after_s, 60);
+  assert.equal(out.count, 1); assert.equal(out.stop_reason, 'rate_limited');
+});
+
+test('shutdown waits for an in-flight launch handle before closing it', async () => {
+  const s = new Session();
+  const order: string[] = [];
+  (s as any).booting = new Promise<void>(resolve => setTimeout(() => { order.push('launch'); resolve(); }, 10));
+  s.close = async () => { order.push('close'); };
+  await s.shutdown();
+  assert.deepEqual(order, ['launch', 'close']);
+});
+
+test('detail rechecks price and title filters when a listing changed since its card', async () => {
+  resetCaches();
+  const q = 'P100';
+  const search = searchReply(q, [['P100 PCIe 裸卡', '1', '500', '北京', '1'], ['P100 PCIe 裸卡', '2', '600', '北京', '2']]);
+  const s = use(makeSession({ mtop: { 'mtop.taobao.idlemtopsearch.pc.search': [ok(search)], 'mtop.taobao.idle.pc.detail': [
+    ok({ itemDO: { itemId: '1', title: 'P100 PCIe 裸卡', soldPrice: '900' }, sellerDO: { city: '北京' } }),
+    ok({ itemDO: { itemId: '2', title: 'V100 PCIe 裸卡', soldPrice: '600' }, sellerDO: { city: '北京' } }),
+  ] } }));
+  s.runRealNormalizer = true;
+  process.env.XIANYU_DETAIL_FANOUT = '0';
+  try {
+    const out = await run('search_items')({ query: q, limit: 2, detail: 2, max_price: 700, attempts: 1 });
+    assert.equal(out.count, 0); assert.deepEqual(out.items, []);
+    assert.equal(out.post_detail_filter.query_mismatches, 1);
+    assert.equal(out.post_detail_filter.reasons.above_max_price, 1);
+  } finally { delete process.env.XIANYU_DETAIL_FANOUT; resetCaches(); }
 });

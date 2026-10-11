@@ -8,6 +8,14 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { getItem, getSearchPage, itemTtl, missed, notCached, on, pageReport, putItem, putSearchPage, reset, searchKey, searchTtl, stats } from '../src/cache.ts';
 
+test('live pages age during a long walk even though they are cache misses', () => {
+  const observed = new Date(Date.now() - 75000).toISOString();
+  const report = pageReport([{ page: 1, hit: false, age_s: null, observed_at: observed }]);
+  assert.equal(report.pages[0].age_s, null, 'cache lookup age is still distinct from observation age');
+  assert.ok(report.pages[0].observation_age_s >= 75 && report.pages[0].observation_age_s < 76);
+  assert.equal(report.pages[0].observed_at, observed);
+});
+
 test.afterEach(() => { reset(); for (const k of ['XIANYU_CACHE', 'XIANYU_CACHE_ITEM_TTL_S', 'XIANYU_CACHE_SEARCH_TTL_S']) delete process.env[k]; });
 
 test('a listing read once is served again without asking, and says how old it is', () => {

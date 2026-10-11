@@ -132,9 +132,14 @@ export const putSearchPage = (query: string, page: number, payload: any): void =
  *  listings behind `count` were read when is visible rather than implied. Pages read at different
  *  moments happen here (page 1 fresh, page 3 ninety seconds old), and one age for the whole set
  *  would be a claim about a set that does not exist. */
-export const pageReport = (lines: { page: number; hit: boolean; age_s: number | null }[]): Record<string, any> => {
+export const observationAge = (lines: { age_s?: number | null; observed_at?: string | null }[]): number => Math.max(0, ...lines.map(l => {
+  const stamp = l.observed_at ? Date.parse(l.observed_at) : NaN;
+  return Number.isFinite(stamp) ? Math.max(0, (Date.now() - stamp) / 1000) : l.age_s ?? 0;
+}));
+export const pageReport = (lines: { page: number; hit: boolean; age_s: number | null; observed_at?: string | null }[]): Record<string, any> => {
   const ttlS = searchTtl(), hits = lines.filter((l) => l.hit);
-  return { enabled: on(), hits: hits.length, misses: lines.length - hits.length, ttl_s: ttlS, pages: lines,
+  return { enabled: on(), hits: hits.length, misses: lines.length - hits.length, ttl_s: ttlS,
+    pages: lines.map(l => ({ ...l, observation_age_s: observationAge([l]) })),
     note: hits.length === 0
       ? `every page below was read from goofish just now (nothing cached, or the cache is off; TTL ${ttlS}s)`
       : `${hits.length} of ${lines.length} page(s) were served from this process's own cache and the rest were read live just now; a cached page may no longer be what goofish would return, so read a listing before relying on its price (TTL ${ttlS}s)` };
