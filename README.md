@@ -40,7 +40,14 @@ TypeScript types from files under `node_modules/`, so shipping `src/*.ts` would 
 fail on first run.
 
 Requires **Node 22.18+** (the server runs TypeScript directly, natively). It launches a windowed
-Chromium, so it needs a display -- on a headless box, `xvfb-run -a node src/index.ts` or an X server.
+Chromium, so it needs a display. On a machine with no monitor, run it under a virtual one:
+
+```sh
+# Debian/Ubuntu: sudo apt install xvfb    Arch: sudo pacman -S xorg-server-xvfb
+xvfb-run -a node src/index.ts          # or point your MCP client at this command
+```
+
+This recipe is not yet run end to end on a headless host; if it fails, the error is from Chromium, not the server.
 See [Headless vs headed](#headless-vs-headed) for what `XIANYU_HEADLESS=1` costs you.
 
 ## MCP client config
@@ -92,7 +99,6 @@ full answer, base ref and fetch included, is what it runs when it has to rebuild
 | `XIANYU_HEADLESS` | `0` (windowed) | `1` runs headless. Headed is the default because goofish serves headless Chromium its risk-control page instead of the app -- see [Headless vs headed](#headless-vs-headed). Needs a display (`DISPLAY=:0`, or Xvfb). |
 | `XIANYU_SEARCH_BUDGET_S` | 90 | wall-clock budget for the `search_items` retry loop (5–600s) |
 | `XIANYU_ITEM_VIEW_BUDGET_S` | 90 | wall-clock budget for the `item_view` retry loop (5–600s) |
-| `XIANYU_RECOMMENDATIONS_BUDGET_S` | 45 | wall-clock budget for the `recommendations` retry loop (5–600s) |
 | `XIANYU_SELLER_PROFILE_BUDGET_S` | 90 | wall-clock budget for the item-page hop `seller_profile` / `seller_items` make when given an `item_id` (5–600s). A lookup by `user_id` runs no loop and spends none of it |
 | `XIANYU_SEARCH_MAX_ITEMS` | 300 | ceiling for one `search_items` call, in listings -- clamps both `limit` and how deep the pager walk goes (30–300), so a huge walk stays inside `XIANYU_SEARCH_BUDGET_S` |
 | `XIANYU_DETAIL_FANOUT` | 2 | how many listing pages `detail` loads at once (0–4), `0` reads them one at a time -- see [the detail fan-out](#detail-reads-two-listings-at-a-time-and-says-when-it-stops) |
@@ -122,7 +128,6 @@ their own data.
 | `capabilities` | `probe` (bool, dtrue) | with `probe: true` (the default): `session_state` (`unexpectedly_logged_in` / `logged_out` / `unknown`, where `logged_out` only comes from a ret that actually names the session or token, so a rate limit or a timeout reads `unknown` rather than proving anonymity), `login_probe_ret`, `feed_reachable`, `probes` (`ran`, `measured`, `not_measured`), `cache` (`enabled`, the two TTLs, how many listings and search pages are held), `works_without_account`, `anonymous_flakiness`, `notes`, `note`, `browser_launches`, and a `browser_error` / `login_error` / `feed_error` per probe. Never raises, not even if the browser is gone. **With `probe: false`** the same static payload and `build` / `cache` come back immediately, no browser launched, and the four live-probe keys are `null`; see [which build is answering](#which-build-is-answering-and-is-it-current). |
 | `browse_feed` | `page_number` (1–10000, d1), `pages` (1–25, d1), `limit` (≤500, d60) | `items[]` of `rank, item_id, title, price, original_price, city, seller, want_count, image_count, image_urls, is_video, category_id, url`; `page_reports`, `raw_cards`, `unique_items`, `count`, `source: homepage_feed`. Every item also carries `typed` + `missing`; see [the typed block](#the-typed-block-every-listing-carries) |
 | `search_count` | `query` | `match_count`, `has_matches`, `source: filter_hitnum`. Zero is an answer, not an error, but only when the site said zero: a `hitnum` that is missing, null, a string or carries a thousands separator is a `ParseError`, never `match_count: 0`. |
-| `search_suggest` | `query`, `limit` (d20) | `suggestions[]` of `text, bucket_num`, `total_count`, `count`, `source: search_suggest` |
 | `seller_profile` | `user_id` **or** `item_id` (exactly one) | `display_name, avatar_url, signature, seller_credit, buyer_credit, level, level_score, praise_ratio, review_count, listings_count, ratings_count, followers, following, verified_real_name, verified_real_person, verified_zhima`, plus `city, tenure_years, items_sold, items_listed, positive_rate, reply_rate_24h, last_active` **only when given an `item_id`**, `profile_url`, `item_id`, `fields_present` / `fields_missing`, and `source`: **`idle_user_page_head`** (given a `user_id`, one mtop call, no page load) or **`item_detail+idle_user_page_head`** (given an `item_id`, one item page load). A seller that does not exist raises `DetailUnavailableError`; a throttle raises `GatedError`. See [seller tools](#the-two-seller-tools). |
 | `seller_items` | `user_id` **or** `item_id` (exactly one), `limit` (d20), `page` (1–50, d1) | `items[]` of `rank, item_id, title, price, category_id, want_count, tags, image_urls, url`, `has_more` (from goofish's own `nextPage` -- walk `page`, do not assume 20), `raw_cards`, `count`, `profile_url`, `source: idle_xyh_item_list`. An empty shop and a page past the end are both `count: 0`, not an error; a payload carrying none of the endpoint's own keys is a `ParseError`. goofish serves at most 50 pages of 20, so walk `has_more` rather than asking for a page number up front. |
 
@@ -234,6 +239,8 @@ refusal can quote a real page rather than a guess -- it is expected to be refuse
 what it is.
 
 ### Depth: `pages` and `detail`
+
+`compact: true` on `search_items` returns each item as one pipe-separated line (rank, id, price, want count, city, seller, first three tags, title) instead of an object. It costs a fraction of the tokens, so use it to scan a large result set, then ask for `detail` or `item_view` on the shortlist. The default is unchanged.
 
 One search reply is 30 listings, and the search API cannot be re-issued -- replaying the page's own
 payload through the same client answers `TIMEOUT::接口超时`, for the same anti-bot reason item detail
@@ -466,8 +473,8 @@ Measured, same URL, one fresh context per run, sampling every 4s for 128–200s:
 | DOM tools | get the real page | get nothing to read |
 
 So **headed is the default** and the three DOM tools need a display. What headless can still do is
-everything that only needs goofish's own JS client -- `browse_feed`, `search_count`, `search_suggest`,
-`related_items`, and the probes inside `capabilities` -- because the mtop client comes up on the
+everything that only needs goofish's own JS client -- `browse_feed`, `search_count`, `related_items`,
+the seller tools, and the probes inside `capabilities` -- because the mtop client comes up on the
 risk-control page as well. That was measured: all four returned normal data headless.
 
 Set `XIANYU_HEADLESS=1` to opt back in; the cost is the DOM tools.
@@ -483,13 +490,11 @@ other figure is that same warm session. Treat these as order of magnitude, not a
 | cold start (launch + first feed) | 24.7s | n/a |
 | `capabilities` | 1.9s | `logged_out`, `feed_reachable: true` (probed; `probe: false` is milliseconds; see [which build is answering](#which-build-is-answering-and-is-it-current)) |
 | `search_count` | 0.5s | 28,8xx for `thinkpad x220` |
-| `search_suggest` | 0.4s | 10 suggestions |
 | `related_items` | 2.2s | 20 listings, `item_web_recommend` |
 | `browse_feed` | 1.5s | 20 listings, `homepage_feed` |
 | `search_items` -- first of a session | 20.9s | 10 matches, `search_api` |
 | `search_items` -- later, warm page | 13.6–14.9s | 10 matches, `search_api` |
 | `item_view` | 6.4–9.5s | 5/5 live listings, `item_detail_api`, `fields_missing: []` |
-| `recommendations` | 17.7s | 20 real listings, `dom_recommendation` |
 
 Two things do the work. The mtop-only tools run on a page of their own that never navigates, so
 they cost one request and no page load -- 0.4–2.2s warm -- and they no longer queue behind a search. And
@@ -507,7 +512,7 @@ continuous polling on one page load never produced a result.
 
 ## What is verified, and what is not
 
-Verified against the live site on 2026-09-29. The mtop endpoints behind `browse_feed`,
+Verified against the live site on 2026-09-29, when the server still had ten tools. `search_suggest` and `recommendations` were removed afterwards; the endpoint results below are unchanged. The mtop endpoints behind `browse_feed`,
 `search_count`, `search_suggest` and `related_items` all answer anonymously, in *both* headless and
 headed: 8 feed pages / 157 unique listings with 0 duplicates, the match counter at 28,841 and 29,671
 for `x220` on consecutive runs (it drifts, so treat the number as a magnitude, not a constant) and 0 for

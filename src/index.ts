@@ -13,7 +13,7 @@ import { TOOLS } from './tools.ts';
 const { version } = createRequire(import.meta.url)('../package.json') as { version: string };
 
 const mcp = new McpServer({ name: 'xianyu', version }, {
-  instructions: 'Read-only access to Xianyu/Goofish with NO Xianyu account required. All ten tools -- capabilities, browse_feed, search_count, search_suggest, search_items, related_items, item_view, recommendations, seller_profile, seller_items -- work logged out. Search is a keystroke rather than a URL and is declined by goofish on some page loads, so search_items retries and refuses to return the recommendation rail as results; item_view and search_items read the calls the page makes for itself, which is the only way those two answer. The mtop-only tools run on their own page and do not queue behind a search. seller_profile and seller_items take either a seller id (one cheap mtop call) or a listing id, meaning the seller of that listing, which costs one page load and also yields their city, tenure and sales history. Call capabilities for the current verified picture.',
+  instructions: 'Read-only access to Xianyu/Goofish with NO Xianyu account required. Start with search_items for a keyword, then item_view for the listings worth a closer look. search_items returns cards (price, want count, seller, city, tags); detail=N on search_items or item_view fills in description, photos, seller sales and shipping. Calls run one at a time on the browser, except the mtop-only tools (browse_feed, search_count, related_items, seller_profile, seller_items), which run alongside. Call capabilities to see the current state and the build that is answering.',
 });
 
 for (const t of TOOLS) {
@@ -22,9 +22,9 @@ for (const t of TOOLS) {
     // slow search does not block feed requests.
     let envelope: any;
     try {
-      envelope = { ok: true, data: await t.run(args) };
+      envelope = { ok: true, version, data: await t.run(args) };
     } catch (e) {
-      envelope = { ok: false, ...describe(e) };
+      envelope = { ok: false, version, ...describe(e) };
     }
     return { content: [{ type: 'text', text: JSON.stringify(envelope) }], structuredContent: envelope };
   });

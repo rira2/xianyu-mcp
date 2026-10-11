@@ -15,7 +15,6 @@ type Data = Record<string, any>;
 const FEED_API = 'mtop.taobao.idlehome.home.webpc.feed';
 // Search's count endpoint works for logged-out visitors even when the results page is declined.
 const HITNUM_API = 'mtop.taobao.idle.filter.hitnum.pc.get';
-const SUGGEST_API = 'mtop.taobao.idlemtopsearch.pc.search.suggest';
 const RECOMMEND_API = 'mtop.taobao.idle.item.web.recommend.list';
 const LOGINUSER_API = 'mtop.taobao.idlemessage.pc.loginuser.get';   // never used to act as a user: it exists only to *prove* the session is logged out
 const DETAIL_API = 'mtop.taobao.idle.pc.detail';
@@ -185,26 +184,6 @@ const searchCount = async ({ query }: CountArgs): Promise<Data> => {
   return { query: q, match_count: Math.trunc(count), has_matches: count > 0, account_required: false, source: 'filter_hitnum' };
 };
 
-/** goofish's own search-box autocomplete: turns "x220" into "x220笔记本" and friends, and is a cheap
- *  signal that a term is understood at all. */
-const searchSuggest = async ({ query, limit = 20 }: SuggestArgs): Promise<Data> => {
-  const q = requireQuery(query);
-  const session = getSession();
-  await session.ensureReady();
-  const entry = (await session.call([['sug', SUGGEST_API, { inputWords: q, searchReqFromPage: 'xyPcHome', bucketId: 30, type: 0 }]]))?.sug || {};
-  if (!entry.ok) throw new GatedError(`goofish refused the suggestion endpoint for ${JSON.stringify(q)}: ${entry.ret}`);
-  const data = entry.data || {}, seen = new Set<string>(), suggestions: any[] = [];
-  if (data.items != null && !Array.isArray(data.items)) throw new ParseError(`suggestion payload has a non-list \`items\` (${typeof data.items}); the response shape likely changed. data keys=${Object.keys(data).sort().slice(0, 10)}`);
-  for (const it of data.items || []) {
-    const text = String(it?.suggest || it?.title || '').trim();
-    if (!text || seen.has(text)) continue;
-    seen.add(text);
-    suggestions.push({ text, bucket_num: it?.bucketNum ?? null });
-  }
-  const trimmed = suggestions.slice(0, clamp(limit, 1, MAX_LIMIT));
-  return { query: q, account_required: false, source: 'search_suggest', total_count: Number.isInteger(data.totalCount) ? data.totalCount : null, count: trimmed.length, suggestions: trimmed };
-};
-
 /** Listings goofish recommends for a given item ("more like this"), or its generic recommendation set
  *  when item_id is omitted -- which is what the page itself requests. The cards are the same shapes the
  *  homepage feed returns, so they go through the same normalizer. */
@@ -309,31 +288,6 @@ const sellerItems = async ({ user_id, item_id, limit = SELLER_PAGE_SIZE, page = 
   return { user_id: uid, profile_url: `${HOME}personal?userId=${uid}`, item_id: item || null, page: wanted, account_required: false, source: 'idle_xyh_item_list', raw_cards: cards.length, has_more: Boolean(payload.nextPage), count: items.length, items };
 };
 
-/** Scrape goofish's 猜你喜欢 / 为你推荐 rails for an anonymous visitor. Renders are flaky, so this
- *  retries under a clock, like the other two best-effort tools: five renders with a reload between each
- *  is five minutes of somebody's timeout at the 60s navigation timeout. When the DOM never cooperates it
- *  falls back to the feed API and says so in `source`, rather than returning an empty list. */
-const recommendations = async ({ limit = 30, url }: RecoArgs): Promise<Data> => {
-  const cap = clamp(limit, 1, MAX_LIMIT), target = url || HOME;
-  // The clock starts before the load, for the same reason item_view's does: a budget that ignores the
-  // slowest step in the call is not a budget. The elapsed time in `fallback_reason` was understating
-  // itself by one page load.
-  const started = Date.now(), deadline = started + budget('RECOMMENDATIONS', 45) * 1000;
-  const session = getSession(), page = await session.open(target);
-  let payload: any = {}, attemptNo = 0;
-  for (attemptNo = 1; attemptNo <= RENDER_ATTEMPTS; attemptNo++) {
-    payload = await scrape(page, SCRAPE_CARDS_JS, { query: '', limit: cap, rails: RAIL_MARKERS }, 'recommendation scrape');
-    if (payload?.items?.length) break;
-    if (attemptNo < RENDER_ATTEMPTS && Date.now() < deadline) { await reloadFresh(page); await settle(page, RENDER_SETTLE_MS); }
-  }
-  if (!payload?.items?.length) {
-    const feed = await browseFeed({ pages: 1, limit: cap });
-    return { ...feed, source: 'homepage_feed', requested_url: target, fallback_reason: `the DOM at ${page.url()} rendered no cards after ${Math.min(attemptNo, RENDER_ATTEMPTS)} attempt(s) in ${Math.round((Date.now() - started) / 1000)}s (goofish serves anonymous visitors an empty shell part of the time); returned live feed listings instead` };
-  }
-  const items = rankItems(withTyped(dedupe(payload.items)), cap);
-  return { source: 'dom_recommendation', rail: payload.rail || '', page_url: page.url(), account_required: false, attempts: attemptNo, says_no_results_for_query: Boolean(payload.says_no_results), risk_control_page: Boolean(payload.blocked), count: items.length, items };
-};
-
 /**
  * Types into the SPA input and returns the attempt log's verdict rather than throwing, because retry
  * is the caller's decision. Three waits: the input (none for 8-14s while the app mounts), the keys
@@ -385,7 +339,7 @@ const typeSearch = async (page: Page, query: string, deadline: number): Promise<
  * direct-URL/search-input, only the cell that typed into the SPA header input returned results. The
  * dialog's close controls are left alone: measured, clicking them made the result list never render at
  * all, and both scrapers read through the overlay anyway. */
-const searchItems = async ({ query, limit = DEFAULT_SEARCH_ITEMS, attempts = SEARCH_ATTEMPTS, pages = 1, detail = 0 }: SearchArgs): Promise<Data> => {
+const searchItems = async ({ query, limit = DEFAULT_SEARCH_ITEMS, attempts = SEARCH_ATTEMPTS, pages = 1, detail = 0, compact = false }: SearchArgs): Promise<Data> => {
   const q = requireQuery(query), maxAttempts = clamp(attempts, 1, MAX_SEARCH_ATTEMPTS), cap = clamp(limit, 1, searchCap()), pagesWanted = clamp(pages, 1, Math.max(1, Math.min(MAX_SEARCH_PAGES, Math.ceil(searchCap() / 30))));
   const session = getSession(), log: any[] = [];
   let payload: any = {};
@@ -414,7 +368,7 @@ const searchItems = async ({ query, limit = DEFAULT_SEARCH_ITEMS, attempts = SEA
     // live search rather than publish a set this code would have refused a moment ago.
     if (found) {
       log.push({ via: 'cache', pages: pooled.length, results: found.scanned, note: `every page this search asked for was already cached, so goofish was not asked at all; ages are in the cache block below` });
-      return publishSearch(session, q, found, detail, deadline, { query: q, source: 'search_api', via: 'cache', account_required: false, attempts: 0, attempt_log: log, cache: pageReport(cachedLines), ...found });
+      return publishSearch(session, q, found, detail, deadline, { query: q, source: 'search_api', via: 'cache', account_required: false, attempts: 0, attempt_log: log, cache: pageReport(cachedLines), ...found }, compact);
     }
   }
   for (let attemptNo = 1; attemptNo <= maxAttempts; attemptNo++) {
@@ -489,7 +443,7 @@ const searchItems = async ({ query, limit = DEFAULT_SEARCH_ITEMS, attempts = SEA
         if (found) {
           log.push({ attempt: attemptNo, via, source: 'search_api', pages: replies.length, results: found.scanned });
           const out = { query: q, source: 'search_api', via, account_required: false, attempts: attemptNo, attempt_log: log, cache: pageReport(pageLines), ...found };
-          return publishSearch(session, q, found, detail, deadline, out);
+          return publishSearch(session, q, found, detail, deadline, out, compact);
         }
       }
       if (reply && !reply.ok) log.push({ attempt: attemptNo, via, search_api_ret: reply.ret });
@@ -534,10 +488,17 @@ const searchItems = async ({ query, limit = DEFAULT_SEARCH_ITEMS, attempts = SEA
  * Publish a pooled search answer, deepening it when the caller asked for `detail`. One function for
  * both routes in, so they cannot differ: the cache path was written first and returned the pool as it
  * stood, so `detail: 1` answered from cache with plain cards and no `detail_report`. */
-const publishSearch = async (session: any, q: string, found: any, detail: number, deadline: number, out: any): Promise<Data> => {
-  if (detail < 1) return out;
+const compactLine = (it: any): string => {
+  const tags = Array.isArray(it.tags) ? it.tags.slice(0, 3).join('/') : '';
+  return [it.rank, it.item_id, `¥${it.price || '?'}`, it.want_count ? `想要${it.want_count}` : '', it.city, it.seller, tags, it.title].filter((v) => v !== undefined && v !== '').join(' | ');
+};
+
+const applyCompact = (out: any, compact: boolean): any => (compact && Array.isArray(out.items) ? { ...out, items: out.items.map(compactLine) } : out);
+
+const publishSearch = async (session: any, q: string, found: any, detail: number, deadline: number, out: any, compact = false): Promise<Data> => {
+  if (detail < 1) return applyCompact(out, compact);
   const deep = await enrichDetails(session, found.items, detail, deadline, out.items);
-  return { ...out, items: deep.items, detail_requested: deep.report.requested, detailed: deep.report.ok, detail_ms: deep.report.ms_total,
+  return applyCompact({ ...out, items: deep.items, detail_requested: deep.report.requested, detailed: deep.report.ok, detail_ms: deep.report.ms_total,
     // How the depth was bought: how wide the fan-out ran, how many batches it managed, how many of the
     // listings actually came back out of one, and -- the part that matters -- whether it turned itself
     // off because goofish went quiet. A caller that sees `fell_back` knows the wall clock it just paid
@@ -545,7 +506,7 @@ const publishSearch = async (session: any, q: string, found: any, detail: number
     detail_fanout: deep.report.fanout,
     // Per-listing outcomes, so a caller knows exactly which of the fifty it got in full and which are
     // still cards -- rather than having to infer it from a missing field.
-    detail_report: deep.report.per_listing };
+    detail_report: deep.report.per_listing }, compact);
 };
 
 /**
@@ -860,7 +821,7 @@ const capabilities = async ({ probe = true }: Args<typeof CAP_ARGS> = {}): Promi
     cache: cacheStats(),
     works_without_account: [
       'browse_feed: paged homepage feed, 20 listings/page, live inventory',
-      'search_count / search_suggest: match counter and autocomplete, both undeclined',
+      'search_count: match counter, undeclined by goofish',
       'related_items: more-like-this for an item, or goofish\'s generic set',
       'search_items: keyword search with real depth -- pages walks the result pager for 30 listings a page (up to 10 pages, measured 4 to 81-82 matches in 19-36s, and it tops up by two pages if the pool comes up short of limit), and detail reads the top N in full (one page load each at 7.5-10s; measured 50 full listings, 39 fields, ~246 photos, 0 failures, in 410-550s). Retried because goofish declines some page loads.',
       'item_view: title, price, want/browse counts, description, seller with city/tenure/sales/rating, brand, condition and every photo, from the detail call the item page makes for itself',
@@ -869,7 +830,7 @@ const capabilities = async ({ probe = true }: Args<typeof CAP_ARGS> = {}): Promi
     ],
     anonymous_flakiness: [
       'search_items works logged out, but goofish declines on some page loads: the search call is not even made and the page renders the 猜你喜欢 rail instead. It retries, and only accepts a reply or a page when a fraction of the listing titles really contain the query.',
-      'The three DOM tools (search_items, item_view, recommendations) can also be served goofish\'s risk-control page instead of the app, which renders zero cards and no rail. That is named as risk_control_page in the output, and it clears after a pause; the mtop-only tools keep working throughout because they need only the mtop client.',
+      'The two DOM tools (search_items, item_view) can also be served goofish\'s risk-control page instead of the app, which renders zero cards and no rail. That is named as risk_control_page in the output, and it clears after a pause; the mtop-only tools keep working throughout because they need only the mtop client.',
       'Anonymous page rendering is throttled per IP and degrades to an empty shell with no error; the DOM-scraping tools retry and then report what they got.',
     ],
     notes: [
@@ -893,7 +854,7 @@ const capabilities = async ({ probe = true }: Args<typeof CAP_ARGS> = {}): Promi
       'search pager walk': '30 listings a page at 5-9.5s each, against 13-25s for a fresh page load',
       'how many of a page match': 'varies a lot -- across three sessions `pages: 2` gave 25, 28 and 55 matches of 60 scanned, and `pages: 4` gave 81 of 90. Read `count`; do not assume 30 a page',
       'deep comparison, measured': '`pages: 2, limit: 50, detail: 50` returned 50 full listings, 39 fields and 247 photos, no failures, in 410s',
-      'the mtop-only tools': 'browse_feed / search_count / search_suggest / related_items / seller_profile / seller_items take no page load at all beyond the boot URL, and do not queue behind a search',
+      'the mtop-only tools': 'browse_feed / search_count / related_items / seller_profile / seller_items take no page load at all beyond the boot URL, and do not queue behind a search',
     },
     // The known causes, in the order they were actually observed; static, so it survives a dead browser.
     note: 'goofish did not serve a usable page. Known causes, in the order actually observed: (1) the network resolves goofish to IPv6 but has no working IPv6 route, so Chromium gets ERR_ADDRESS_UNREACHABLE where curl over v4 returns 200; (2) resource exhaustion, ERR_INSUFFICIENT_RESOURCES, usually a small /tmp; (3) goofish answering with its risk-control page instead of the app -- a 200 whose whole body reads "非法访问 ... 请使用正常浏览器访问闲鱼" -- which is the state to check for first, because it is indistinguishable from "no results" unless it is named, and it is server-side so it lifts after a pause; (4) a footer-only shell as a successful 200. The mtop-only tools need only the mtop client, which comes up even on (3) and (4), so they survive every one of these.',
@@ -947,7 +908,6 @@ const capabilities = async ({ probe = true }: Args<typeof CAP_ARGS> = {}): Promi
 type Args<S extends z.ZodRawShape> = Partial<z.infer<z.ZodObject<S>>>;
 const FEED_ARGS = { page_number: z.number().int().min(1).max(MAX_PAGE_NUMBER).default(1), pages: z.number().int().min(1).max(MAX_PAGES).default(1), limit: z.number().int().min(1).max(MAX_LIMIT).default(60) };
 const COUNT_ARGS = { query: z.string().min(1) };
-const SUGGEST_ARGS = { query: z.string().min(1), limit: z.number().int().min(1).max(MAX_LIMIT).default(20) };
 const SEARCH_ARGS = {
   query: z.string().min(1),
   limit: z.number().int().min(1).max(MAX_SEARCH_ITEMS).default(DEFAULT_SEARCH_ITEMS),
@@ -961,18 +921,18 @@ const SEARCH_ARGS = {
     // rate, signature. ~8s warm each, read two at a time on pages of its own; XIANYU_DETAIL_FANOUT sets
     // the width (0-4, default 2) and each listing reports its own `ms` and `via`.
   detail: z.number().int().min(0).max(MAX_SEARCH_DETAIL).default(0),
+  compact: z.boolean().default(false),
 };
 const RELATED_ARGS = { item_id: z.string().optional(), limit: z.number().int().min(1).max(MAX_LIMIT).default(30), page: z.number().int().min(1).max(MAX_PAGE_NUMBER).default(1) };
 const ITEM_ARGS = { item_id: z.string().min(1) };
-const RECO_ARGS = { limit: z.number().int().min(1).max(MAX_LIMIT).default(30), url: z.string().optional() };
 // Both seller tools take the same two alternatives and neither is required: which is missing is the
 // question, and making one required would push that message into every caller's error handling.
 // `resolveSeller` asks. `item_id` is looser on purpose -- an empty string is how a caller says "not
 // this one", which is a better answer than a validation error.
 const SELLER_ARGS = { user_id: z.string().optional(), item_id: z.string().optional() };
-const SELLER_ITEMS_ARGS = { ...SELLER_ARGS, limit: z.number().int().min(1).max(MAX_LIMIT).default(SELLER_PAGE_SIZE), page: z.number().int().min(1).max(MAX_SELLER_PAGE).default(1) };
-type FeedArgs = Args<typeof FEED_ARGS>; type CountArgs = Args<typeof COUNT_ARGS>; type SuggestArgs = Args<typeof SUGGEST_ARGS>;
-type SearchArgs = Args<typeof SEARCH_ARGS>; type RelatedArgs = Args<typeof RELATED_ARGS>; type ItemArgs = Args<typeof ITEM_ARGS>; type RecoArgs = Args<typeof RECO_ARGS>;
+const SELLER_ITEMS_ARGS = { ...SELLER_ARGS, limit: z.number().int().min(1).max(SELLER_PAGE_SIZE).default(SELLER_PAGE_SIZE), page: z.number().int().min(1).max(MAX_SELLER_PAGE).default(1) };
+type FeedArgs = Args<typeof FEED_ARGS>; type CountArgs = Args<typeof COUNT_ARGS>;
+type SearchArgs = Args<typeof SEARCH_ARGS>; type RelatedArgs = Args<typeof RELATED_ARGS>; type ItemArgs = Args<typeof ITEM_ARGS>;
 type SellerArgs = Args<typeof SELLER_ARGS>;
 
 type ToolDef = { name: string; description: string; schema: z.ZodRawShape; run: (args: any) => Promise<Data> };
@@ -987,11 +947,9 @@ export const TOOLS: ToolDef[] = [
   tool({ name: 'capabilities', description: 'Report what this server can do without a Xianyu account right now: session_state, feed_reachable, the split between what works and what is flaky, the measured cost of each call, the known failure causes, and `build` -- which commit is answering your calls and whether it is behind main. Read `build` first if you are measuring performance or trusting a result against the documentation: a deployment can be many commits and a whole release behind and still answer every call plausibly. Start here if you are unsure whether a call will work, what it will cost, or what a refusal means. Never raises, not even if the browser is gone. Args: probe (bool, default true) -- with probe:false this answers ONLY the questions no browser is needed for (`build`, `cache`, the tool list, the measured costs) and returns immediately instead of launching Chromium first, which is what a spawn-time freshness gate or a latency measurement wants. The four live-probe keys are then null with `probes.not_measured` naming them, never a false that would read as a probe having failed.' + NO_ACCOUNT, schema: CAP_ARGS, run: capabilities }),
   tool({ name: 'browse_feed', description: 'Page through goofish\'s public homepage feed: live listings with item_id, title, price, city, seller, want_count and image_urls. Not keyword-filterable, so use it to sample inventory, not to answer a query. Args: page_number (1-10000, default 1), pages (1-25, default 1), limit (max items, default 60).' + NO_ACCOUNT, schema: FEED_ARGS, run: browseFeed }),
   tool({ name: 'search_count', description: 'How many goofish listings match a keyword, and whether there are any. Unlike search_items this is not subject to goofish\'s per-page-load declines -- verified returning about 28,800 for "x220" and 0 for a nonsense string anonymously. Args: query (str).' + NO_ACCOUNT, schema: COUNT_ARGS, run: searchCount }),
-  tool({ name: 'search_suggest', description: 'goofish\'s own search-box autocomplete: keyword suggestions for a prefix, plus the total suggestion count. Args: query (str), limit (default 20).' + NO_ACCOUNT, schema: SUGGEST_ARGS, run: searchSuggest }),
-  tool({ name: 'search_items', description: 'Search goofish listings by keyword, logged out. Depth is two arguments. `pages` (1-10, default 1) walks the result pager for 30 listings a page; it is a floor, not a ceiling -- if the pages walked leave fewer than `limit` matches, up to two more are walked. Read `count` rather than assuming 30 a page. `detail` (0-50, default 0) reads that many of the top-ranked results in full -- description, every photo, and the seller with their city, tenure, sales count, rating, reply rate and signature -- one page load each, two at a time on pages of the session\'s own (`XIANYU_DETAIL_FANOUT`, 0-4, default 2), so the batch costs less wall clock than one load per listing suggests; each listing\'s own `ms` and `via` are in `detail_report`, and the fan-out switches itself back to serial the moment a batch comes back with no answers at all, which `detail_fanout.fell_back` names; `detail_report` also names which listings answered and what goofish said about the ones that did not. Cards already carry price, want count, city, seller, avatar, photo and tags, so ask for `detail` only on a shortlist. `items` holds just the listings whose titles really carry the query -- as the phrase, or as every term in any order, which is what makes Chinese work (`机械硬盘4t` has 70,000+ listings; the titles read 西数4T机械硬盘). `matched_by` says which rule admitted the set. The recommendation rail is never returned as results; goofish declines some page loads outright, so this retries and may raise `SearchUnavailableError`. A search whose (query, page) set this process has already walked answers from the cache with no page load at all -- `via: \'cache\'`, `attempts: 0` -- and a deeper walk reuses the pages it already has instead of clicking the pager again (5-9.5s a page); `cache` reports every page, whether it was a hit and how old it is, and read a listing before relying on its price. For measured costs, call capabilities. Args: query (str), limit (default 120, capped by XIANYU_SEARCH_MAX_ITEMS), attempts (1-10, default 4; the first 3 type into the search box, the last is a direct-URL fallback), pages (1-10, default 1), detail (0-50, default 0).' + NO_ACCOUNT, schema: SEARCH_ARGS, run: locked(searchItems) }),
+  tool({ name: 'search_items', description: 'Search goofish listings by keyword, logged out. Each card has item_id, title, price, want count, city, seller, tags and photo. `items` only holds listings whose titles contain the query (any word order, so 机械硬盘4t matches 西数4T机械硬盘); `matched_by` says which rule admitted them. `pages` (1-10, default 1) adds 30 listings per page. `detail` (0-50, default 0) fills in the top N with description, all photos, shipping and seller sales -- about 8s each, two at a time. Use detail only on a shortlist. A declined page load is retried; if every try is declined the call raises SearchUnavailableError. `cache` on the answer gives each page\'s age; prices older than a few minutes may be stale. Args: query (str), limit (default 120, capped by XIANYU_SEARCH_MAX_ITEMS), attempts (1-10, default 4), pages (1-10, default 1), detail (0-50, default 0).' + NO_ACCOUNT, schema: SEARCH_ARGS, run: locked(searchItems) }),
   tool({ name: 'related_items', description: 'Listings goofish recommends for a given item ("more like this"), or its generic recommendation set when item_id is omitted. Returns real listings with titles, prices and cities. Args: item_id (optional digits or item URL), limit (default 30), page (1-10000, default 1).' + NO_ACCOUNT, schema: RELATED_ARGS, run: relatedItems }),
   tool({ name: 'seller_profile', description: 'One seller\'s public profile, logged out: display name, avatar, signature, credit tier (卖家信用极好), shop level and score, praise ratio, review count, follower and listing counts, and whether they have passed real-name, real-person and 芝麻 checks. Pass `user_id` (the id item_view and this tool report, or the one in a goofish /personal?userId= URL) for a direct mtop call, or `item_id` to mean "whoever is selling this listing" -- which first loads the listing\'s page -- one page load, and on the loads goofish declines item_view\'s own retry loop absorbs the cost -- and additionally returns their city, tenure, sales count and positive rate, the four facts the profile endpoint does not carry. Exactly one of the two; passing both is refused rather than guessed. Fields the call could not fill come back null and are named in `fields_missing` rather than blank. Args: user_id (optional digits), item_id (optional digits or item URL).' + NO_ACCOUNT, schema: SELLER_ARGS, run: sellerProfile }),
-  tool({ name: 'seller_items', description: 'The listings one seller currently has up, logged out -- the 宝贝 tab of their goofish profile, with title, price, category, photo, want count and the label strip. On a site with no ratings and no feedback threads this is the whole of due diligence, and nothing else here can answer it. Pass `user_id` for a direct mtop call, or `item_id` to mean that listing\'s seller (which costs one item page load). `has_more` comes from goofish\'s own `nextPage`; walk `page` rather than assuming 20 a page. Args: user_id (optional digits), item_id (optional digits or item URL), limit (default 20), page (1-50, default 1 -- goofish serves at most 50 pages of 20 here, so walk `has_more` rather than asking for a page number up front).' + NO_ACCOUNT, schema: SELLER_ITEMS_ARGS, run: sellerItems }),
-  tool({ name: 'item_view', description: 'Read one listing, logged out -- title, price, want and browse counts, the description, the seller with their city, tenure, sales and rating, the brand and condition, and every photo. `source` says which route answered -- `item_detail_api` is the full listing, `item_page_dom` is the rendered page, `search_card_cache` is an earlier search result in this session and is missing the description and the seller statistics, which `fields_missing` names rather than guessing. Most often an id that cannot be read has been sold or removed; that raises `DetailUnavailableError`. A listing this process has already read in full is served again from its own cache in ~0s instead of 4-10s, and says so: `cache.hit`, `cache.age_s` and `cache.ttl_s` are on every answer, hit or not, because a listing read 40s ago may since have been sold or repriced -- `XIANYU_CACHE=0` turns the cache off for a live read. Args: item_id (digits or item URL).' + NO_ACCOUNT, schema: ITEM_ARGS, run: locked(itemView) }),
-  tool({ name: 'recommendations', description: 'Scrape goofish\'s recommendation rails (猜你喜欢 / 为你推荐) for an anonymous visitor from any goofish page. Falls back to live feed listings if the DOM will not cooperate, and says so in `source` and `fallback_reason`. Args: limit (default 30), url (optional goofish page to load, default the homepage).' + NO_ACCOUNT, schema: RECO_ARGS, run: locked(recommendations) }),
+  tool({ name: 'seller_items', description: 'The listings one seller currently has up, logged out -- the 宝贝 tab of their goofish profile, with title, price, category, photo, want count and the label strip. On a site with no ratings and no feedback threads this is the whole of due diligence, and nothing else here can answer it. Pass `user_id` for a direct mtop call, or `item_id` to mean that listing\'s seller (which costs one item page load). `has_more` comes from goofish\'s own `nextPage`; walk `page` rather than assuming 20 a page. Args: user_id (optional digits), item_id (optional digits or item URL), limit (1-20, default 20: one goofish page is 20 listings, so ask for more with `page`), page (1-50, default 1 -- walk `has_more`).' + NO_ACCOUNT, schema: SELLER_ITEMS_ARGS, run: sellerItems }),
+  tool({ name: 'item_view', description: 'Read one listing in full, logged out: title, price, want and browse counts, description, every photo, shipping fee, seller city, tenure, sales and rating, brand and condition. `fields_missing` names anything goofish did not return. A sold or removed listing raises DetailUnavailableError. Reads are cached for 45s and `cache.age_s` says how old the answer is; set XIANYU_CACHE=0 for a live read. Args: item_id (digits or item URL).' + NO_ACCOUNT, schema: ITEM_ARGS, run: locked(itemView) }),
 ];

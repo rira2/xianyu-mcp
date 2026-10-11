@@ -626,13 +626,12 @@ test('concurrent mtop calls launch and park the browser once, and never navigate
   };
   (s as any).apiPage = page; (s as any).domPage = page;
   use(s);
-  const [a, b, c] = await Promise.all([
+  const [a, b] = await Promise.all([
     run('search_count')({ query: 'x220' }),
     run('search_count')({ query: 'ipad' }),
-    run('search_suggest')({ query: 'thinkpad' }),
   ]);
   // none of them raised, and none of them navigated while another was in flight
-  assert.equal(a.match_count + b.match_count + c.total_count >= 0, true);
+  assert.equal(a.match_count + b.match_count >= 0, true);
   assert.deepEqual(inFlight, []);
 });
 
@@ -744,13 +743,13 @@ test('the lock is on the three DOM tools and nowhere else, through the registere
   // The regression guard for the defect above, stated about the tool table itself rather than about
   // one hand-wrapped call. Which tools take the shared-page lock is a contract with index.ts -- it
   // must not wrap them again, or the fast tools queue behind every slow one -- so assert it here.
-  const LOCKED = ['search_items', 'item_view', 'recommendations'];
+  const LOCKED = ['search_items', 'item_view'];
   const free = TOOLS.filter((t) => !LOCKED.includes(t.name)).map((t) => t.name);
   // The two seller tools are in the free set for a reason that is not "they never touch the dom page":
   // given a user_id they do not, and given an item_id they take the lock for exactly the hop that
   // resolves the seller and release it before their mtop calls. Wrapping them whole would be the
   // defect this test exists to catch; the scoped lock is pinned by its own invariant scan.
-  assert.deepEqual(free.sort(), ['browse_feed', 'capabilities', 'related_items', 'search_count', 'search_suggest', 'seller_items', 'seller_profile']);
+  assert.deepEqual(free.sort(), ['browse_feed', 'capabilities', 'related_items', 'search_count', 'seller_items', 'seller_profile']);
   // `capabilities` is deliberately free: it only reads, never navigates, and it is the tool an agent
   // calls when something else is stuck -- queueing it behind the stuck search would be perverse.
   // Proof by behaviour: an mtop call in flight while a DOM call holds the lock still answers.
@@ -1108,39 +1107,13 @@ test('item_view refuses to report a different listing\'s fields -- or no listing
   });
 });
 
-test('recommendations reads the DOM rail, and says why it fell back to the feed', async () => {
-  use(makeSession({ scrape: [{ items: [{ item_id: '1', title: '相机', price: '¥1200', url: 'u' }], rail: '为你推荐', says_no_results: false, blocked: false }] }));
-  const dom = await run('recommendations')({ limit: 10 });
-  assert.equal(dom.source, 'dom_recommendation');
-  assert.equal(dom.rail, '为你推荐');
-  assert.equal(dom.risk_control_page, false);
-  assert.equal(dom.items[0].rank, 1);
-  use(makeSession({ scrape: [{ items: [] }], cards: [listed(['9'])] }, { p1: cards(['9']) }));
-  const out = await run('recommendations')({ limit: 5 });
-  assert.equal(out.source, 'homepage_feed');
-  assert.match(out.fallback_reason, /empty shell/);
-  assert.equal(out.requested_url, HOME);
-  assert.equal(out.count, 1);
-
-  // The budget and the elapsed time quoted here both start before the page load, as item_view's do.
-  // A clock started after `open` ignored the slowest step in the call and undercounted it by one load.
-  const slow = use(makeSession({ scrape: [{ items: [] }], cards: [listed(['7'])] }, { p1: cards(['7']) }));
-  slow.open = async () => { await new Promise((r) => setTimeout(r, 1200)); return slow.ensureReady(); };
-  const late = await run('recommendations')({ limit: 5 });
-  assert.match(late.fallback_reason, /after 5 attempt\(s\) in [1-9]\d*s/, 'the page load is inside the budget and inside the reported elapsed time');
-  assert.equal(late.count, 1);
-});
-
 test('navigation is confined to goofish by the real Session, at both sites and after the redirect', async () => {
   // The fake session's `open` is a stand-in; this drives `Session.open` itself, so the check that
   // matters is the real `ensureGoofishUrl` rather than a copy of it sitting in the test double.
-  const { page } = realSession({ queues: { [SCRAPE_CARDS_JS as any]: [{ items: [], rail: '为你推荐' }] } });
-  await assert.rejects(run('recommendations')({ url: 'https://evil.com/steal?_r=1' }), (e: any) => e.constructor.name === 'NavigationError');
-  assert.deepEqual(page.calls, [], 'an off-site target is refused before the browser is moved');
   // and a navigation that lands off-site -- goofish bouncing us, or anything in the page -- is caught
   // on the way back, before the DOM is read
   const bounced = realSession({ land: () => 'https://www.goofish.com.evil.com/', queues: { [SCRAPE_CARDS_JS as any]: [{ items: [{ item_id: '1', title: 'x', url: 'u' }] }] } });
-  await assert.rejects(run('recommendations')({}), (e: any) => e.constructor.name === 'NavigationError');
+  await assert.rejects(run('search_items')({ query: 'x220', attempts: 1 }), (e: any) => e instanceof SearchUnavailableError && /NavigationError/.test(e.message));
   assert.equal(bounced.page.calls.length, 1, 'it tried the target, and stopped there');
 });
 
@@ -1213,23 +1186,6 @@ test('search_count reads the match counter, and zero matches is an answer, not a
     use(makeSession({}, { hitnum: { ok: true, ret: 'SUCCESS', data: { hitnum } } }));
     await assert.rejects(run('search_count')({ query: 'x220' }), (e: any) => e instanceof ParseError && /unreadable hitnum/.test(e.message), JSON.stringify(hitnum));
   }
-});
-
-test('search_suggest normalises, dedupes and respects the default limit of 20', async () => {
-  const items: any[] = Array.from({ length: 25 }, (_, i) => ({ suggest: `x220-${i}`, bucketNum: 30 }));
-  items.push({ suggest: 'x220-0' }, { suggest: '' }, 'not-a-dict');
-  const s = use(makeSession({}, { sug: { ok: true, ret: 'SUCCESS', data: { totalCount: 1234, items } } }));
-  const out = await run('search_suggest')({ query: 'x220' });
-  assert.equal(out.total_count, 1234);
-  assert.equal(out.count, 20, 'the published default limit');
-  assert.deepEqual(out.suggestions[0], { text: 'x220-0', bucket_num: 30 });
-  assert.deepEqual(s.specs[0][0][2], { inputWords: 'x220', searchReqFromPage: 'xyPcHome', bucketId: 30, type: 0 });
-  assert.equal((await run('search_suggest')({ query: 'x220', limit: 3 })).count, 3);
-  use(makeSession({}, { sug: { ok: false, ret: 'RGV587_ERROR', data: null } }));
-  await assert.rejects(run('search_suggest')({ query: 'x220' }), GatedError);
-  // a non-list `items` used to escape as a raw TypeError published as error_type "TypeError"
-  use(makeSession({}, { sug: { ok: true, ret: 'SUCCESS', data: { totalCount: 3, items: { 0: { suggest: 'x220-0' } } } } }));
-  await assert.rejects(run('search_suggest')({ query: 'x220' }), (e: any) => e instanceof ParseError && /non-list `items`/.test(e.message));
 });
 
 // ---- the two seller tools. Both fixtures below are the payloads read off the wire, not invented:
@@ -1688,4 +1644,19 @@ test('tool calls are serialised, so two in flight cannot navigate one page out f
   // a rejected tool releases the lock rather than wedging every call after it
   await assert.rejects(exclusive(async () => { throw new XianyuError('boom'); }), XianyuError);
   assert.equal(await exclusive(async () => 'after'), 'after');
+});
+
+test('compact search returns one line per listing with the fields a scan needs, and the default is still an object', async () => {
+  const c = searchCase('x220', [['联想 X220 笔记本电脑', '4242', '99', '北京', '7']]);
+  use(makeSession({ cards: [c.rows], mtop: c.mtop }));
+  const full = await run('search_items')({ query: 'x220', limit: 1 });
+  assert.equal(typeof full.items[0], 'object', 'the default stays an object');
+  use(makeSession({ cards: [c.rows], mtop: c.mtop }));
+  const compact = await run('search_items')({ query: 'x220', limit: 1, compact: true });
+  assert.equal(typeof compact.items[0], 'string', 'compact returns a line');
+  const line = compact.items[0];
+  assert.match(line, /^1 \| 4242 \| ¥99/, 'rank, id and price lead the line');
+  assert.match(line, /想要7/, 'the want count is in the line');
+  assert.match(line, /北京/, 'the city is in the line');
+  assert.match(line, /联想 X220 笔记本电脑$/, 'the title ends the line');
 });

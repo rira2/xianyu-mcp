@@ -655,6 +655,7 @@ export const FEED_NORMALIZE_JS = (spec: { rows: any[] }): any[] => {
       // `ex.showVideoIcon` is how a search card says it; the feed card has no such field, hence the
       // three-way read rather than a replacement.
       is_video: pick(dp.isVideo, am.isVideo) === 'true' || Boolean(card.videoInfo) || Boolean(ex.is_video),
+      is_auction: Boolean(ex.is_auction),
       category_id: pick(card.categoryId, dp.categoryId),
       image_urls: imageUrls,
       // Search cards carry more than a homepage feed card, and it is all in hand already: the seller's

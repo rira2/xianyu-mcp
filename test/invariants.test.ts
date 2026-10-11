@@ -57,11 +57,10 @@ test('no credential access anywhere in the tree', () => {
   assert.equal(flat(['page.context()', '  .' + 'cookies()'].join('\n')).includes('.' + 'cookies('), true);
 });
 
-test('only the nine read-only mtop APIs are named anywhere: a closed list, so a new one cannot slip in', () => {
+test('only the eight read-only mtop APIs are named anywhere: a closed list, so a new one cannot slip in', () => {
   const readApis = [
     'mtop.taobao.idlehome.home.webpc.feed',
     'mtop.taobao.idle.filter.hitnum.pc.get',
-    'mtop.taobao.idlemtopsearch.pc.search.suggest',
     'mtop.taobao.idle.item.web.recommend.list',
     'mtop.taobao.idlemessage.pc.loginuser.get',
     // The last two are never called by us -- they are named because the *page* calls them and
@@ -78,7 +77,7 @@ test('only the nine read-only mtop APIs are named anywhere: a closed list, so a 
     'mtop.idle.web.user.page.head',
     'mtop.idle.web.xyh.item.list',
   ];
-  assert.equal(readApis.length, 9);
+  assert.equal(readApis.length, 8);
   // `window.lib.mtop.request` is the page's own client method -- the one call this server is built
   // on -- not an API name. Everything else shaped like `mtop.<something>` is an API and is closed.
   const notAnApi = 'mtop.request';
@@ -105,7 +104,7 @@ test('only the nine read-only mtop APIs are named anywhere: a closed list, so a 
 });
 
 test('exactly the ten read-only tools exist, and none of them can change state', () => {
-  assert.deepEqual(TOOLS.map((t) => t.name).sort(), ['browse_feed', 'capabilities', 'item_view', 'recommendations', 'related_items', 'search_count', 'search_items', 'search_suggest', 'seller_items', 'seller_profile']);
+  assert.deepEqual(TOOLS.map((t) => t.name).sort(), ['browse_feed', 'capabilities', 'item_view', 'related_items', 'search_count', 'search_items', 'seller_items', 'seller_profile']);
   for (const t of TOOLS) {
     assert.equal(/publish|delete|remove|message|send|upload|comment|order|buy|checkout|follow|favou?rite/i.test(t.name), false, `${t.name} looks like a write tool`);
   }
@@ -183,10 +182,10 @@ test('the entry point does not serialise the tools: the lock belongs to the thre
   assert.equal(/exclusive/.test(entry), false, 'index.ts must not take the lock; tools.ts owns it. Re-wrapping all ten re-serialises the fast tools behind every slow one.');
   // ...and the lock really is on the three DOM tools, so the promise is kept rather than deleted.
   const toolsSrc = readFileSync(join(ROOT, 'src', 'tools.ts'), 'utf8');
-  for (const name of ['searchItems', 'itemView', 'recommendations']) {
+  for (const name of ['searchItems', 'itemView']) {
     assert.match(toolsSrc, new RegExp(`run: locked\\(${name}\\)`), `${name} reads the shared navigating page and must take the lock`);
   }
-  for (const name of ['browseFeed', 'searchCount', 'searchSuggest', 'relatedItems', 'capabilities']) {
+  for (const name of ['browseFeed', 'searchCount', 'relatedItems', 'capabilities']) {
     assert.equal(new RegExp(`run: locked\\(${name}\\)`).test(toolsSrc), false, `${name} never touches the dom page; locking it only adds latency`);
   }
 });
@@ -221,11 +220,9 @@ test('the published argument names and defaults are exactly these', () => {
     capabilities: { probe: true },
     browse_feed: { page_number: 1, pages: 1, limit: 60 },
     search_count: { query: '<required>' },
-    search_suggest: { query: '<required>', limit: 20 },
-    search_items: { query: '<required>', limit: 120, attempts: 4, pages: 1, detail: 0 },
+    search_items: { query: '<required>', limit: 120, attempts: 4, pages: 1, detail: 0, compact: false },
     related_items: { item_id: '<optional>', limit: 30, page: 1 },
     item_view: { item_id: '<required>' },
-    recommendations: { limit: 30, url: '<optional>' },
     // Both seller tools take two alternatives and neither is required: which one is missing is the
     // question, and a schema that forced one would push the "give exactly one of these" message into
     // every caller's error handling instead of the envelope.
