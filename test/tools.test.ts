@@ -30,7 +30,7 @@ const run = (name: string) => {
  *  can drive the two tools that now read the page's own mtop replies -- `mtop: { detail: {...} }`
  *  makes item_view answer from `mtop.taobao.idle.pc.detail`, `mtop: { search: {...} }` does the same
  *  for search_items -- and can hand back a refusal (`{ ret: 'RGV587_ERROR' }`) as readily as a result. */
-const makeTap = (feed: Record<string, any[]> = {}) => {
+const makeTap = (feed: Record<string, any[]> = {}, delayMs = 0) => {
   const left: Record<string, any[]> = { ...feed };
   return {
     record: () => {},
@@ -39,7 +39,14 @@ const makeTap = (feed: Record<string, any[]> = {}) => {
     // so clearing here would throw away the reply the test is trying to hand over.
     clear: () => {},
     peek: (api: string) => { const l = left[api] ?? []; return l.length ? l[l.length - 1] : null; },
-    take: async (api: string) => { const l = left[api] ?? []; return l.length ? l.shift() : null; },
+    // `delayMs` puts that much wire time between the `take` call and the reply: the fake still ignores
+    // the caller's timeout (tests never wait 32s), but the reply genuinely lands later, which is what
+    // the DOM-first ordering test needs. No reply means no delay.
+    take: async (api: string) => {
+      if (!(left[api] ?? []).length) return null;
+      if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
+      return (left[api] ?? []).shift() ?? null;
+    },
   };
 };
 const ok = (data: any) => ({ ret: 'SUCCESS::调用成功', ok: true, data });
@@ -49,21 +56,32 @@ const refused = (ret: string) => ({ ret, ok: false, data: null });
  *  moves the page off goofish to that URL: at `hijackAfter: 'open'`, on the first tick after `open`
  *  resolves -- after `open`'s own allowlist check, before the caller's first read, the window the
  *  reviewer read a lookalike host off-site in. At `'read'`, on the first wait *after* a read, which is
- *  item_view's 6s readiness poll and the second read site. */
-const makeSession = (payloads: { cards?: any[]; item?: any[]; scrape?: any[]; search?: any; swallow?: number; mtop?: Record<string, any[]>; poolMs?: number; poolSilent?: boolean } = {}, raw: any = {}, sleepMs = 0, hijack = '', hijackAfter: 'open' | 'read' = 'open') => {
+ *  item_view's 6s readiness poll and the second read site.
+ *
+ *  `domDelayMs` is the time between Enter and the SPA's route change: the page keeps the pre-search
+ *  URL for that long, so a test can put a slow render behind an already-arrived mtop reply. `mtopMs`
+ *  is the same idea on the other side, delaying the tap's reply delivery rather than the render. */
+const makeSession = (payloads: { cards?: any[]; item?: any[]; scrape?: any[]; search?: any; swallow?: number; mtop?: Record<string, any[]>; poolMs?: number; poolSilent?: boolean; domDelayMs?: number; mtopMs?: number } = {}, raw: any = {}, sleepMs = 0, hijack = '', hijackAfter: 'open' | 'read' = 'open') => {
   const queues: Record<any, any[]> = { [FEED_NORMALIZE_JS as any]: [...(payloads.cards ?? [])], [ITEM_SCRAPE_JS as any]: [...(payloads.item ?? [])], [SCRAPE_CARDS_JS as any]: [...(payloads.scrape ?? [])] };
   // The searchbox, as a real page holds it: mounted or not, with the keys that have landed so far.
   const search = { mounted: 'search' in payloads ? payloads.search !== null : true, value: '' };
-  let at = HOME, reads = 0;
+  let at = HOME, reads = 0, pending = '', pendingFrom = 0;
+  // The SPA routes a moment after Enter, and `domDelayMs` is that moment. A timer would keep the
+  // process alive past the test; comparing the clock answers the same question when it is asked.
+  const here = () => { if (pending && Date.now() >= pendingFrom) { at = pending; pending = ''; } return at; };
   const page: any = {
-    url: () => { reads++; return at; },
+    url: () => { reads++; return here(); },
     waitForTimeout: async () => { if (hijack && hijackAfter === 'read' && reads > 0) at = hijack; if (sleepMs) await new Promise((r) => setTimeout(r, sleepMs)); },
-    goto: async (u: string) => { at = u; search.value = ''; },
+    goto: async (u: string) => { at = u; pending = ''; search.value = ''; },
     // Only what typeSearch needs: the two in-page reads and the two key actions. `keyboard.type`
     // truncates at `swallow` characters to reproduce the SPA eating a burst across a re-render.
     keyboard: {
       type: async (text: string) => { search.value = payloads.swallow ? text.slice(0, payloads.swallow) : text; },
-      press: async (key: string) => { if (key === 'Enter' && search.value) at = `${HOME}search?q=${encodeURIComponent(search.value)}`; },
+      press: async (key: string) => {
+        if (key !== 'Enter' || !search.value) return;
+        const landed = `${HOME}search?q=${encodeURIComponent(search.value)}`;
+        if (payloads.domDelayMs) { pending = landed; pendingFrom = Date.now() + payloads.domDelayMs; } else at = landed;
+      },
     },
     evaluate: async (fn: any, arg: any) => {
       if (fn === MTOP_READY_JS) return 'ready';
@@ -77,7 +95,7 @@ const makeSession = (payloads: { cards?: any[]; item?: any[]; scrape?: any[]; se
       // under test.
       if (fn === FEED_NORMALIZE_JS && s.runRealNormalizer) return FEED_NORMALIZE_JS(arg);
       if (fn === SEARCH_STATE_JS) {
-        const onSearch = at.includes('/search');
+        const onSearch = here().includes('/search');
         return { typed: search.value, path: onSearch ? '/search' : '/', on_search: onSearch, cards: onSearch ? 30 : 0 };
       }
       const q = queues[fn];
@@ -91,11 +109,11 @@ const makeSession = (payloads: { cards?: any[]; item?: any[]; scrape?: any[]; se
     domReady: async () => page,
     // The dom page is a separate page from the api page, so the four mtop-only tools never wait on a
     // search; the fake keeps one `page` for both because nothing under test depends on them differing.
-    apiTap: makeTap(), domTap: makeTap(payloads.mtop),
+    apiTap: makeTap(), domTap: makeTap(payloads.mtop, payloads.mtopMs),
     // NOT the real guard: this stand-in records what a tool asked for and loads it, nothing more.
     // The real `Session.open`, and the `ensureGoofishUrl` it runs before and after every goto, is
     // exercised for real in the two navigation tests below, against a fake Page.
-    open: async (u: string) => { s.opened.push(u); at = u; search.value = ''; if (hijack && hijackAfter === 'open') queueMicrotask(() => { at = hijack; }); return page; },
+    open: async (u: string) => { s.opened.push(u); at = u; pending = ''; search.value = ''; if (hijack && hijackAfter === 'open') queueMicrotask(() => { at = hijack; }); return page; },
     // The bounded detail pool, as the session hands it out: one page and one tap per slot, created on
     // demand. The tap answers about whatever listing its OWN page was last asked to load, which is what
     // a real page's own detail call does -- and is what makes two concurrent reads provably
@@ -703,6 +721,69 @@ test('search_items answers from the page\'s own search reply, and holds it to th
   assert.ok(out.items.every((i: any) => i.want_count && i.city && i.image_urls.length), 'and each carries the card fields the DOM scrape lost');
   assert.equal(out.attempts, 1);
   assert.deepEqual(s.opened, ['https://www.goofish.com/'], 'one page load: the reply answers it');
+});
+
+test('search_items answers from the API reply without waiting for the DOM render', async () => {
+  // The page's own search call carries the data; the render is downstream of it. With the reply
+  // already in the tap, a page that takes 5s to route must not hold the answer: the tool waits for
+  // the reply, not for the render. `cards` is the same listing set the reply carries, because the
+  // relevance guard normalises whatever came back and would refuse an empty one -- without it this
+  // would measure the guard, not the wait.
+  const c = searchCase('x220', [
+    ['联想Thinkpad X220 笔记本 甲', '1001', '329', '北京', '5'],
+    ['联想Thinkpad X220 笔记本 乙', '1002', '199', '上海', '2'],
+  ]);
+  const s = use(makeSession({ cards: [c.rows], search: {}, mtop: c.mtop, domDelayMs: 5000 }));
+  const began = Date.now();
+  const out = await run('search_items')({ query: 'x220', attempts: 1 });
+  const elapsed = Date.now() - began;
+  assert.equal(out.source, 'search_api');
+  assert.ok(out.count > 0);
+  assert.equal(out.items[0].item_id, '1001', 'the reply answered, not the DOM');
+  assert.equal('result_cards' in out.attempt_log[0], false, 'the attempt was answered by the reply, not by the poll');
+  assert.ok(elapsed < 4000, `answered in ${elapsed}ms: the 5s render wait was paid`);
+  assert.equal(s.opened.length, 1, 'still one page load');
+});
+
+test('search_items still works when the reply arrives only after the DOM', async () => {
+  // The other ordering: the DOM renders at once and the page's reply lands 600ms later. The answer
+  // must still be the reply, which the race only reaches because the reply waiter is registered once
+  // at Enter and claimed by the same attempt -- a second `take` would wait on a queue this attempt's
+  // waiter already drained.
+  const c = searchCase('x220', [
+    ['联想Thinkpad X220 笔记本 甲', '1001', '329', '北京', '5'],
+    ['联想Thinkpad X220 笔记本 乙', '1002', '199', '上海', '2'],
+  ]);
+  use(makeSession({ cards: [c.rows], search: {}, mtop: c.mtop, domDelayMs: 0, mtopMs: 600 }));
+  const out = await run('search_items')({ query: 'x220', attempts: 1 });
+  assert.equal(out.source, 'search_api');
+  assert.equal(out.via, 'searchbox');
+  assert.equal(out.count, 2);
+  assert.equal(out.items[0].item_id, '1001');
+  assert.equal('result_cards' in out.attempt_log[0], true, 'the poll finished first -- and the same attempt still claimed the reply');
+});
+
+test('a search that submits but never answers still fails with the existing taxonomy', async () => {
+  // No reply ever comes and the results page serves the recommendation rail. The typing step still
+  // reports the submission and the card count it saw, the scrape step still reports the rail, and the
+  // refusal is the same SearchUnavailableError with the same evidence.
+  const s = use(makeSession({ scrape: [SEARCH_RAIL, SEARCH_RAIL], search: {}, domDelayMs: 0 }));
+  await assert.rejects(run('search_items')({ query: 'x220', attempts: 2 }), (e: any) => {
+    assert.ok(e instanceof SearchUnavailableError);
+    assert.equal(e.details!.reason, 'unavailable', 'the taxonomy is unchanged');
+    const log = e.details!.attempt_log;
+    const steps = log.filter((x: any) => x.via === 'searchbox' && 'submitted' in x);
+    assert.equal(steps.length, 2, 'both attempts logged the typing step');
+    assert.ok(steps.every((x: any) => x.submitted === true));
+    assert.ok(steps.every((x: any) => x.result_cards === 30), 'and the card count the DOM reported');
+    assert.ok(steps.every((x: any) => x.lost_contexts === 0));
+    const scraped = log.filter((x: any) => 'rendered' in x);
+    assert.equal(scraped.length, 2, 'the DOM fallback still ran and reported itself');
+    assert.deepEqual(scraped.map((x: any) => [x.rendered, x.rail, x.query_hits]), [[true, '猜你喜欢', 0], [true, '猜你喜欢', 0]]);
+    assert.ok(scraped.every((x: any) => typeof x.min_query_hits === 'number' && typeof x.scraped_cards === 'number'));
+    return true;
+  });
+  assert.equal(s.opened.length, 2, 'it retried with a fresh load before giving up');
 });
 
 /** Three real search cards, one of them priced 面议: `searchCase` builds the mtop reply and the rows

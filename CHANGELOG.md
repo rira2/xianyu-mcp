@@ -35,6 +35,12 @@ The Python implementation this is a port of is not in this history at all: it li
   answer carries `price_stats` (count/min/p10/p25/median/p75/p90/max/mean in CNY, or null); `sort`
   orders the kept listings by relevance, price or publish time. The default envelope only gains
   `price_stats`, and filters and `detail` still run on full cards.
+- Answer `search_items` from the page's own search reply without waiting for the results render: from
+  Enter, the reply is raced against a 400ms DOM poll and the first page is published as soon as the
+  reply lands, with the poll left as the fallback for a reply that never comes (it still produces the
+  `enter-did-not-submit` verdict). The pager walk is unchanged, so deeper pages still wait for the
+  page, and every other search behavior -- relevance guard, cache writes, partial results, attempt
+  log, `detail` -- is untouched.
 
 ## [0.2.1] — 2026-10-08
 

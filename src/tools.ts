@@ -6,7 +6,7 @@ import { DetailUnavailableError, describe, GatedError, NavigationError, ParseErr
 import { buildBlock } from './build.ts';
 import { getItem, getSearchPage, itemKey, itemTtl, missed, notCached, observationAge, pageReport, putItem, putSearchPage, searchTtl, stats as cacheStats } from './cache.ts';
 import type { CacheVerdict } from './cache.ts';
-import { DETAIL_POOL_MAX, type DomSurface } from './browser.ts';
+import { DETAIL_POOL_MAX, type DomSurface, type MtopTap, type MtopReply } from './browser.ts';
 import { ensureGoofishUrl, evaluate, exclusive, getSession, HOME, reloadFresh, settle } from './browser.ts';
 import { compact, filterRows, matchesGroups, queryDiagnostics, readCursor, saveCursor, termGroups, type Filters } from './search-policy.ts';
 import { checkpoint, recordPartial, remainingMs } from './runtime.ts';
@@ -346,8 +346,17 @@ const recommendations = async ({ limit = 30, url }: RecoArgs): Promise<Data> => 
 /**
  * Types into the SPA input and returns the attempt log's verdict rather than throwing, because retry
  * is the caller's decision. Three waits: the input (none for 8-14s while the app mounts), the keys
- * (`keyboard.type`; a DOM assignment React never sees submits an empty keyword), and the route. */
-const typeSearch = async (page: Page, query: string, deadline: number): Promise<any> => {
+ * (`keyboard.type`; a DOM assignment React never sees submits an empty keyword), and the answer.
+ *
+ * The answer is raced. The page's own search call carries the data this tool returns and lands
+ * before the render that draws it, so the reply waiter is registered as soon as Enter is pressed and
+ * wins the attempt whenever it arrives. The DOM poll is the fallback for a reply that never comes --
+ * it is still the only source of the `enter-did-not-submit` verdict -- and the waiter is registered
+ * exactly once per attempt and always claimed here, so a reply that lands while the DOM is finishing
+ * is returned rather than left for the caller's own `take`, which would block on a queue this waiter
+ * had already drained.
+ */
+const typeSearch = async (page: Page, tap: MtopTap, query: string, deadline: number): Promise<any> => {
   let box: any = { found: false };
   for (let until = Date.now() + Math.min(SEARCH_INPUT_WAIT_MS, Math.max(0, deadline - Date.now())); Date.now() < until;) {
     box = await scrape(page, SEARCH_INPUT_JS, SEARCH_MARK, 'search input lookup');
@@ -378,15 +387,39 @@ const typeSearch = async (page: Page, query: string, deadline: number): Promise<
   }
   if (box?.value !== query) return { retryable: 'incomplete-keystrokes', typed: String(box?.value ?? ''), wanted: query, home_path: box?.path || '' };
   await page.keyboard.press('Enter');
-  let state: any = { typed: '', on_search: false, cards: 0 }, lostContexts = 0;
-  for (let until = Date.now() + Math.min(SEARCH_RESULT_WAIT_MS, Math.max(0, deadline - Date.now())); Date.now() < until;) {
-    await settle(page, 1000);
-    try { state = await scrape(page, SEARCH_STATE_JS, SEARCH_MARK, 'search submit poll'); }
-    catch (e: unknown) { if (e instanceof NavigationError) throw e; lostContexts++; continue; }   // the SPA replaced the context on its way to /search
-    if (state.on_search && state.cards > 0) break;
+  // From the keystroke on, two independent answers are in flight: the page's search call (the data
+  // this tool returns) and the DOM render that follows it. The reply is read first; the poll is the
+  // fallback, ticking every 400ms so a page that never sends the reply still gets an answer.
+  let state: any = { typed: '', on_search: false, cards: 0 }, lostContexts = 0, stopPoll = false;
+  const replyP = tap.take(SEARCH_API, Math.min(SEARCH_REPLY_WAIT_MS, Math.max(0, deadline - Date.now())));
+  const domP = (async () => {
+    for (let until = Date.now() + Math.min(SEARCH_RESULT_WAIT_MS, Math.max(0, deadline - Date.now())); Date.now() < until && !stopPoll;) {
+      await settle(page, 400);
+      if (stopPoll) break;
+      try { state = await scrape(page, SEARCH_STATE_JS, SEARCH_MARK, 'search submit poll'); }
+      catch (e: unknown) { if (e instanceof NavigationError) throw e; lostContexts++; continue; }   // the SPA replaced the context on its way to /search
+      if (state.on_search && state.cards > 0) break;
+    }
+  })();
+  // A poll that loses the race is abandoned, and the page can be navigated out from under it: the
+  // race below still sees a rejection, this only stops one arriving after the answer from becoming an
+  // unhandled rejection.
+  domP.catch(() => {});
+  try {
+    const first = await Promise.race([replyP.then((reply) => ({ reply })), domP.then(() => null)]);
+    // The reply is the data; the render is not needed for it. Answer now, without the render wait.
+    if (first?.reply) return { submitted: true, reply: first.reply };
+    // The DOM finished first, or the reply waiter ran out while the poll was still reading: wait out
+    // the poll, then claim the one reply this attempt registered.
+    await domP;
+    const reply = await replyP;
+    if (reply) return { submitted: true, reply, typed: state.typed, result_cards: state.cards, lost_contexts: lostContexts };
+    if (!state.on_search) return { retryable: 'enter-did-not-submit', typed: state.typed || '', cards_left_on_home: state.cards || 0, lost_contexts: lostContexts, home_path: state.path || '' };
+    return { submitted: true, reply: null, typed: state.typed, result_cards: state.cards, lost_contexts: lostContexts };
+  } finally {
+    // No path out of this attempt may leave the poll reading the page for the rest of its window.
+    stopPoll = true;
   }
-  if (!state.on_search) return { retryable: 'enter-did-not-submit', typed: state.typed || '', cards_left_on_home: state.cards || 0, lost_contexts: lostContexts, home_path: state.path || '' };
-  return { submitted: true, typed: state.typed, result_cards: state.cards, lost_contexts: lostContexts };
 };
 
 /**
@@ -468,6 +501,9 @@ const searchItems = async (args: SearchArgs): Promise<Data> => {
     // that is off goofish, has no input, or is mid-flight with no results is what forces a load.
     const reuse = via === 'searchbox' && (await warmInputUsable(session));
     let page: Page | null = null;
+    // The reply `typeSearch` claimed while racing the DOM render. Null means the attempt answered on
+    // the DOM side (or failed) and the caller still has to ask the tap for one, as it always did.
+    let early: MtopReply | null = null;
     if (reuse) { page = await session.domReady(); log.push({ attempt: attemptNo, via, reused_page: true, path: page.url() }); }
     else {
       try { page = await session.open(HOME); }
@@ -481,13 +517,19 @@ const searchItems = async (args: SearchArgs): Promise<Data> => {
         // query's results -- a full 30, all of them for the wrong keyword -- and the relevance guard
         // throws away a good answer to go looking for a DOM fallback.
         session.domTap.clear();
-        const step = await typeSearch(page, q, deadline);
-        log.push({ attempt: attemptNo, via, ...step });
+        const step = await typeSearch(page, session.domTap, q, deadline);
+        // Evidence, not payload: the reply is the page's whole result set and the attempt log is
+        // published with every envelope (and stringified into a refusal), so the log keeps the verdict.
+        const { reply: claimed, ...verdict } = step;
+        early = claimed ?? null;
+        log.push({ attempt: attemptNo, via, ...verdict });
         if (!step.submitted) { if (Date.now() >= deadline) break; continue; }
       }
-      // The page's own search call is the answer. `take` claims the reply, so a later attempt cannot
-      // be handed this one -- and the leftover DOM poll below only runs if no reply ever arrived.
-      const reply = await session.domTap.take(SEARCH_API, Math.min(SEARCH_REPLY_WAIT_MS, Math.max(0, deadline - Date.now())));
+      // The page's own search call is the answer. `typeSearch` raced it against the DOM render and
+      // hands it over when it won, so the wait only runs when the render got there first. `take`
+      // claims the reply, so a later attempt cannot be handed this one -- and the leftover DOM poll
+      // below only runs if no reply ever arrived.
+      const reply = early ?? await session.domTap.take(SEARCH_API, Math.min(SEARCH_REPLY_WAIT_MS, Math.max(0, deadline - Date.now())));
       if (reply?.ok) {
         // Walk the pager for the rest. One reply is 30 listings and the search API cannot be
         // re-issued (replaying the page's own payload through the same client answers TIMEOUT), so the

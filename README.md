@@ -318,8 +318,16 @@ search call the page makes for itself, read off the wire. That call cannot be re
 it is the richer one: 30 structured results per query, each with a price, a want count, a city and a
 photo, where the DOM card this used to scrape could see a title and little else.
 
-This is measured, not preferred. A 2x2x2 matrix -- headed/headless x fresh/persistent profile x
-direct-URL/search-input, one fresh browser per cell -- returned results from exactly one cell:
+The answer comes off the wire before the page draws it. The search call the page makes carries the
+data that is returned and lands ahead of the render that uses it, so the tap is registered the moment
+Enter is pressed and the first page is answered as soon as the reply arrives. The DOM poll -- a 400ms
+tick, which is also the fallback for a reply that never comes and the only source of the
+`enter-did-not-submit` verdict -- no longer gates the answer; the pager is the one DOM dependency
+left, and only when more than one page is wanted (or the shortfall top-up runs).
+
+The typed route is measured, not preferred. A 2x2x2 matrix -- headed/headless x fresh/persistent
+profile x direct-URL/search-input, one fresh browser per cell -- returned results from exactly one
+cell:
 
 | cell | cards | cards whose titles contain the query | outcome |
 |---|---|---|---|
@@ -597,6 +605,21 @@ only the *first* `search_items` of a session pays for a page load: later ones re
 input of the page already showing results, which is an SPA route change, 13–15s against 21s for a cold
 load. `item_view` reads the call the page makes for itself, which is both the only route that works and
 far cheaper than the reload-and-retry loop it replaced.
+
+Re-measured on 2026-11-07 for the reply-first search, with the repo's own harness
+(`node scripts/bench-scan.mjs`), one process, headed, three queries at `pages: 1, limit: 60`:
+
+| query | wall | route | listings |
+|---|---|---|---|
+| `thinkpad x220` (the session's first call) | 40.5s | `search_api` / `searchbox` | 56 |
+| `iphone 13` | 12.4s | `search_api` / `searchbox` | 37 |
+| `kindle paperwhite` | 16.0s | `search_api` / `searchbox` | 60 |
+
+The render wait is gone from the page-1 answer, but it was not the floor on this box: the typed
+search's own reply took 7–12s, and one reply carries 30 listings, so `limit: 60` made every one of
+those calls walk one or two pages afterwards at 5–9.5s each -- the pager dependency described above,
+not a render wait. The same three queries at `limit: 30` measured 29.7s for the first call and then
+16.1s and 11.3s. What is left is the reply's own latency and the pager, not a wait this server adds.
 
 Each MCP call now has a total deadline, including time in the DOM queue. `search_items.timeout_s`
 overrides the default; browser waits and navigation are capped by the remaining time. Expired work
