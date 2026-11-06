@@ -738,6 +738,15 @@ clone needs no build step. `tsconfig.build.json` is the emit config for the publ
 two differ only in that. Any import in `src/` keeps its `.ts` extension and `rewriteRelativeImportExtensions`
 turns it into a `.js` one at build time; do not hand-write `.js` imports.
 
+`npm run bench -- scripts/bench-spec.json --out /tmp/xianyu-bench` measures the bulk-scan workflow
+against the built server: the harness spawns one `node dist/index.js`, speaks the same MCP stdio
+protocol a client does, runs the spec's queries in order and prints a line per query plus totals. It
+never retries -- a failed query is data -- and it exits 2 instead of reporting a number when the
+harness or the protocol breaks. `--out DIR` keeps `summary.json` and each raw envelope
+(`<slug>.json`, or one `batch.json` for `--tool search_batch`) in DIR; without it, `summary.json`
+lands in the current directory. `--timeout` sets one call's budget (default 180s). Build first: the
+harness refuses to run against a missing `dist/index.js`.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE). Release notes are in

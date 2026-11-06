@@ -1,0 +1,8 @@
+[
+  { "slug": "p100", "query": "Tesla P100 16G", "pages": 2, "limit": 60 },
+  { "slug": "v100", "query": "Tesla V100 16G", "pages": 2, "limit": 60 },
+  { "slug": "p40", "query": "Tesla P40 24G", "pages": 2, "limit": 60 },
+  { "slug": "rtx3090", "query": "RTX 3090 24G", "pages": 2, "limit": 60 },
+  { "slug": "x99", "query": "精粤 X99 主板 D4", "pages": 2, "limit": 60 },
+  { "slug": "ddr4-ecc", "query": "DDR4 ECC REG 16G 2400", "pages": 2, "limit": 60 }
+]
