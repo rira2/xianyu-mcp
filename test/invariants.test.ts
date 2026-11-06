@@ -38,7 +38,7 @@ test('no credential access anywhere in the tree', () => {
   // credential scan below has to be able to see them. `src/cache.ts` is in it for the same reason one
   // layer down: a module that holds what this server has read off goofish is exactly the module the
   // scans must cover, and a scan that quietly does not cover it is worse than no scan.
-  assert.deepEqual(sources.map((p) => p.replace(`${ROOT}/`, '')).sort(), ['src/browser.ts', 'src/build-info.ts', 'src/build.ts', 'src/cache.ts', 'src/display.ts', 'src/errors.ts', 'src/extract.ts', 'src/index.ts', 'src/response.ts', 'src/runtime.ts', 'src/search-policy.ts', 'src/tools.ts', 'test/build-info.test.ts', 'test/cache.test.ts', 'test/check-deploy.test.ts', 'test/extract.test.ts', 'test/invariants.test.ts', 'test/response.test.ts', 'test/search-policy.test.ts', 'test/serve.test.ts', 'test/tools.test.ts']);
+  assert.deepEqual(sources.map((p) => p.replace(`${ROOT}/`, '')).sort(), ['src/browser.ts', 'src/build-info.ts', 'src/build.ts', 'src/cache.ts', 'src/display.ts', 'src/errors.ts', 'src/extract.ts', 'src/index.ts', 'src/output.ts', 'src/response.ts', 'src/runtime.ts', 'src/search-policy.ts', 'src/tools.ts', 'test/build-info.test.ts', 'test/cache.test.ts', 'test/check-deploy.test.ts', 'test/extract.test.ts', 'test/invariants.test.ts', 'test/output.test.ts', 'test/response.test.ts', 'test/search-policy.test.ts', 'test/serve.test.ts', 'test/tools.test.ts']);
   // `.cookies(` rather than `context.cookies(`, and matched with the whitespace stripped: matching
   // the literal missed `page.context().cookies()` and any call split across lines.
   const forbidden = [
@@ -158,7 +158,7 @@ test('the detail fan-out is reachable only from inside the lock its caller alrea
   // publisher, so there is no way to reach the fan-out that skips the lock
   const search = toolsSrc.match(/const searchItems = async[\s\S]*?\n};/)?.[0] ?? '';
   assert.equal((search.match(/publishSearch\(/g) ?? []).length, 3, 'all three are inside search_items');
-  assert.match(toolsSrc, /run: locked\(searchItems\)/, 'and the tool that reaches it holds the shared lock');
+  assert.match(toolsSrc, /run: locked\(shaped\(searchItems\)\)/, 'and the tool that reaches it holds the shared lock, with the output shaping inside it');
   // The fallback is not a silent one: the fan-out either ran or says why it did not, and both are in
   // the envelope rather than in a comment above this function.
   assert.match(fanout, /fellBack/, 'the answer-rate check is in the loop, not beside it');
@@ -183,8 +183,13 @@ test('the entry point does not serialise the tools: the lock belongs to the thre
   assert.equal(/exclusive/.test(entry), false, 'index.ts must not take the lock; tools.ts owns it. Re-wrapping all ten re-serialises the fast tools behind every slow one.');
   // ...and the lock really is on the three DOM tools, so the promise is kept rather than deleted.
   const toolsSrc = readFileSync(join(ROOT, 'src', 'tools.ts'), 'utf8');
-  for (const name of ['searchItems', 'itemView', 'recommendations']) {
-    assert.match(toolsSrc, new RegExp(`run: locked\\(${name}\\)`), `${name} reads the shared navigating page and must take the lock`);
+  // `search_items` is registered as `locked(shaped(searchItems))`: the shaping wrapper rewrites the
+  // answer the search already built and still runs inside the one lock, so the promise is unchanged.
+  const lockSite: Record<string, string> = {
+    searchItems: 'run: locked\\(shaped\\(searchItems\\)\\)', itemView: 'run: locked\\(itemView\\)', recommendations: 'run: locked\\(recommendations\\)',
+  };
+  for (const [name, registration] of Object.entries(lockSite)) {
+    assert.match(toolsSrc, new RegExp(registration), `${name} reads the shared navigating page and must take the lock`);
   }
   for (const name of ['browseFeed', 'searchCount', 'searchSuggest', 'relatedItems', 'capabilities']) {
     assert.equal(new RegExp(`run: locked\\(${name}\\)`).test(toolsSrc), false, `${name} never touches the dom page; locking it only adds latency`);
@@ -222,7 +227,7 @@ test('the published argument names and defaults are exactly these', () => {
     browse_feed: { page_number: 1, pages: 1, limit: 60 },
     search_count: { query: '<required>' },
     search_suggest: { query: '<required>', limit: 20 },
-    search_items: { query: '<required>', limit: 120, attempts: 4, pages: 1, detail: 0, timeout_s: '<optional>', expand_synonyms: true, min_price: '<optional>', max_price: '<optional>', city: '<optional>', province: '<optional>', exclude_keywords: '<optional>', form_factor: '<optional>', bare_card_only: '<optional>', cursor: '<optional>' },
+    search_items: { query: '<required>', limit: 120, attempts: 4, pages: 1, detail: 0, timeout_s: '<optional>', expand_synonyms: true, min_price: '<optional>', max_price: '<optional>', city: '<optional>', province: '<optional>', exclude_keywords: '<optional>', form_factor: '<optional>', bare_card_only: '<optional>', cursor: '<optional>', compact: false, sort: 'relevance' },
     related_items: { item_id: '<optional>', limit: 30, page: 1 },
     item_view: { item_id: '<required>' },
     recommendations: { limit: 30, url: '<optional>' },

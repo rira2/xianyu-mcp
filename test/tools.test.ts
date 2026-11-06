@@ -705,6 +705,88 @@ test('search_items answers from the page\'s own search reply, and holds it to th
   assert.deepEqual(s.opened, ['https://www.goofish.com/'], 'one page load: the reply answers it');
 });
 
+/** Three real search cards, one of them priced 面议: `searchCase` builds the mtop reply and the rows
+ *  the fake page would scrape from the same three listings, so a test cannot accidentally score a
+ *  payload against a different fixture. */
+const shapedCase = () => searchCase('thinkpad x220', [
+  ['联想Thinkpad X220 笔记本 甲', '1001', '300', '北京', '1'],
+  ['联想Thinkpad X220 笔记本 乙', '1002', '100', '上海', '2'],
+  ['联想Thinkpad X220 笔记本 丙', '1003', '面议', '广州', '0'],
+]);
+
+test('search_items adds price statistics over the kept listings and leaves the default card alone', async () => {
+  // The default call is additive: today's envelope plus `price_stats`, with the full card, the
+  // evidence trail and the relevance order exactly as they were. 面议 is not a price, so it is left
+  // out of every figure rather than counted as cheap.
+  const c = shapedCase();
+  const s = use(makeSession({ cards: [c.rows], mtop: c.mtop }));
+  s.runRealNormalizer = true;
+  const out = await run('search_items')({ query: 'thinkpad x220' });
+  assert.deepEqual(out.items.map((i: any) => i.item_id), ['1001', '1002', '1003'], 'relevance order is untouched');
+  assert.deepEqual(out.items.map((i: any) => i.rank), [1, 2, 3]);
+  assert.equal(out.items[0].typed.price_amount, 300, 'the full card is still there');
+  assert.ok(out.attempt_log.length, 'and so is the evidence trail');
+  assert.equal('compact' in out, false, 'nothing opts a caller into the new mode by accident');
+  assert.equal(out.count, 3);
+  assert.equal(out.price_stats.count, 2);
+  assert.equal(out.price_stats.min, 100);
+  assert.equal(out.price_stats.max, 300);
+  assert.equal(out.price_stats.median, 200, 'the unknown price did not pull the median down');
+});
+
+test('search_items compact returns the deal fields, drops the evidence trail and keeps the count', async () => {
+  const c = shapedCase();
+  const s = use(makeSession({ cards: [c.rows], mtop: c.mtop }));
+  s.runRealNormalizer = true;
+  const out = await run('search_items')({ query: 'thinkpad x220', compact: true });
+  assert.equal(out.compact, true);
+  assert.equal(out.count, 3, 'compaction changes the size of the envelope, not the size of the answer');
+  assert.equal('attempt_log' in out, false);
+  assert.equal(out.attempts, 1, 'the attempt count survives without the log');
+  assert.equal('sample_titles' in out.diagnostics, false);
+  assert.deepEqual(out.items.map((i: any) => i.item_id), ['1001', '1002', '1003']);
+  assert.deepEqual(Object.keys(out.items[0]).sort(), ['city', 'item_id', 'price', 'price_amount', 'publish_time', 'rank', 'seller', 'title', 'url', 'want_count']);
+  assert.equal(out.items[0].price_amount, 300, 'the typed price rides along as a number');
+  assert.equal('typed' in out.items[0], false, 'and the block it came from does not');
+  assert.equal(out.price_stats.count, 2);
+});
+
+test('search_items sort reorders the kept listings and renumbers their ranks, on full cards', async () => {
+  // The sort has to run before any compaction, on the cards `detail` and the filters read: a card
+  // whose price was unknown sorts last instead of first.
+  const c = shapedCase();
+  const s = use(makeSession({ cards: [c.rows], mtop: c.mtop }));
+  s.runRealNormalizer = true;
+  const out = await run('search_items')({ query: 'thinkpad x220', sort: 'price_asc' });
+  assert.deepEqual(out.items.map((i: any) => i.item_id), ['1002', '1001', '1003']);
+  assert.deepEqual(out.items.map((i: any) => i.rank), [1, 2, 3]);
+  assert.equal(out.items[0].typed.price_amount, 100, 'the full card is what was sorted');
+  assert.equal(out.items[0].title, '联想Thinkpad X220 笔记本 乙');
+  assert.equal(out.price_stats.min, 100);
+});
+
+test('compact and sort run after `detail`, so the reported prices are the deepened ones', async () => {
+  // The shaping wrapper reads the answer `searchItems` finished with, which is only true if it wraps
+  // the call rather than sitting inside it: `detail` re-reads each shortlisted listing and re-checks
+  // the filters on what came back, and a compacted envelope would leave both with no `typed` block.
+  process.env.XIANYU_DETAIL_FANOUT = '0';
+  const rows = Array.from({ length: 3 }, (_, i) => [`联想 X220 ${i}`, String(400 + i), String(100 + i * 10), '北京', '2']);
+  const c = searchCase('x220', rows);
+  const detail = (id: string) => ok({ itemDO: { itemId: id, title: `联想 X220 详情 ${id}`, soldPrice: '123', wantCnt: 4, browseCnt: 900, desc: '成色好' }, sellerDO: { nick: '卖家', city: '北京', hasSoldNumInteger: 12 } });
+  use(makeSession({ cards: [c.rows], mtop: {
+    'mtop.taobao.idlemtopsearch.pc.search': c.mtop['mtop.taobao.idlemtopsearch.pc.search'],
+    'mtop.taobao.idle.pc.detail': [detail('400'), detail('401'), detail('402')],
+  } }));
+  const out = await run('search_items')({ query: 'x220', detail: 3, limit: 3, compact: true, sort: 'price_asc', attempts: 1 });
+  assert.equal(out.detail_report.length, 3, 'the per-listing detail report survives compaction');
+  assert.equal(out.items.length, 3);
+  assert.ok(out.items.every((i: any) => i.price_amount === 123), 'the compact card carries the price the detail read returned, not the search card\'s');
+  assert.equal(out.price_stats.min, 123);
+  assert.equal(out.price_stats.max, 123);
+  assert.equal('description' in out.items[0], false, 'and the detail block itself is not what a compact caller pays for');
+  assert.equal('typed' in out.items[0], false);
+});
+
 test('search_items refuses a search reply that is really the recommendation rail', async () => {
   // A declined anonymous search answers SUCCESS with 30 recommendations and no matches. A `hits > 0`
   // test would pass that; a fraction over the whole reply does not. A known rejected API set is retried without another DOM poll.

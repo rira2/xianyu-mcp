@@ -11,6 +11,7 @@ import { ensureGoofishUrl, evaluate, exclusive, getSession, HOME, reloadFresh, s
 import { compact, filterRows, matchesGroups, queryDiagnostics, readCursor, saveCursor, termGroups, type Filters } from './search-policy.ts';
 import { checkpoint, recordPartial, remainingMs } from './runtime.ts';
 import { failureDetails } from './response.ts';
+import { shapeSearchData } from './output.ts';
 import { detailListing, enrichListing, FEED_NORMALIZE_JS, ITEM_SCRAPE_JS, PAGER_CLICK_JS, PAGER_STATE_JS, queryTerms, RAIL_MARKERS, SCROLL_TO_JS, SCRAPE_CARDS_JS, searchListings, SEARCH_INPUT_JS, SEARCH_MARK, SEARCH_STATE_JS, sellerListings, sellerProfileOf } from './extract.ts';
 type Data = Record<string, any>;
 // Endpoints observed in goofish bundles. DETAIL_API and SEARCH_API are tapped from page requests
@@ -1072,6 +1073,12 @@ const SEARCH_ARGS = {
   exclude_keywords: z.array(z.string().trim().min(1)).max(50).optional(),
   form_factor: z.enum(['pcie', 'sxm2', 'sxm3', 'sxm4', 'sxm5']).optional(),
   bare_card_only: z.boolean().optional(), cursor: z.string().min(1).max(100).optional(),
+// Output shaping rather than search behaviour: `compact` is the response mode (not search-policy's
+  // title-normalisation helper of the same name) and `sort` reorders what was kept. Both are applied
+  // at the tool boundary, after `detail` and the filter re-checks, which is why neither is read inside
+  // `searchItems`.
+  compact: z.boolean().default(false),
+  sort: z.enum(['relevance', 'price_asc', 'price_desc', 'newest']).default('relevance'),
 };
 const RELATED_ARGS = { item_id: z.string().optional(), limit: z.number().int().min(1).max(MAX_LIMIT).default(30), page: z.number().int().min(1).max(MAX_PAGE_NUMBER).default(1) };
 const ITEM_ARGS = { item_id: z.string().min(1) };
@@ -1092,6 +1099,11 @@ type ToolDef = { name: string; description: string; schema: z.ZodRawShape; run: 
  *  other's page as its own data. The mtop-only tools and `capabilities` never touch it, so making them
  *  queue bought latency and nothing else. */
 const locked = (run: (args: any) => Promise<Data>): ((args: any) => Promise<Data>) => (args: any) => exclusive(() => run(args));
+/** Shape a search answer at the tool boundary, never inside `searchItems`. `detail` enrichment and
+ *  the filter re-checks read full cards, and compacting before them would hand both an envelope whose
+ *  `typed` block -- the prices and the filter facts -- is gone. */
+const shaped = (fn: (args: any) => Promise<Data>): ((args: any) => Promise<Data>) => async (args: any) =>
+  shapeSearchData(await fn(args), { compact: args.compact, sort: args.sort });
 const tool = <S extends z.ZodRawShape>(def: { name: string; description: string; schema: S; run: (args: Args<S>) => Promise<Data> }): ToolDef => def as ToolDef;
 const NO_ACCOUNT = ' No Xianyu account, cookie or login is required or used. Read-only: this server cannot publish, message, or change anything.';
 export const TOOLS: ToolDef[] = [
@@ -1099,7 +1111,7 @@ export const TOOLS: ToolDef[] = [
   tool({ name: 'browse_feed', description: 'Read pages of the public homepage feed. Returns listings, count and page reports. This feed is not a keyword search and has no verified upstream filters. Use search_items for a product query. Args: page_number (1-10000), pages (1-25), limit (1-500, default 60).' + NO_ACCOUNT, schema: FEED_ARGS, run: browseFeed }),
   tool({ name: 'search_count', description: 'Get Goofish’s keyword inventory estimate, not the number of cards this server can retrieve. A positive count does not prove search_items can load results, and may include broad matches. Refusals and unreadable counts are errors, never zero. Args: query.' + NO_ACCOUNT, schema: COUNT_ARGS, run: searchCount }),
   tool({ name: 'search_suggest', description: 'Get Goofish’s autocomplete suggestions for a query prefix. Returns suggestions and count; this is not a product search. Args: query, limit (1-500, default 20).' + NO_ACCOUNT, schema: SUGGEST_ARGS, run: searchSuggest }),
-  tool({ name: 'search_items', description: 'Search product listings by typing a query into Goofish. Only relevant titles are returned; punctuation and spacing are normalized, and Xeon/至强 are equivalent unless expand_synonyms:false. Args: query; pages (1-10, default 1, with up to 2 top-up pages); limit (1-300, default 120, further capped by XIANYU_SEARCH_MAX_ITEMS); detail (0-50, default 0, enrich a shortlist); attempts (1-10, default 4); timeout_s (1-600, bounds total time including queue and detail). Optional filters: min_price/max_price in CNY, city, province, exclude_keywords, form_factor (pcie/sxm2/sxm3/sxm4/sxm5), bare_card_only. Filters run on fetched cards, not at Goofish; unknown price/location/hardware fails a requested filter. Bare-card matching requires explicit title evidence. Read status, diagnostics, effective_limit and freshness. Partial calls retain items and next_cursor; resume with the same query and cursor (10-minute process-local lifetime), preserving original filters. Errors report retry_after_s; do not retry during cooldown. Prices and counts are numeric under typed, with raw strings preserved.' + NO_ACCOUNT, schema: SEARCH_ARGS, run: locked(searchItems) }),
+  tool({ name: 'search_items', description: 'Search product listings by typing a query into Goofish. Only relevant titles are returned; punctuation and spacing are normalized, and Xeon/至强 are equivalent unless expand_synonyms:false. Args: query; pages (1-10, default 1, with up to 2 top-up pages); limit (1-300, default 120, further capped by XIANYU_SEARCH_MAX_ITEMS); detail (0-50, default 0, enrich a shortlist); attempts (1-10, default 4); timeout_s (1-600, bounds total time including queue and detail). Optional filters: min_price/max_price in CNY, city, province, exclude_keywords, form_factor (pcie/sxm2/sxm3/sxm4/sxm5), bare_card_only. Filters run on fetched cards, not at Goofish; unknown price/location/hardware fails a requested filter. Bare-card matching requires explicit title evidence. Read status, diagnostics, effective_limit and freshness. Partial calls retain items and next_cursor; resume with the same query and cursor (10-minute process-local lifetime), preserving original filters. Errors report retry_after_s; do not retry during cooldown. Prices and counts are numeric under typed, with raw strings preserved. compact:true keeps only item_id, rank, title, price, price_amount, city, want_count, seller, url (plus tags/publish_time when the card has them), drops attempt_log and diagnostics.sample_titles, and returns the same listings in a fraction of the bytes. sort (relevance default, price_asc, price_desc, newest) reorders the kept listings and renumbers rank; an unknown price or date sorts last. Every answer carries price_stats: count, min, p10, p25, median, p75, p90, max and mean over typed.price_amount, currency CNY, or null when no kept listing carried a numeric price.' + NO_ACCOUNT, schema: SEARCH_ARGS, run: locked(shaped(searchItems)) }),
   tool({ name: 'related_items', description: 'Read products Goofish recommends for an item; these are recommendations, not keyword matches. Omit item_id for generic suggestions. Returns items and count. Args: item_id (digits or item URL, optional), limit (1-500, default 30), page (1-10000).' + NO_ACCOUNT, schema: RELATED_ARGS, run: relatedItems }),
   tool({ name: 'seller_profile', description: 'Read a seller’s public profile and trust fields. Pass exactly one of user_id (seller digits or profile URL) or item_id (listing digits or URL). A user_id needs one API call; item_id first loads the listing and can add city, sales, tenure and reply rate. Unknown facts are null and named in fields_missing. No account is required.' + NO_ACCOUNT, schema: SELLER_ARGS, run: sellerProfile }),
   tool({ name: 'seller_items', description: 'Read a seller’s listings. Pass exactly one of user_id or item_id; item_id first loads the listing to identify its seller. Each page contains at most 20 cards; limit (1-20, default 20) only truncates that page. Walk page (1-50) while has_more is true. Returns effective_limit, page_size, items and numeric fields under typed.' + NO_ACCOUNT, schema: SELLER_ITEMS_ARGS, run: sellerItems }),

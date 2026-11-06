@@ -195,6 +195,25 @@ strings remain compatible; consume `typed.price_amount`, `typed.original_price_a
 approximate (e.g. 1.2万 → 12000), range, negotiable and unknown prices. Prose such as deposits is
 never guessed into a price. Range/negotiable/unknown prices fail a numeric price-band filter.
 
+`compact: true` keeps only the deal fields a scan needs — `item_id`, `rank`, `title`, `price`,
+`price_amount`, `city`, `want_count`, `seller` and `url`, plus `tags` and `publish_time` when the card
+carries them — and drops `attempt_log` (the attempt count stays in `attempts`) and
+`diagnostics.sample_titles`. `count`, `next_cursor`, `freshness` and the rest of `diagnostics` are
+passed through, and `compact: true` says so in the envelope. It is the same answer in a fraction of
+the bytes; the default (`false`) envelope is unchanged. Compaction happens at the tool boundary, after
+`detail` enrichment and the filter re-checks, so both still read full cards.
+
+`price_stats` is on every `search_items` answer: `count`, `min`, `p10`, `p25`, `median`, `p75`, `p90`,
+`max` and `mean` over `typed.price_amount`, with `currency: "CNY"` — or `null` when no kept listing
+had a numeric price. `count` is how many listings were measured, which is not `count` of the answer:
+an unknown price is left out of every figure rather than counted as zero. Percentiles interpolate
+between the closest ranks, the same rule the benchmark uses.
+
+`sort` reorders the kept listings before any compaction: `relevance` (the default) keeps Goofish’s
+own order, `price_asc`/`price_desc` sort on `typed.price_amount`, and `newest` sorts on
+`publish_time`. A listing whose price or date is unknown goes last in either direction, and any sort
+other than `relevance` renumbers `rank` 1..n.
+
 Observed rate-limit or risk-control failures recommend an initial 60-second pause and establish a
 process-wide cooldown; another measured failure after cooldown increases it, capped at 300 seconds.
 No blind sleeps occur inside a tool call. Static `capabilities(probe:false)` remains available.

@@ -29,6 +29,12 @@ The Python implementation this is a port of is not in this history at all: it li
 - Reject malformed success payloads and unsafe inventory counts. Stop known throttles immediately,
   enforce a visible process cooldown, and avoid redundant DOM polling of rejected API results.
 - Publish effective limits, cap seller pages at 20 cards, and shorten tool descriptions.
+- Shape `search_items` answers at the tool boundary: `compact: true` keeps the deal fields
+  (`item_id`, `rank`, `title`, `price`, `price_amount`, `city`, `want_count`, `seller`, `url`, plus
+  `tags`/`publish_time` when present) and drops `attempt_log` and `diagnostics.sample_titles`; every
+  answer carries `price_stats` (count/min/p10/p25/median/p75/p90/max/mean in CNY, or null); `sort`
+  orders the kept listings by relevance, price or publish time. The default envelope only gains
+  `price_stats`, and filters and `detail` still run on full cards.
 
 ## [0.2.1] — 2026-10-08
 
