@@ -11,14 +11,14 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { BOOT_URL, DETAIL_POOL_MAX, exclusive, HOME, reloadFresh, Session, setSession } from '../src/browser.ts';
+import { BOOT_URL, DETAIL_POOL_MAX, exclusive, HOME, MtopTap, reloadFresh, Session, setSession } from '../src/browser.ts';
 import { BrowserError, DetailUnavailableError, GatedError, NavigationError, ParseError, SearchUnavailableError, XianyuError } from '../src/errors.ts';
 import { FEED_NORMALIZE_JS, ITEM_SCRAPE_JS, MTOP_READY_JS, PAGER_CLICK_JS, PAGER_STATE_JS, SCRAPE_CARDS_JS, SEARCH_INPUT_JS, SEARCH_STATE_JS } from '../src/extract.ts';
 import { budget, fanoutSize, ITEM_FIELDS, resetCardCache, TOOLS } from '../src/tools.ts';
 import { reset as resetCaches } from '../src/cache.ts';
 import { z } from 'zod';
 import { executeTool, resetCooldown } from '../src/response.ts';
-import { putSearchPage } from '../src/cache.ts';
+import { getSearchPage, putSearchPage } from '../src/cache.ts';
 
 const run = (name: string) => {
   const t = TOOLS.find((x) => x.name === name);
@@ -29,20 +29,31 @@ const run = (name: string) => {
 /** A stand-in for the network tap on a page. `feed` hands back each reply once, in order, so a test
  *  can drive the two tools that now read the page's own mtop replies -- `mtop: { detail: {...} }`
  *  makes item_view answer from `mtop.taobao.idle.pc.detail`, `mtop: { search: {...} }` does the same
- *  for search_items -- and can hand back a refusal (`{ ret: 'RGV587_ERROR' }`) as readily as a result. */
-const makeTap = (feed: Record<string, any[]> = {}, delayMs = 0) => {
+ *  for search_items -- and can hand back a refusal (`{ ret: 'RGV587_ERROR' }`) as readily as a result.
+ *
+ *  `live` delegates to the real `MtopTap`, for the one test that needs the tap's own delivery rule
+ *  (a reply claimed by a waiter must not also be queued). The feed then only names the replies in
+ *  order: the fake page announces each one with `record` at the event that provokes it, as the page's
+ *  response listener does, instead of leaving it in a take-side queue. The wait is capped so a test
+ *  that loses a reply fails in seconds rather than in `SEARCH_REPLY_WAIT_MS`. */
+const makeTap = (feed: Record<string, any[]> = {}, delayMs = 0, live = false) => {
   const left: Record<string, any[]> = { ...feed };
+  const real = live ? new MtopTap() : null;
   return {
-    record: () => {},
-    // No-op on purpose. The seed models a reply the page is about to make, not a backlog of ones it
-    // has already made, and the code calls `clear()` immediately before it provokes the next call --
-    // so clearing here would throw away the reply the test is trying to hand over.
-    clear: () => {},
+    record: (r: any) => { real?.record(r); },
+    // Non-live is a no-op on purpose. The seed models a reply the page is about to make, not a backlog
+    // of ones it has already made, and the code calls `clear()` immediately before it provokes the
+    // next call -- so clearing here would throw away the reply the test is trying to hand over. In
+    // live mode it clears the real tap, and nothing has been announced yet at that point.
+    clear: () => { real?.clear(); },
     peek: (api: string) => { const l = left[api] ?? []; return l.length ? l[l.length - 1] : null; },
+    /** The next seeded reply for `api`, for the fake page to announce through `record` (live mode). */
+    next: (api: string) => (left[api] ?? []).shift() ?? null,
     // `delayMs` puts that much wire time between the `take` call and the reply: the fake still ignores
     // the caller's timeout (tests never wait 32s), but the reply genuinely lands later, which is what
     // the DOM-first ordering test needs. No reply means no delay.
-    take: async (api: string) => {
+    take: async (api: string, timeoutMs = 0) => {
+      if (real) return real.take(api, Math.min(timeoutMs, 2000));
       if (!(left[api] ?? []).length) return null;
       if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
       return (left[api] ?? []).shift() ?? null;
@@ -61,8 +72,20 @@ const refused = (ret: string) => ({ ret, ok: false, data: null });
  *  `domDelayMs` is the time between Enter and the SPA's route change: the page keeps the pre-search
  *  URL for that long, so a test can put a slow render behind an already-arrived mtop reply. `mtopMs`
  *  is the same idea on the other side, delaying the tap's reply delivery rather than the render. */
-const makeSession = (payloads: { cards?: any[]; item?: any[]; scrape?: any[]; search?: any; swallow?: number; mtop?: Record<string, any[]>; poolMs?: number; poolSilent?: boolean; domDelayMs?: number; mtopMs?: number } = {}, raw: any = {}, sleepMs = 0, hijack = '', hijackAfter: 'open' | 'read' = 'open') => {
+const makeSession = (payloads: { cards?: any[]; item?: any[]; scrape?: any[]; search?: any; swallow?: number; mtop?: Record<string, any[]>; poolMs?: number; poolSilent?: boolean; domDelayMs?: number; mtopMs?: number; liveMtop?: boolean } = {}, raw: any = {}, sleepMs = 0, hijack = '', hijackAfter: 'open' | 'read' = 'open') => {
   const queues: Record<any, any[]> = { [FEED_NORMALIZE_JS as any]: [...(payloads.cards ?? [])], [ITEM_SCRAPE_JS as any]: [...(payloads.item ?? [])], [SCRAPE_CARDS_JS as any]: [...(payloads.scrape ?? [])] };
+  // `liveMtop`: the tap is the real `MtopTap` and the fake page announces the seeded replies through
+  // `record` at Enter and at each pager click, so a test sees the tap's delivery rule rather than a
+  // take-side queue. The setTimeout is the wire: it lands after the next `take` has registered, which
+  // is the ordering a real response has.
+  const liveMtop = Boolean(payloads.liveMtop);
+  const announce = () => {
+    const next = s.domTap.next('mtop.taobao.idlemtopsearch.pc.search');
+    // The seeded feed is the reply's `ret`/`ok`/`data`; a tapped reply also carries the API its URL
+    // names, because the real listener records under that key. The tap keys on `api`, not on the
+    // `take` argument, so the fake must stamp it to be a reply at all.
+    if (next) setTimeout(() => s.domTap.record({ ...next, api: 'mtop.taobao.idlemtopsearch.pc.search' }), 0);
+  };
   // The searchbox, as a real page holds it: mounted or not, with the keys that have landed so far.
   const search = { mounted: 'search' in payloads ? payloads.search !== null : true, value: '' };
   let at = HOME, reads = 0, pending = '', pendingFrom = 0;
@@ -81,6 +104,7 @@ const makeSession = (payloads: { cards?: any[]; item?: any[]; scrape?: any[]; se
         if (key !== 'Enter' || !search.value) return;
         const landed = `${HOME}search?q=${encodeURIComponent(search.value)}`;
         if (payloads.domDelayMs) { pending = landed; pendingFrom = Date.now() + payloads.domDelayMs; } else at = landed;
+        if (liveMtop) announce();
       },
     },
     evaluate: async (fn: any, arg: any) => {
@@ -89,7 +113,13 @@ const makeSession = (payloads: { cards?: any[]; item?: any[]; scrape?: any[]; se
         ? { found: true, focused: true, value: search.value, inputs: 1, chars: 1200, path: '/' }
         : { found: false, inputs: 0, chars: 512, path: '/', value: '' };
       if (fn === PAGER_STATE_JS) return { on_page: s.on_page };
-      if (fn === PAGER_CLICK_JS) { s.pagers.push(String(arg.page)); if (s.max_page >= Number(arg.page)) s.on_page = String(arg.page); return { ok: s.max_page >= Number(arg.page), on_page: arg.page }; }
+      if (fn === PAGER_CLICK_JS) {
+        s.pagers.push(String(arg.page));
+        if (s.max_page >= Number(arg.page)) s.on_page = String(arg.page);
+        const answer = { ok: s.max_page >= Number(arg.page), on_page: arg.page };
+        if (liveMtop && answer.ok) announce();
+        return answer;
+      }
       // The real normaliser, on the rows the tool actually passed. A canned queue cannot express this:
       // how many cards come out of the pool depends on how many pages were walked, which is the thing
       // under test.
@@ -109,7 +139,7 @@ const makeSession = (payloads: { cards?: any[]; item?: any[]; scrape?: any[]; se
     domReady: async () => page,
     // The dom page is a separate page from the api page, so the four mtop-only tools never wait on a
     // search; the fake keeps one `page` for both because nothing under test depends on them differing.
-    apiTap: makeTap(), domTap: makeTap(payloads.mtop, payloads.mtopMs),
+    apiTap: makeTap(), domTap: makeTap(payloads.mtop, payloads.mtopMs, liveMtop),
     // NOT the real guard: this stand-in records what a tool asked for and loads it, nothing more.
     // The real `Session.open`, and the `ensureGoofishUrl` it runs before and after every goto, is
     // exercised for real in the two navigation tests below, against a fake Page.
@@ -748,8 +778,8 @@ test('search_items answers from the API reply without waiting for the DOM render
 test('search_items still works when the reply arrives only after the DOM', async () => {
   // The other ordering: the DOM renders at once and the page's reply lands 600ms later. The answer
   // must still be the reply, which the race only reaches because the reply waiter is registered once
-  // at Enter and claimed by the same attempt -- a second `take` would wait on a queue this attempt's
-  // waiter already drained.
+  // at Enter and claimed by the same attempt -- and the tap delivers a reply to one consumer, so that
+  // claim does not leave a second copy for the caller's `take`.
   const c = searchCase('x220', [
     ['联想Thinkpad X220 笔记本 甲', '1001', '329', '北京', '5'],
     ['联想Thinkpad X220 笔记本 乙', '1002', '199', '上海', '2'],
@@ -761,6 +791,26 @@ test('search_items still works when the reply arrives only after the DOM', async
   assert.equal(out.count, 2);
   assert.equal(out.items[0].item_id, '1001');
   assert.equal('result_cards' in out.attempt_log[0], true, 'the poll finished first -- and the same attempt still claimed the reply');
+});
+
+test('a reply the wait consumed is not walked again as page 2', async () => {
+  // The pager take is the tap's next consumer. If the page-1 reply `typeSearch` claimed had also
+  // been queued, that take would hand page 1's data to the page-2 slot: ten cards instead of twenty,
+  // and page 2's cache entry would hold page 1's listings. `liveMtop` runs the real MtopTap and the
+  // fake page announces each reply through `record` after the provoking event, so what is pinned is
+  // the tap's delivery rule, not a take-side queue in the fake.
+  resetCaches();
+  const q = 'x220';
+  const rows = (n: number) => Array.from({ length: 10 }, (_, i) => [`联想 X220 ${n}-${i}`, String(n * 100 + i), '50', '北京', '1']);
+  const s = use(makeSession({ search: {}, liveMtop: true, mtop: { 'mtop.taobao.idlemtopsearch.pc.search': [ok(searchReply(q, rows(1))), ok(searchReply(q, rows(2)))] } }));
+  s.runRealNormalizer = true;
+  const out = await run('search_items')({ query: q, pages: 2, limit: 10, attempts: 1 });
+  assert.equal(out.pages_fetched, 2, 'page 2 was walked');
+  assert.deepEqual(s.pagers, ['2']);
+  assert.equal(out.scraped_cards, 20, 'page 2 held its own ten listings, not page 1 again');
+  const page2 = getSearchPage(q, 2);
+  assert.ok(page2, 'the walked page was cached under page 2');
+  assert.deepEqual(page2.value.resultList.map((r: any) => r.data.item.main.clickParam.args.item_id), rows(2).map((r) => r[1]), 'and the cache entry is page 2\'s data');
 });
 
 test('a search that submits but never answers still fails with the existing taxonomy', async () => {

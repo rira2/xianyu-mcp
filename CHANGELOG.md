@@ -38,9 +38,12 @@ The Python implementation this is a port of is not in this history at all: it li
 - Answer `search_items` from the page's own search reply without waiting for the results render: from
   Enter, the reply is raced against a 400ms DOM poll and the first page is published as soon as the
   reply lands, with the poll left as the fallback for a reply that never comes (it still produces the
-  `enter-did-not-submit` verdict). The pager walk is unchanged, so deeper pages still wait for the
-  page, and every other search behavior -- relevance guard, cache writes, partial results, attempt
-  log, `detail` -- is untouched.
+  `enter-did-not-submit` verdict). A tapped reply is delivered to one consumer only -- the waiting
+  `take` or the tap's queue, never both -- so the pager walk that follows cannot be handed page 1's
+  reply as page 2. The pager walk itself is unchanged, so deeper pages still wait for the page. The
+  reply-first typing step logs the submission (`attempt`, `via`, `submitted`), while the DOM-first
+  step keeps today's keys (`typed`, `result_cards`, `lost_contexts`); the relevance guard, cache
+  writes, partial results and `detail` are untouched.
 
 ## [0.2.1] — 2026-10-08
 

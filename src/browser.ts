@@ -84,23 +84,32 @@ export const DETAIL_POOL_MAX = 4;
  * prevents concurrent loads from assigning a verdict to the wrong listing. */
 export type DomSurface = { page: Page; tap: MtopTap; load: { url: string; declined: string; ms: number } };
 
-/** Collects mtop responses from a page. `take` returns and removes the next reply for an API;
- * timed-out waiters are removed as well. */
+/** Collects mtop responses from a page. A reply is delivered by one route only: to the `take`s
+ * already waiting for its API, or else into the bounded per-API queue. A queued reply is removed by
+ * the `take` that returns it, and a timed-out waiter is removed as well, so no queued reply is ever
+ * served twice. */
 export class MtopTap {
   private readonly replies = new Map<string, MtopReply[]>();
   private readonly waiters = new Map<string, ((r: MtopReply) => void)[]>();
   private readonly onReply?: (r: MtopReply) => void;
   constructor(onReply?: (r: MtopReply) => void) { this.onReply = onReply; }
   record(r: MtopReply): void {
+    this.onReply?.(r);
+    const waiters = this.waiters.get(r.api);
+    if (waiters?.length) {
+      // A waiting `take` owns this reply. Queueing it as well would hand the same payload out a second
+      // time; in `search_items` that second consumer is the pager walk, which then stores page 1's
+      // data under the next page's number.
+      this.waiters.delete(r.api);
+      for (const resolve of waiters) resolve(r);
+      return;
+    }
     const list = this.replies.get(r.api) ?? [];
     list.push(r);
     // Bounded: a long-lived page fires these on every scroll and every feed rail, and an unbounded
     // array of full search payloads is a memory leak with a 70s search attached to it.
     while (list.length > 8) list.shift();
     this.replies.set(r.api, list);
-    this.onReply?.(r);
-    for (const resolve of this.waiters.get(r.api) ?? []) resolve(r);
-    this.waiters.delete(r.api);
   }
   /** The next unhanded reply for `api`, or wait up to `timeoutMs` for one. null means none came. */
   async take(api: string, timeoutMs: number): Promise<MtopReply | null> {

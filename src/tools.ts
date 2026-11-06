@@ -343,6 +343,16 @@ const recommendations = async ({ limit = 30, url }: RecoArgs): Promise<Data> => 
   return { source: 'dom_recommendation', rail: payload.rail || '', page_url: page.url(), account_required: false, attempts: attemptNo, says_no_results_for_query: Boolean(payload.says_no_results), risk_control_page: Boolean(payload.blocked), count: items.length, items };
 };
 
+/** One typed-search attempt's verdict. `submitted` is absent only on the two input failures that
+ *  never got as far as Enter; the trailing evidence keys are the ones those pre-existing failure
+ *  verdicts already carried in the attempt log. */
+type SearchStep = {
+  submitted?: boolean; reply?: MtopReply | null;
+  typed?: string; result_cards?: number; lost_contexts?: number;
+  retryable?: string; wanted?: string; home_path?: string;
+  inputs_on_page?: number; page_chars?: number; cards_left_on_home?: number;
+};
+
 /**
  * Types into the SPA input and returns the attempt log's verdict rather than throwing, because retry
  * is the caller's decision. Three waits: the input (none for 8-14s while the app mounts), the keys
@@ -352,11 +362,11 @@ const recommendations = async ({ limit = 30, url }: RecoArgs): Promise<Data> => 
  * before the render that draws it, so the reply waiter is registered as soon as Enter is pressed and
  * wins the attempt whenever it arrives. The DOM poll is the fallback for a reply that never comes --
  * it is still the only source of the `enter-did-not-submit` verdict -- and the waiter is registered
- * exactly once per attempt and always claimed here, so a reply that lands while the DOM is finishing
- * is returned rather than left for the caller's own `take`, which would block on a queue this waiter
- * had already drained.
+ * exactly once per attempt and always claimed here. A tapped reply goes to exactly one consumer: a
+ * waiting `take`, else the tap's queue. The reply this attempt returns therefore never also sits in
+ * that queue for the caller's own `take`, and the pager walk cannot be handed it as a later page.
  */
-const typeSearch = async (page: Page, tap: MtopTap, query: string, deadline: number): Promise<any> => {
+const typeSearch = async (page: Page, tap: MtopTap, query: string, deadline: number): Promise<SearchStep> => {
   let box: any = { found: false };
   for (let until = Date.now() + Math.min(SEARCH_INPUT_WAIT_MS, Math.max(0, deadline - Date.now())); Date.now() < until;) {
     box = await scrape(page, SEARCH_INPUT_JS, SEARCH_MARK, 'search input lookup');
