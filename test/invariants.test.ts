@@ -38,7 +38,7 @@ test('no credential access anywhere in the tree', () => {
   // credential scan below has to be able to see them. `src/cache.ts` is in it for the same reason one
   // layer down: a module that holds what this server has read off goofish is exactly the module the
   // scans must cover, and a scan that quietly does not cover it is worse than no scan.
-  assert.deepEqual(sources.map((p) => p.replace(`${ROOT}/`, '')).sort(), ['src/browser.ts', 'src/build-info.ts', 'src/build.ts', 'src/cache.ts', 'src/display.ts', 'src/errors.ts', 'src/extract.ts', 'src/index.ts', 'src/output.ts', 'src/replay.ts', 'src/response.ts', 'src/runtime.ts', 'src/search-policy.ts', 'src/tools.ts', 'test/browser-tap.test.ts', 'test/build-info.test.ts', 'test/cache.test.ts', 'test/check-deploy.test.ts', 'test/extract.test.ts', 'test/invariants.test.ts', 'test/output.test.ts', 'test/replay.test.ts', 'test/response.test.ts', 'test/search-policy.test.ts', 'test/serve.test.ts', 'test/tools.test.ts']);
+  assert.deepEqual(sources.map((p) => p.replace(`${ROOT}/`, '')).sort(), ['src/batch.ts', 'src/browser.ts', 'src/build-info.ts', 'src/build.ts', 'src/cache.ts', 'src/display.ts', 'src/errors.ts', 'src/extract.ts', 'src/index.ts', 'src/output.ts', 'src/replay.ts', 'src/response.ts', 'src/runtime.ts', 'src/search-policy.ts', 'src/tools.ts', 'test/batch.test.ts', 'test/browser-tap.test.ts', 'test/build-info.test.ts', 'test/cache.test.ts', 'test/check-deploy.test.ts', 'test/extract.test.ts', 'test/invariants.test.ts', 'test/output.test.ts', 'test/replay.test.ts', 'test/response.test.ts', 'test/search-policy.test.ts', 'test/serve.test.ts', 'test/tools.test.ts']);
   const forbidden = [
     'storageState', 'launchPersistentContext', 'userDataDir',
     'cookie2', 'sgcookie', 'x5sec', 'addCookies', 'localStorage', 'sessionStorage',
@@ -119,8 +119,8 @@ test('only the nine read-only mtop APIs are named anywhere: a closed list, so a 
   assert.deepEqual(write.match(/mtop\.[A-Za-z0-9_.]+/g), [write]);
 });
 
-test('exactly the ten read-only tools exist, and none of them can change state', () => {
-  assert.deepEqual(TOOLS.map((t) => t.name).sort(), ['browse_feed', 'capabilities', 'item_view', 'recommendations', 'related_items', 'search_count', 'search_items', 'search_suggest', 'seller_items', 'seller_profile']);
+test('exactly the eleven read-only tools exist, and none of them can change state', () => {
+  assert.deepEqual(TOOLS.map((t) => t.name).sort(), ['browse_feed', 'capabilities', 'item_view', 'recommendations', 'related_items', 'search_batch', 'search_count', 'search_items', 'search_suggest', 'seller_items', 'seller_profile']);
   for (const t of TOOLS) {
     assert.equal(/publish|delete|remove|message|send|upload|comment|order|buy|checkout|follow|favou?rite/i.test(t.name), false, `${t.name} looks like a write tool`);
   }
@@ -189,20 +189,22 @@ test('every tool says that no account is required, and that it is read-only', ()
   }
 });
 
-test('the entry point does not serialise the tools: the lock belongs to the three DOM tools only', () => {
+test('the entry point does not serialise the tools: the lock belongs to the four page-reading tools only', () => {
   // The regression guard for a defect that shipped: index.ts wrapped *every* tool in `exclusive()`,
   // so the four mtop-only tools queued behind a 70s search -- exactly the latency the two-page
   // session exists to remove -- while browser.ts's own comment claimed they did not. Nothing failed,
   // because the test that "proved" it called `t.run` directly and hand-wrapped the search itself.
   // Read the source, because the property is about the entry point, not about any one tool's runtime.
   const entry = readFileSync(join(ROOT, 'src', 'index.ts'), 'utf8');
-  assert.equal(/exclusive/.test(entry), false, 'index.ts must not take the lock; tools.ts owns it. Re-wrapping all ten re-serialises the fast tools behind every slow one.');
-  // ...and the lock really is on the three DOM tools, so the promise is kept rather than deleted.
+  assert.equal(/exclusive/.test(entry), false, 'index.ts must not take the lock; tools.ts owns it. Re-wrapping all eleven re-serialises the fast tools behind every slow one.');
+  // ...and the lock really is on the four page-reading tools, so the promise is kept rather than deleted.
   const toolsSrc = readFileSync(join(ROOT, 'src', 'tools.ts'), 'utf8');
   // `search_items` is registered as `locked(shaped(searchItems))`: the shaping wrapper rewrites the
   // answer the search already built and still runs inside the one lock, so the promise is unchanged.
+  // `search_batch` is one lock around the whole list, because every query in it walks the same page.
   const lockSite: Record<string, string> = {
     searchItems: 'run: locked\\(shaped\\(searchItems\\)\\)', itemView: 'run: locked\\(itemView\\)', recommendations: 'run: locked\\(recommendations\\)',
+    searchBatch: 'run: locked\\(searchBatch\\)',
   };
   for (const [name, registration] of Object.entries(lockSite)) {
     assert.match(toolsSrc, new RegExp(registration), `${name} reads the shared navigating page and must take the lock`);
@@ -243,7 +245,11 @@ test('the published argument names and defaults are exactly these', () => {
     browse_feed: { page_number: 1, pages: 1, limit: 60 },
     search_count: { query: '<required>' },
     search_suggest: { query: '<required>', limit: 20 },
-    search_items: { query: '<required>', limit: 120, attempts: 4, pages: 1, detail: 0, timeout_s: '<optional>', expand_synonyms: true, min_price: '<optional>', max_price: '<optional>', city: '<optional>', province: '<optional>', exclude_keywords: '<optional>', form_factor: '<optional>', bare_card_only: '<optional>', cursor: '<optional>', compact: false, sort: 'relevance' },
+    search_items: { query: '<required>', limit: 120, attempts: 4, pages: 1, topup_pages: 2, detail: 0, timeout_s: '<optional>', expand_synonyms: true, min_price: '<optional>', max_price: '<optional>', city: '<optional>', province: '<optional>', exclude_keywords: '<optional>', form_factor: '<optional>', bare_card_only: '<optional>', cursor: '<optional>', compact: false, sort: 'relevance' },
+    // A bulk scan is the one place the depth default is 0: the pages a query asks for are what it
+    // pays for, and the top-up exists for a single search's completeness rather than a scan's speed.
+    // `queries` publishes as one required array argument even though each element has its own shape.
+    search_batch: { queries: '<required>', compact: true, sort: 'relevance', timeout_s: 180, attempts: 2, per_query_timeout_s: 60 },
     related_items: { item_id: '<optional>', limit: 30, page: 1 },
     item_view: { item_id: '<required>' },
     recommendations: { limit: 30, url: '<optional>' },

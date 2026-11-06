@@ -1121,11 +1121,13 @@ test('the mtop-only tools do not queue behind a search on the shared page', asyn
   assert.equal(s.launches, 0);
 });
 
-test('the lock is on the three DOM tools and nowhere else, through the registered tool table', async () => {
+test('the lock is on the four page-reading tools and nowhere else, through the registered tool table', async () => {
   // The regression guard for the defect above, stated about the tool table itself rather than about
   // one hand-wrapped call. Which tools take the shared-page lock is a contract with index.ts -- it
   // must not wrap them again, or the fast tools queue behind every slow one -- so assert it here.
-  const LOCKED = ['search_items', 'item_view', 'recommendations'];
+  // `search_batch` is in the set because it is `search_items` in a loop: every query it runs walks the
+  // same shared page, so the whole list has to hold the lock rather than each query separately.
+  const LOCKED = ['search_items', 'search_batch', 'item_view', 'recommendations'];
   const free = TOOLS.filter((t) => !LOCKED.includes(t.name)).map((t) => t.name);
   // The two seller tools are in the free set for a reason that is not "they never touch the dom page":
   // given a user_id they do not, and given an item_id they take the lock for exactly the hop that
@@ -2194,4 +2196,101 @@ test('detail rechecks price and title filters when a listing changed since its c
     assert.equal(out.post_detail_filter.query_mismatches, 1);
     assert.equal(out.post_detail_filter.reasons.above_max_price, 1);
   } finally { delete process.env.XIANYU_DETAIL_FANOUT; resetCaches(); }
+});
+
+// ---------------------------------------------------------------- search_batch, and per-query depth
+
+test('search_batch walks only the pages each query asks for, through the real search tool', async () => {
+  resetCaches(); resetCooldown();
+  const calls: any[] = [];
+  use(makeSession({ replay: async (api: string, data: any) => { calls.push({ api, pageNumber: data.pageNumber }); return replayAnswer(data); } }));
+  const out = await executeTool(TOOLS.find((t) => t.name === 'search_batch')!, { queries: [{ query: 'thinkpad x220' }], timeout_s: 60 });
+  assert.equal(out.ok, true);
+  assert.equal(out.status, 'success');
+  assert.equal(out.count, 30, 'the batch asked for 60 listings but only for page 1: 30 is what one page holds');
+  const data = out.data!;
+  const entry = data.queries[0];
+  assert.deepEqual([entry.index, entry.query], [0, 'thinkpad x220']);
+  assert.equal(entry.ok, true);
+  assert.equal(entry.status, 'success');
+  assert.equal(entry.count, 30);
+  assert.equal(entry.source, 'search_api');
+  assert.equal(entry.via, 'search_replay', 'the query reports the route that answered it');
+  assert.equal(entry.pages_fetched, 1);
+  assert.equal(entry.items[0].image_urls, undefined, 'compact cards are the batch default');
+  assert.equal(entry.price_stats.count, 30, 'and every query carries its own price statistics');
+  // Omitting `topup_pages` on a batch query must send 0, not search_items' own default of 2: with 30
+  // of 60 kept, a top-up walk would ask for pages 2 and 3.
+  assert.deepEqual(calls.map((c) => c.pageNumber), [1], 'no extra page was bought for the shortfall');
+  assert.equal(data.totals.requested, 1);
+  assert.equal(data.totals.listings, 30);
+  assert.equal(data.totals.unique_listings, 30);
+  assert.equal(data.totals.duplicates, 0);
+  assert.equal(data.partial, false);
+  assert.deepEqual(data.failed_queries, []);
+  assert.equal(data.stop_reason, null);
+});
+
+test('search_batch keeps going when one query is refused, and the call is partial rather than failed', async () => {
+  resetCaches(); resetCooldown();
+  const calls: string[] = [];
+  use(makeSession({ replay: async (api: string, data: any) => { calls.push(data.keyword); return replayAnswer(data); } }));
+  const out = await executeTool(TOOLS.find((t) => t.name === 'search_batch')!, {
+    // The search tool refuses an inverted price band before it asks the site anything, which is a
+    // per-query failure with no network in it -- exactly the case isolation is for.
+    queries: [{ query: 'thinkpad x220', min_price: 1000, max_price: 900 }, { query: 'thinkpad x220' }],
+    timeout_s: 60,
+  });
+  assert.equal(out.ok, true, 'the call itself answered');
+  assert.equal(out.status, 'partial');
+  assert.equal(out.count, 30, 'the listings from the query that did run are still returned');
+  const data = out.data!;
+  assert.equal(data.queries[0].ok, false);
+  assert.equal(data.queries[0].status, 'error');
+  assert.equal(data.queries[0].error_type, 'XianyuError');
+  assert.match(data.queries[0].message, /min_price|max_price/);
+  assert.deepEqual(data.queries[0].items, []);
+  assert.equal(data.queries[1].ok, true);
+  assert.equal(data.queries[1].items.length, 30, 'the query after the failure still ran');
+  assert.deepEqual(data.failed_queries, [0]);
+  assert.equal(data.partial, true);
+  assert.deepEqual(calls, ['thinkpad x220'], 'only the valid query reached goofish');
+  assert.equal(out.retryable, true, 'a failed query is a retryable call: the rest can be asked again');
+});
+
+test('search_batch publishes its query-list bounds and refuses what falls outside them', async () => {
+  resetCaches(); resetCooldown();
+  use(makeSession());
+  const def = TOOLS.find((t) => t.name === 'search_batch')!;
+  const empty = await executeTool(def, { queries: [] });
+  assert.equal(empty.ok, false);
+  assert.match(empty.message ?? '', /queries/);
+  const tooMany = await executeTool(def, { queries: Array.from({ length: 21 }, (_, i) => ({ query: `q${i}` })) });
+  assert.equal(tooMany.ok, false);
+  assert.match(tooMany.message ?? '', /queries/);
+  // A misspelled per-query control is refused rather than silently dropped into the default: a scan
+  // that asked for page 2 and got page 1 would be the wrong answer with the right shape.
+  const typo = await executeTool(def, { queries: [{ query: 'thinkpad x220', page: 2 }] });
+  assert.equal(typo.ok, false);
+  assert.match(typo.message ?? '', /page/);
+  assert.equal(typo.count, 0);
+});
+
+test('topup_pages: 0 walks exactly the pages asked for; without it the walk still tops up', async () => {
+  resetCaches();
+  const pages: number[] = [];
+  use(makeSession({ replay: async (api: string, data: any) => { pages.push(Number(data.pageNumber)); return replayAnswer(data); } }));
+  const exact = await run('search_items')({ query: 'thinkpad x220', pages: 2, limit: 60, topup_pages: 0 });
+  assert.equal(exact.via, 'search_replay');
+  assert.equal(exact.pages_fetched, 2, 'the two pages asked for are the two pages read');
+  assert.deepEqual(pages, [1, 2], 'no third page was fetched for the shortfall');
+  assert.equal(exact.count, 60);
+  // And the default is what it always was: a set still short of `limit` walks up to two more pages.
+  resetCaches();
+  const topped: number[] = [];
+  use(makeSession({ replay: async (api: string, data: any) => { topped.push(Number(data.pageNumber)); return replayAnswer(data); } }));
+  const deep = await run('search_items')({ query: 'thinkpad x220', pages: 1, limit: 120 });
+  assert.deepEqual(topped, [1, 2, 3], 'one page asked for, and the shortfall topped up to the two-page bound');
+  assert.equal(deep.pages_fetched, 3);
+  assert.equal(deep.count, 90);
 });

@@ -227,6 +227,59 @@ present on every card; shortlist with `detail` or use `seller_profile` rather th
 
 See [the issue audit](docs/issue-audit.md) for the scope and remaining limitations.
 
+## Bulk scans
+
+A deal scan is a list of keywords compared against each other, and asking for them one call at a time
+makes the caller carry the orchestration: a timeout per call, a sleep after a throttle, and a decision
+about whether a failure ended the scan. `search_batch` puts that in one call:
+
+```json
+{
+  "queries": [
+    { "query": "Tesla P100 16G", "pages": 2, "limit": 60 },
+    { "query": "Tesla V100 16G", "pages": 2, "limit": 60 },
+    { "query": "DDR4 ECC REG 16G 2400", "pages": 2, "limit": 60, "min_price": 100 }
+  ],
+  "compact": true,
+  "sort": "price_asc",
+  "timeout_s": 180
+}
+```
+
+It runs 1–20 queries **in order on the same page**, and answers once. Every query reports its own
+`ok`, `status`, `count`, `ms` and the route that answered (`source`, `via`, `pages_fetched`, plus
+`stop_reason` when one applies), with its `items` and `price_stats` shaped exactly as `search_items`
+shapes them. **A failed query does not fail the call**: the queries after it still run, and its row
+carries `error_type`, `message`, `retryable`, `retry_after_s` and, when the tool can name it,
+`reason`. A query the call never reached — the deadline, or this process's throttle cooldown — is
+`skipped: true` with `status: "skipped"`, so `ok: false` always says whether Goofish refused that
+query or never saw it.
+
+`totals` counts `requested`, `ok`, `empty`, `partial`, `failed`, `listings`, `unique_listings` and
+`duplicates` across the list; `failed_queries` names the indexes that failed; `stop_reason` is
+`timeout` or `cooldown` when the call stopped early; and `partial` is true whenever a query failed or
+the call stopped early. `count` is every listing returned, duplicates included — `unique_listings` is
+what a merged scan actually holds.
+
+The defaults are the batch's own, and they are not `search_items`':
+
+- `compact: true` — the deal fields only; a scan reads price, city and title.
+- Per query `pages: 1`, `limit: 60`, `detail: 0` and **`topup_pages: 0`**. A single search tops up by
+  up to two pages when the pages asked for come back short; a scan asks for the pages it will read
+  and pays for no others, because the second page of sixty is bought for a price comparison rather
+  than for a complete inventory. Pass `topup_pages` on a query to get the single-search behaviour
+  back.
+- `timeout_s: 180` bounds the **whole** list, `per_query_timeout_s: 60` bounds one query and is
+  clipped to whatever is left of the call, and `attempts: 2` is the per-query retry count.
+
+Measured against the built server, one `search_batch` of six two-page queries answered 6/6 in **25.4s**
+and 156KB (263 listings, 262 unique, one duplicate), every page from the signed replay — the first
+query paid for the browser launch (15s) and the rest answered in 1.6–2.7s each. Replaying is a route,
+not a promise: on a later run Goofish refused it with `RGV587_ERROR` and the same six queries answered
+6/6 through the typed fallback in 99–109s, the first query paying a page load and a typed search. So a
+scan that cares about its wall clock should read `via` on each row. `npm run bench` runs the same thing
+from a spec file; see [Development](#development).
+
 ## The two seller tools
 
 `seller_profile` and `seller_items` answer the two questions about a seller that nothing else here can:

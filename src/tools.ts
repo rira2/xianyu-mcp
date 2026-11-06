@@ -4,13 +4,14 @@ import { z } from 'zod';
 import type { Page } from 'playwright';
 import { DetailUnavailableError, describe, GatedError, NavigationError, ParseError, SearchUnavailableError, XianyuError } from './errors.ts';
 import { buildBlock } from './build.ts';
+import { runBatch, type BatchArgs } from './batch.ts';
 import { getItem, getSearchPage, itemKey, itemTtl, missed, notCached, observationAge, pageReport, putItem, putSearchPage, searchTtl, stats as cacheStats } from './cache.ts';
 import type { CacheVerdict } from './cache.ts';
 import { DETAIL_POOL_MAX, type DomSurface, type MtopTap, type MtopReply } from './browser.ts';
 import { ensureGoofishUrl, evaluate, exclusive, getSession, HOME, reloadFresh, settle } from './browser.ts';
 import { compact, filterRows, matchesGroups, queryDiagnostics, readCursor, saveCursor, termGroups, type Filters } from './search-policy.ts';
 import { checkpoint, recordPartial, remainingMs } from './runtime.ts';
-import { failureDetails } from './response.ts';
+import { cooldown, failureDetails } from './response.ts';
 import { shapeSearchData } from './output.ts';
 import { detailListing, enrichListing, FEED_NORMALIZE_JS, ITEM_SCRAPE_JS, PAGER_CLICK_JS, PAGER_STATE_JS, queryTerms, RAIL_MARKERS, SCROLL_TO_JS, SCRAPE_CARDS_JS, searchListings, SEARCH_INPUT_JS, SEARCH_MARK, SEARCH_STATE_JS, sellerListings, sellerProfileOf } from './extract.ts';
 import { DETAIL_API, SEARCH_API, detailPayload, replayEnabled, searchPayload } from './replay.ts';
@@ -70,7 +71,11 @@ const DETAIL_FANOUT_DEFAULT = 2;
 // How many extra pages a walk may take when the ones it was asked for leave fewer than `limit`
 // matches. It is named here rather than inside the walk because the cache fast path has to know the
 // deepest page a call could reach before it can decide whether it can answer without a browser at all.
+// It is also the published default of `topup_pages`, which lets a caller turn the top-up off.
 const SEARCH_TOPUP_PAGES = 2;
+// What one `search_batch` call gets by default. The whole list shares this wall clock while each query
+// has a shorter budget of its own; 180s is the acceptance run's ceiling, with room for one throttle.
+const BATCH_TIMEOUT_S = 180;
 // Maximum search walk: ten pages of 30 listings, also bounded by the wall-clock budget.
 const MAX_SEARCH_ITEMS = MAX_SEARCH_PAGES * 30, DEFAULT_SEARCH_ITEMS = 120;
 // How long item_view waits for the page's own detail call before it calls the listing dead. The reply
@@ -442,15 +447,15 @@ const typeSearch = async (page: Page, tap: MtopTap, query: string, deadline: num
  * on purpose: measured, clicking them meant the result list never rendered at all, and both scrapers
  * read through the overlay anyway. */
 const searchItems = async (args: SearchArgs): Promise<Data> => {
-  let { query, limit = DEFAULT_SEARCH_ITEMS, attempts = SEARCH_ATTEMPTS, pages = 1, detail = 0, timeout_s, expand_synonyms = true, cursor, ...filters } = args;
+  let { query, limit = DEFAULT_SEARCH_ITEMS, attempts = SEARCH_ATTEMPTS, pages = 1, detail = 0, topup_pages, timeout_s, expand_synonyms = true, cursor, ...filters } = args;
   const resumed = cursor ? readCursor(cursor, requireQuery(query)) : null;
   const startPage = resumed?.nextPage ?? 1;
   if (cursor) {
     const saved = resumed!.options;
-    ({ limit, pages, detail, expand_synonyms, ...filters } = saved as any);
+    ({ limit, pages, detail, topup_pages, expand_synonyms, ...filters } = saved as any);
   }
   if (filters.min_price !== undefined && filters.max_price !== undefined && filters.min_price > filters.max_price) throw new XianyuError('min_price must be <= max_price');
-  const controls = { limit, pages, detail, expand_synonyms, ...filters };
+  const controls = { limit, pages, detail, topup_pages, expand_synonyms, ...filters };
   let diagnostics: any = { ...queryDiagnostics(requireQuery(query), [], expand_synonyms), inventory: { match_count: null, state: 'not_measured' } };
   let pageProgress: any = null;
   const finish = async (rows: any[], q: string, cap: number, normalize: any) => {
@@ -477,8 +482,11 @@ const searchItems = async (args: SearchArgs): Promise<Data> => {
   // them: the 8-deep case measured 0/8 answered before this.
   const started = Date.now(), deadline = started + remainingMs((timeout_s ?? budget('SEARCH', detail > 0 ? Math.min(600, 60 + detail * 10) : 90)) * 1000);
   // The deepest page this call could reach, needed before the walk starts: it is the last page the
-  // cache fast path has to find before it can answer with no page in the process at all.
-  const deepLimit = Math.min(MAX_SEARCH_PAGES, Math.ceil(searchCap() / 30), pagesWanted + SEARCH_TOPUP_PAGES);
+  // cache fast path has to find before it can answer with no page in the process at all. `topup_pages`
+  // is how many extra pages the walk may take beyond the ones asked for, so 0 means the walk is
+  // exactly `pages` deep -- a bulk scan asks for the pages it wants and pays for no others.
+  const topup = clamp(topup_pages ?? SEARCH_TOPUP_PAGES, 0, SEARCH_TOPUP_PAGES);
+  const deepLimit = Math.min(MAX_SEARCH_PAGES, Math.ceil(searchCap() / 30), pagesWanted + topup);
 // The whole call can end here -- every page asked for is cached, so no page load, no keystroke, no
     // mtop call, and no chance of being declined by a site that declines some loads. Cached pages face
     // the same relevance guard as live ones (`finishSearch`), and normalising them needs no page,
@@ -652,7 +660,10 @@ const searchItems = async (args: SearchArgs): Promise<Data> => {
         for (let want = Math.max(2, startPage); want <= deepLimit; want++) {
           checkpoint();
           nextPage = want;
-          if (want > pagesWanted && (pageProgress?.count ?? 0) >= cap) break;
+          // A page past the ones asked for is a top-up, and there is no top-up when the caller turned
+          // it off -- `deepLimit` already stops the loop there, and this says why at the one place the
+          // walk decides to go deeper.
+          if (want > pagesWanted && (topup === 0 || (pageProgress?.count ?? 0) >= cap)) break;
           if (Date.now() >= deadline) { stopReason = 'timeout'; log.push({ stopped: `time budget reached at page ${want}` }); break; }
 // A page this process already walked costs nothing to re-read against the 5-9.5s its pager
         // click takes. It is pooled with the live pages and judged by the same guard; its age is
@@ -1151,7 +1162,8 @@ const capabilities = async ({ probe = true }: Args<typeof CAP_ARGS> = {}): Promi
     cache: cacheStats(),
     works_without_account: [
       'browse_feed: public homepage listings', 'search_count / search_suggest: inventory estimate and autocomplete',
-      'search_items: relevant product cards and optional shortlist detail', 'related_items / recommendations: suggested products',
+      'search_items: relevant product cards and optional shortlist detail', 'search_batch: 1-20 queries in one call, each isolated',
+      'related_items / recommendations: suggested products',
       'item_view: listing detail', 'seller_profile / seller_items: public seller data',
     ],
     anonymous_flakiness: ['Anonymous page loads can be refused or throttled; no tool is guaranteed to succeed.',
@@ -1211,6 +1223,19 @@ const capabilities = async ({ probe = true }: Args<typeof CAP_ARGS> = {}): Promi
   return status;
 };
 
+/**
+ * The bulk scan: the list, the shared page, one envelope. `runBatch` owns the ordering, the per-query
+ * isolation and the totals; this wrapper only turns the process's remaining call budget and its
+ * throttle cooldown into what that module needs. `remainingMs` is what makes the list stop at the
+ * call's deadline rather than at a second, independently counted one -- and the schema always fills
+ * `timeout_s`, so the fallback is only for a direct `run()` call (it is the same number, so the two
+ * cannot drift).
+ */
+const searchBatch = async (args: BatchArgs): Promise<Data> => runBatch(args, searchItems, {
+  deadline: Date.now() + remainingMs((args.timeout_s ?? BATCH_TIMEOUT_S) * 1000),
+  cooldown,
+});
+
 // The zod shape IS the published argument contract, and each handler's type is inferred from that
 // same shape, so a renamed or retyped argument is a type error rather than a silent drift. `Partial`
 // because the defaults live in the schema.
@@ -1218,6 +1243,15 @@ type Args<S extends z.ZodRawShape> = Partial<z.infer<z.ZodObject<S>>>;
 const FEED_ARGS = { page_number: z.number().int().min(1).max(MAX_PAGE_NUMBER).default(1), pages: z.number().int().min(1).max(MAX_PAGES).default(1), limit: z.number().int().min(1).max(MAX_LIMIT).default(60) };
 const COUNT_ARGS = { query: z.string().min(1) };
 const SUGGEST_ARGS = { query: z.string().min(1), limit: z.number().int().min(1).max(MAX_LIMIT).default(20) };
+// The post-fetch filters, in one shape, because `search_batch` publishes the same filter contract per
+// query as `search_items` publishes at the top level: two copies of it would be two contracts.
+const SEARCH_FILTERS = {
+  min_price: z.number().min(0).max(1e9).optional(), max_price: z.number().min(0).max(1e9).optional(),
+  city: z.string().trim().min(1).optional(), province: z.string().trim().min(1).optional(),
+  exclude_keywords: z.array(z.string().trim().min(1)).max(50).optional(),
+  form_factor: z.enum(['pcie', 'sxm2', 'sxm3', 'sxm4', 'sxm5']).optional(),
+  bare_card_only: z.boolean().optional(),
+};
 const SEARCH_ARGS = {
   query: z.string().min(1),
   limit: z.number().int().min(1).max(MAX_SEARCH_ITEMS).default(DEFAULT_SEARCH_ITEMS),
@@ -1225,25 +1259,50 @@ const SEARCH_ARGS = {
 // How many result pages to walk. One page is 30 listings; the pager is the page's own control, never
     // a dialog dismissal, and each extra page costs 5-9.5s against 13-25s for a fresh load. Capped at
     // 10: the pager only renders boxes 1..10. A floor, not a ceiling -- if those pages under-deliver,
-    // up to two more are walked.
+    // up to `topup_pages` more are walked.
   pages: z.number().int().min(1).max(MAX_SEARCH_PAGES).default(1),
+// How many extra pages the walk may take when the requested ones leave fewer than `limit` matches.
+    // 0 walks exactly the pages asked for; 2 is the long-standing behaviour, because goofish's pager
+    // can repeat items and a page that matches 25 of 30 should not be a silent shortfall.
+  topup_pages: z.number().int().min(0).max(SEARCH_TOPUP_PAGES).default(SEARCH_TOPUP_PAGES),
 // How many ranked results to read in full: description, gallery, seller tenure, sales, rating, reply
     // rate, signature. ~8s warm each, read two at a time on pages of its own; XIANYU_DETAIL_FANOUT sets
     // the width (0-4, default 2) and each listing reports its own `ms` and `via`.
   detail: z.number().int().min(0).max(MAX_SEARCH_DETAIL).default(0),
   timeout_s: z.number().int().min(1).max(600).optional(),
   expand_synonyms: z.boolean().default(true),
-  min_price: z.number().min(0).max(1e9).optional(), max_price: z.number().min(0).max(1e9).optional(),
-  city: z.string().trim().min(1).optional(), province: z.string().trim().min(1).optional(),
-  exclude_keywords: z.array(z.string().trim().min(1)).max(50).optional(),
-  form_factor: z.enum(['pcie', 'sxm2', 'sxm3', 'sxm4', 'sxm5']).optional(),
-  bare_card_only: z.boolean().optional(), cursor: z.string().min(1).max(100).optional(),
+  ...SEARCH_FILTERS,
+  cursor: z.string().min(1).max(100).optional(),
 // Output shaping rather than search behaviour: `compact` is the response mode (not search-policy's
   // title-normalisation helper of the same name) and `sort` reorders what was kept. Both are applied
   // at the tool boundary, after `detail` and the filter re-checks, which is why neither is read inside
   // `searchItems`.
   compact: z.boolean().default(false),
   sort: z.enum(['relevance', 'price_asc', 'price_desc', 'newest']).default('relevance'),
+};
+// One query of a bulk scan: the search controls a batch sets per query, and the same filters
+// `search_items` takes. `topup_pages` is 0 here, the opposite of the single-search default: a bulk
+// scan's second page is bought for a price comparison, not for a complete inventory, and the extra
+// page is the most expensive thing the walk can spend.
+const BATCH_QUERY_ARGS = {
+  query: z.string().min(1),
+  pages: z.number().int().min(1).max(MAX_SEARCH_PAGES).default(1),
+  limit: z.number().int().min(1).max(MAX_SEARCH_ITEMS).default(60),
+  detail: z.number().int().min(0).max(MAX_SEARCH_DETAIL).default(0),
+  topup_pages: z.number().int().min(0).max(SEARCH_TOPUP_PAGES).default(0),
+  ...SEARCH_FILTERS,
+};
+const BATCH_ARGS = {
+  // Strict inside a query too: `{"queries":[{"query":"x","page":2}]}` is a caller trying to ask for
+  // page 2, and silently searching page 1 instead is the kind of help nobody wants from a scan.
+  queries: z.array(z.strictObject(BATCH_QUERY_ARGS)).min(1).max(20),
+  compact: z.boolean().default(true),
+  sort: z.enum(['relevance', 'price_asc', 'price_desc', 'newest']).default('relevance'),
+  // Bounds the whole list, not one query: a query's own budget is `per_query_timeout_s`, clipped to
+  // whatever is left of this one.
+  timeout_s: z.number().int().min(5).max(600).default(BATCH_TIMEOUT_S),
+  attempts: z.number().int().min(1).max(5).default(2),
+  per_query_timeout_s: z.number().int().min(10).max(300).default(60),
 };
 const RELATED_ARGS = { item_id: z.string().optional(), limit: z.number().int().min(1).max(MAX_LIMIT).default(30), page: z.number().int().min(1).max(MAX_PAGE_NUMBER).default(1) };
 const ITEM_ARGS = { item_id: z.string().min(1) };
@@ -1276,7 +1335,8 @@ export const TOOLS: ToolDef[] = [
   tool({ name: 'browse_feed', description: 'Read pages of the public homepage feed. Returns listings, count and page reports. This feed is not a keyword search and has no verified upstream filters. Use search_items for a product query. Args: page_number (1-10000), pages (1-25), limit (1-500, default 60).' + NO_ACCOUNT, schema: FEED_ARGS, run: browseFeed }),
   tool({ name: 'search_count', description: 'Get Goofish’s keyword inventory estimate, not the number of cards this server can retrieve. A positive count does not prove search_items can load results, and may include broad matches. Refusals and unreadable counts are errors, never zero. Args: query.' + NO_ACCOUNT, schema: COUNT_ARGS, run: searchCount }),
   tool({ name: 'search_suggest', description: 'Get Goofish’s autocomplete suggestions for a query prefix. Returns suggestions and count; this is not a product search. Args: query, limit (1-500, default 20).' + NO_ACCOUNT, schema: SUGGEST_ARGS, run: searchSuggest }),
-  tool({ name: 'search_items', description: 'Search product listings by calling Goofish’s own search API from a live page (a signed replay), falling back to typing into the SPA when Goofish refuses. Only relevant titles are returned; punctuation and spacing are normalized, and Xeon/至强 are equivalent unless expand_synonyms:false. Args: query; pages (1-10, default 1, with up to 2 top-up pages); limit (1-300, default 120, further capped by XIANYU_SEARCH_MAX_ITEMS); detail (0-50, default 0, enrich a shortlist); attempts (1-10, default 4); timeout_s (1-600, bounds total time including queue and detail). Optional filters: min_price/max_price in CNY, city, province, exclude_keywords, form_factor (pcie/sxm2/sxm3/sxm4/sxm5), bare_card_only. Filters run on fetched cards, not at Goofish; unknown price/location/hardware fails a requested filter. Bare-card matching requires explicit title evidence. Read status, diagnostics, effective_limit and freshness; `via` names the route that answered (search_replay when the signed API call did, searchbox when the page had to be typed into, cache when nothing was asked). Partial calls retain items and next_cursor; resume with the same query and cursor (10-minute process-local lifetime), preserving original filters. Errors report retry_after_s; do not retry during cooldown. Prices and counts are numeric under typed, with raw strings preserved. compact:true keeps only item_id, rank, title, price, price_amount, city, want_count, seller, url (plus tags/publish_time when the card has them), drops attempt_log and diagnostics.sample_titles, and returns the same listings in a fraction of the bytes. sort (relevance default, price_asc, price_desc, newest) reorders the kept listings and renumbers rank; an unknown price or date sorts last. Every answer carries price_stats: count, min, p10, p25, median, p75, p90, max and mean over typed.price_amount, currency CNY, or null when no kept listing carried a numeric price.' + NO_ACCOUNT, schema: SEARCH_ARGS, run: locked(shaped(searchItems)) }),
+  tool({ name: 'search_items', description: 'Search product listings by calling Goofish’s own search API from a live page (a signed replay), falling back to typing into the SPA when Goofish refuses. Only relevant titles are returned; punctuation and spacing are normalized, and Xeon/至强 are equivalent unless expand_synonyms:false. Args: query; pages (1-10, default 1); topup_pages (0-2, default 2: extra pages walked while the kept set is short of limit, 0 walks only the pages asked for); limit (1-300, default 120, further capped by XIANYU_SEARCH_MAX_ITEMS); detail (0-50, default 0, enrich a shortlist); attempts (1-10, default 4); timeout_s (1-600, bounds total time including queue and detail). Optional filters: min_price/max_price in CNY, city, province, exclude_keywords, form_factor (pcie/sxm2/sxm3/sxm4/sxm5), bare_card_only. Filters run on fetched cards, not at Goofish; unknown price/location/hardware fails a requested filter. Bare-card matching requires explicit title evidence. Read status, diagnostics, effective_limit and freshness; `via` names the route that answered (search_replay when the signed API call did, searchbox when the page had to be typed into, cache when nothing was asked). Partial calls retain items and next_cursor; resume with the same query and cursor (10-minute process-local lifetime), preserving original filters. Errors report retry_after_s; do not retry during cooldown. Prices and counts are numeric under typed, with raw strings preserved. compact:true keeps only item_id, rank, title, price, price_amount, city, want_count, seller, url (plus tags/publish_time when the card has them), drops attempt_log and diagnostics.sample_titles, and returns the same listings in a fraction of the bytes. sort (relevance default, price_asc, price_desc, newest) reorders the kept listings and renumbers rank; an unknown price or date sorts last. Every answer carries price_stats: count, min, p10, p25, median, p75, p90, max and mean over typed.price_amount, currency CNY, or null when no kept listing carried a numeric price.' + NO_ACCOUNT, schema: SEARCH_ARGS, run: locked(shaped(searchItems)) }),
+  tool({ name: 'search_batch', description: 'Bulk scans: run a list of 1-20 searches in one call, in order, and get one compact answer. Each query reports its own ok/status/error, so a failed query does not fail the call and the queries after it still run. Args: queries[] (each with query plus its own pages (1-10, default 1), limit (1-300, default 60), detail (0-50, default 0), topup_pages (0-2, default 0 here -- a batch walks only the pages it asks for), and the same filters as search_items: min_price/max_price in CNY, city, province, exclude_keywords, form_factor (pcie/sxm2/sxm3/sxm4/sxm5), bare_card_only); compact (default true, keeps item_id, rank, title, price, price_amount, city, want_count, seller and url); sort (relevance default, price_asc, price_desc, newest); timeout_s (5-600, default 180, bounds the whole call, not one query); attempts (1-5, default 2 per query); per_query_timeout_s (10-300, default 60). data.queries[] carries index, query, ok, status (success/empty/partial/error/skipped), count, ms, source, via, pages_fetched, stop_reason when one applies, items, price_stats and, on failure, error_type/message/retryable/retry_after_s/reason; a query the call never reached is skipped:true with status skipped. data.totals counts requested/ok/empty/partial/failed, listings, unique_listings and duplicates across queries; data.failed_queries lists the indexes that failed; data.stop_reason is timeout or cooldown when the call stopped early, and data.partial is true whenever a query failed or the call stopped early. Items are the same compact cards and price_stats search_items publishes.' + NO_ACCOUNT, schema: BATCH_ARGS, run: locked(searchBatch) }),
   tool({ name: 'related_items', description: 'Read products Goofish recommends for an item; these are recommendations, not keyword matches. Omit item_id for generic suggestions. Returns items and count. Args: item_id (digits or item URL, optional), limit (1-500, default 30), page (1-10000).' + NO_ACCOUNT, schema: RELATED_ARGS, run: relatedItems }),
   tool({ name: 'seller_profile', description: 'Read a seller’s public profile and trust fields. Pass exactly one of user_id (seller digits or profile URL) or item_id (listing digits or URL). A user_id needs one API call; item_id first loads the listing and can add city, sales, tenure and reply rate. Unknown facts are null and named in fields_missing. No account is required.' + NO_ACCOUNT, schema: SELLER_ARGS, run: sellerProfile }),
   tool({ name: 'seller_items', description: 'Read a seller’s listings. Pass exactly one of user_id or item_id; item_id first loads the listing to identify its seller. Each page contains at most 20 cards; limit (1-20, default 20) only truncates that page. Walk page (1-50) while has_more is true. Returns effective_limit, page_size, items and numeric fields under typed.' + NO_ACCOUNT, schema: SELLER_ITEMS_ARGS, run: sellerItems }),

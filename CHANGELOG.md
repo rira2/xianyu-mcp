@@ -60,6 +60,26 @@ The Python implementation this is a port of is not in this history at all: it li
   reply-first typing step logs the submission (`attempt`, `via`, `submitted`), while the DOM-first
   step keeps today's keys (`typed`, `result_cards`, `lost_contexts`); the relevance guard, cache
   writes, partial results and `detail` are untouched.
+- Add `search_batch`: one call runs 1-20 searches in order and answers once, with per-query
+  isolation. A query that fails is a row (`ok: false` with `error_type`, `message`, `retryable`,
+  `retry_after_s` and, when the tool can name it, `reason`), never a failed call, and the queries
+  after it still run. A query the call never reached -- the whole-call deadline, or this process's
+  throttle cooldown -- says `skipped: true`, so `ok: false` is never ambiguous between "goofish
+  refused this" and "this was never asked". `data.totals` counts requested/ok/empty/partial/failed,
+  listings, unique listings across queries and duplicates; `failed_queries` names the indexes that
+  failed; `stop_reason` is `timeout` or `cooldown` when the call stopped early, and `partial` is true
+  whenever a query failed or the call stopped early. The defaults are the bulk scan's own:
+  `compact: true`, and per query one page of 60, `detail: 0` and `topup_pages: 0`; `timeout_s: 180`
+  bounds the whole list while `per_query_timeout_s: 60` (clipped to what is left) bounds one query.
+  Measured against the built server: six two-page queries answered 6/6 in 25.4s and 156KB (263
+  listings, 262 unique, one duplicate), every page from the signed replay -- the first query paid
+  for the browser launch (~15s) and the rest answered in 1.6-2.7s each. When Goofish refuses the
+  replay route the same list falls back to the typed search per query: 6/6 in 99-109s on a later,
+  throttled run, and each row's `via` says which route it paid for.
+- Add `topup_pages` (0-2, default 2) to `search_items`: 0 walks exactly the pages asked for, so a
+  caller comparing a few pages stops paying for the ones it did not ask for. The default behaviour --
+  up to two extra pages while the kept set is short of `limit` -- is unchanged, and a batch query
+  defaults to 0.
 
 ## [0.2.1] — 2026-10-08
 
