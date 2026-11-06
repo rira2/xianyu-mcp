@@ -29,7 +29,8 @@ import type { Browser, BrowserContext, Page } from 'playwright';
 import { BrowserError, NavigationError } from './errors.ts';
 import { acquireDisplay, stopDisplay } from './display.ts';
 import { checkpoint, remainingMs } from './runtime.ts';
-import { MTOP_CALL_JS, MTOP_READY_JS } from './extract.ts';
+import { MTOP_CALL_JS, MTOP_READY_JS, REPLAY_JS, REPLAY_READY_JS } from './extract.ts';
+import { DETAIL_API, replayEnabled, replaySign, replayTokenFailure, replayUrl, validateReplayReply } from './replay.ts';
 const ALLOWED_HOSTS = ['www.goofish.com', 'goofish.com'];
 
 // The values here are URL parts, so they carry their separators ('https:').
@@ -62,6 +63,30 @@ const MTOP_TIMEOUT_S = 240;
 // evaluate runs 90s by default, so the probe needs its own bound or the wait is not the one it
 // claims to be.
 const MTOP_READY_MS = 6000, PROBE_TIMEOUT_S = 5;
+// The signed-replay fast path's own bounds. The replay latencies measured on this machine
+// (2026-11-07) were 1.06s and 1.0-12.0s for a search page and 0.6-3.1s for a detail: these are the
+// ceilings that still caught every answer, not targets. A hung in-page fetch never settles at all --
+// it is not a slow answer -- so the bound is what turns one into a fallback.
+const REPLAY_SEARCH_TIMEOUT_S = 20, REPLAY_DETAIL_TIMEOUT_S = 12;
+// The homepage replay page's one-time hydration: measured 7.0-13.0s, against the spike's 22.6s for
+// the header input to render on a cold link.
+const REPLAY_WARM_MS = 30_000;
+// The same wait after the one reload a failed replay is allowed. Shorter on purpose: the page was
+// already hydrated once and this retry is for a rotated token, so ten seconds is generous -- and a
+// token that never appears must not cost the caller the full cold-start window twice.
+const REPLAY_RETRY_MS = 10_000;
+// How long a replay waits for `_m_h5_tk` to be minted before it gives up and reloads. The token is
+// issued by goofish on the page's first h5api call, so on a just-loaded item page it is seconds away:
+// measured, a replay on a fresh item page found none, and the reload it then paid re-loaded the whole
+// page for a cookie that was already on its way. Five seconds covers that without holding a caller.
+const REPLAY_TOKEN_WAIT_MS = 5000;
+// A failed replay pauses that surface for this long (see `replayPaused`): goofish's own retry window,
+// and long enough that a scan pays one failed replay rather than one per query or per listing.
+const REPLAY_COOLDOWN_MS = 60_000;
+// The signature token's cookie, and the origin it is read for. Not a credential: goofish mints this
+// for anonymous visitors and the page's own bundle signs with it. It is read in exactly one place,
+// `replayToken`, and an invariant test pins that.
+const REPLAY_TOKEN_NAME = '_m_h5_tk', REPLAY_TOKEN_URL = 'https://h5api.m.goofish.com';
 // Failures that race the page's own navigation rather than being real failures, so they get one more
 // try. A dead target is not on this list: that needs a relaunch, not a retry.
 const TRANSIENT = ['execution context', 'cannot find context', 'while navigating'];
@@ -83,6 +108,14 @@ export const DETAIL_POOL_MAX = 4;
 /** A fan-out page and the response tap and load verdict belonging to it. Keeping them together
  * prevents concurrent loads from assigning a verdict to the wrong listing. */
 export type DomSurface = { page: Page; tap: MtopTap; load: { url: string; declined: string; ms: number } };
+
+/** What one signed replay attempt produced. Never thrown: `ok: false` plus `why` is the whole
+ *  failure contract, because the caller falls back to the SPA and a fast path that can fail a tool is
+ *  worse than no fast path. `ms` is the wall time the caller paid for it, queue included. */
+export type ReplayVerdict = { ok: boolean; ret: string; data: any; ms: number; why?: string };
+/** Which page can sign which API. They are not interchangeable, and that is measured: see
+ *  `replaySurface`. */
+type ReplayKind = 'search' | 'detail';
 
 /** Collects mtop responses from a page. A reply is delivered by one route only: to the `take`s
  * already waiting for its API, or else into the bounded per-API queue. A queued reply is removed by
@@ -368,9 +401,9 @@ export class Session {
    *  orphaned browser processes per session, invisible to a client that had already exited. */
   async close(): Promise<void> {
     const context = this.context, browser = this.browser;
-    if (!browser) { this.context = this.browser = this.apiPage = this.domPage = null; this.apiTap.clear(); this.domTap.clear(); this.pool.length = 0; stopDisplay(); return; }
-    this.context = this.browser = this.apiPage = this.domPage = null;
-    this.apiTap.clear(); this.domTap.clear(); this.pool.length = 0;   // the handles are dead with the context, and keeping them would hand a dead page to the next fan-out
+    if (!browser) { this.context = this.browser = this.apiPage = this.domPage = this.replayPage = null; this.apiTap.clear(); this.domTap.clear(); this.pool.length = 0; this.replayPaused.clear(); stopDisplay(); return; }
+    this.context = this.browser = this.apiPage = this.domPage = this.replayPage = null;
+    this.apiTap.clear(); this.domTap.clear(); this.pool.length = 0; this.replayPaused.clear();   // the handles are dead with the context, and keeping them would hand a dead page to the next fan-out
     await Promise.race([
       (async () => { await context?.close().catch(() => {}); await browser.close().catch(() => {}); })(),
       new Promise((r) => setTimeout(r, 5000)),
@@ -476,6 +509,166 @@ export class Session {
       this.domPage = page;
       return page;
     });
+  }
+
+  /** The page a search replay is signed on, warmed on the homepage once and reused.
+   *
+   *  A dedicated third page, and the reason is not preference. goofish signs an in-page `fetch` with
+   *  whatever the *page's own bundle* can sign, and each bundle only signs the APIs it uses: measured
+   *  2026-11-07, from the parked item page a search replay did not settle in >60s (twice, and >20s on
+   *  a third run), while the same call from a homepage answered 7/7 with 30 results each (2.7-12.0s).
+   *  The item page's own detail call is the mirror image -- `replaySurface` sends detail there.
+   *
+   *  Warming is one homepage load plus the wait for mtop, the header search input and `_m_h5_tk`,
+   *  measured 7.0-13.0s per process. It is paid lazily by the first search that asks, and only once:
+   *  the page is reused for the life of the session. `XIANYU_REPLAY=0` means it is never created. */
+  private async replayReady(): Promise<Page> {
+    const have = this.replayPage;
+    if (have && !have.isClosed() && this.parkedOnGoofish(have)) return have;
+    if (this.replayWarm) return this.replayWarm;   // one warm-up, however many searches ask at once
+    const warm = this.replayWarm = this.move(async () => {
+      await this.ensureLaunched();
+      const again = this.replayPage;
+      if (again && !again.isClosed() && this.parkedOnGoofish(again)) return again;
+      const page = again && !again.isClosed() ? again : await this.context!.newPage();
+      this.replayPage = page;
+      await load(page, HOME);
+      if (!(await this.waitForReplay(page, REPLAY_WARM_MS))) {
+        throw new BrowserError(`the replay page did not hydrate within ${Math.round(REPLAY_WARM_MS / 1000)}s: no mtop client, no rendered search input or no signature token. goofish is most likely serving an empty shell; the typed search still works.`);
+      }
+      return page;
+    });
+    warm.finally(() => { if (this.replayWarm === warm) this.replayWarm = null; }).catch(() => {});
+    return warm;
+  }
+  private replayPage: Page | null = null;
+  private replayWarm: Promise<Page> | null = null;
+
+  /** One bounded, non-throwing probe of `REPLAY_READY_JS`. A probe that errors is "not ready yet":
+   *  a page still booting is a reason to keep waiting, never a reason to name a failure. */
+  private async replayState(page: Page): Promise<{ ready: boolean } | null> {
+    try { return await evaluate(page, REPLAY_READY_JS, undefined, 'replay readiness check', PROBE_TIMEOUT_S); } catch { return null; }
+  }
+  /** Poll until the page can sign a request AND the jar has a token. Both halves are needed: the token
+   *  appears seconds before the app mounts, and a call in that window hangs (spike probe 3). */
+  private async waitForReplay(page: Page, timeoutMs: number): Promise<boolean> {
+    const until = Date.now() + timeoutMs;
+    for (;;) {
+      const state = await this.replayState(page);
+      if (state?.ready && (await this.replayToken().catch(() => ''))) return true;
+      if (Date.now() >= until) return false;
+      try { await settle(page, 300); } catch { return false; }
+    }
+  }
+
+  /** Which page signs which API. Search is signed by a homepage bundle and detail by an item page's
+   *  (see `replayReady`); an API this server does not replay goes to the homepage page, which is the
+   *  general-purpose one. */
+  private async replaySurface(kind: ReplayKind): Promise<Page> {
+    return kind === 'detail' ? this.ensureReady() : this.replayReady();
+  }
+
+  /** goofish's signature token from the browser's own cookie jar: `<32 hex>_<server epoch ms>`, and
+   *  only the first half is signed. Read from the jar rather than from `document.cookie` because the
+   *  jar cannot be shadowed by page JS, and because the same jar is what the request will be checked
+   *  against. Empty means this page has not been given one yet. */
+  private async replayToken(): Promise<string> {
+    if (!this.context) return '';
+    const jar = await this.context.cookies(REPLAY_TOKEN_URL).catch(() => []);
+    return String(jar.find((c) => c.name === REPLAY_TOKEN_NAME)?.value ?? '').split('_')[0];
+  }
+  /** Poll the jar for that token, bounded. Not every page mints one at load: the item page mints it
+   *  on its first h5api call, which is often a moment after `ensureReady` returns. Waiting is cheaper
+   *  than the reload this used to trigger; empty means it really did not appear. */
+  private async waitForToken(timeoutMs: number): Promise<string> {
+    const until = Date.now() + timeoutMs;
+    for (;;) {
+      const token = await this.replayToken().catch(() => '');
+      if (token || Date.now() >= until) return token;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  }
+
+  /** Put a page back into a fresh state for one more attempt: a cache-busted reload, then wait for it
+   *  to hydrate again. Used once per replay, when goofish says the token is stale or none was minted
+   *  yet. Never throws; `false` means the retry is not worth making. */
+  private async rehydrate(page: Page, kind: ReplayKind): Promise<boolean> {
+    try { await this.move(async () => { await reloadFresh(page); }); } catch { return false; }
+    if (kind === 'detail') return waitForMtop(page, REPLAY_RETRY_MS);
+    return this.waitForReplay(page, REPLAY_RETRY_MS);
+  }
+
+  /**
+   * Issue one mtop call with a fresh signature, as a `fetch` from a goofish page. This is the fast
+   * path `search_items` and `item_view` take before they type or load: measured 1.06s for a 30-result
+   * search page (page 2 0.96s, page 3 1.09s; 1.0-1.7s through this tool) and 0.6-3.1s for an item
+   * detail, against 7.5s for one typed search and 4-10s for a detail page load.
+   *
+   * Every failure is a verdict, never an exception: a missing token, a ret that is not SUCCESS, a body
+   * that is not JSON, a shape change and a timeout all come back as `{ok: false, why}`, because the
+   * callers fall back to the route that already worked. The one retry is for a token/session ret -- the
+   * token rotates, so a reload that mints a new one can fix it -- and it is one retry, not a loop.
+   *
+   * Bounded twice over: `evaluate`'s own timeout, and the call deadline through `remainingMs`. One
+   * in-page fetch at a time, because the spike never measured concurrent fetches against goofish's
+   * per-IP limit and the detail fan-out would otherwise issue two or four at once on one page.
+   */
+  async replay(api: string, data: Record<string, any>, opts: { spmCnt?: string; spmPre?: string } = {}): Promise<ReplayVerdict> {
+    const began = Date.now();
+    const verdict = (ok: boolean, ret: string, d: any, why?: string): ReplayVerdict => ({ ok, ret, data: d, ms: Date.now() - began, ...(why ? { why } : {}) });
+    const kind: ReplayKind = api === DETAIL_API ? 'detail' : 'search';
+    if (!replayEnabled()) return verdict(false, '', null, 'the replay fast path is off (XIANYU_REPLAY=0)');
+    const pausedUntil = this.replayPaused.get(kind) ?? 0;
+    if (Date.now() < pausedUntil) return verdict(false, '', null, `the ${kind} replay is paused for ${Math.ceil((pausedUntil - Date.now()) / 1000)}s more after a failed attempt; the typed route is answering instead`);
+    const run = this.replayChain.then(async () => {
+      try { return await this.replayAttempt(kind, api, data, opts, verdict); }
+      catch (e) { return this.replayFailed(kind, verdict, `the ${kind} replay attempt failed: ${String((e as Error)?.message ?? e).slice(0, 200)}`); }
+    });
+    this.replayChain = run.then(() => {}, () => {});
+    return run;
+  }
+  private replayChain: Promise<unknown> = Promise.resolve();
+  /** When each surface was last found refusing or hanging. goofish's risk control does not clear in
+   *  one call, and a hung replay costs its whole bound before the typed path even starts -- a scan
+   *  should pay that once, not on every listing. A minute is goofish's own retry window elsewhere. */
+  private readonly replayPaused = new Map<ReplayKind, number>();
+  private replayFailed(kind: ReplayKind, verdict: (ok: boolean, ret: string, data: any, why?: string) => ReplayVerdict, why: string, ret = ''): ReplayVerdict {
+    this.replayPaused.set(kind, Date.now() + REPLAY_COOLDOWN_MS);
+    return verdict(false, ret, null, why);
+  }
+
+  /** One replay: read the token, sign, fetch from the page, parse, validate. Split out of `replay` so
+   *  the queueing, the kill switch and the cooldown are not repeated in the retry path. */
+  private async replayAttempt(kind: ReplayKind, api: string, data: Record<string, any>, opts: { spmCnt?: string; spmPre?: string }, verdict: (ok: boolean, ret: string, data: any, why?: string) => ReplayVerdict): Promise<ReplayVerdict> {
+    let page: Page;
+    try { page = await this.replaySurface(kind); }
+    catch (e) { return this.replayFailed(kind, verdict, `no page could issue the ${kind} replay: ${String((e as Error)?.message ?? e).slice(0, 200)}`); }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const token = await this.waitForToken(REPLAY_TOKEN_WAIT_MS);
+      if (!token) {
+        // No token is the normal state of a page that has just loaded: one reload mints one, and a
+        // page that never mints one is a page this route cannot use.
+        if (!attempt && (await this.rehydrate(page, kind))) continue;
+        return this.replayFailed(kind, verdict, `no ${REPLAY_TOKEN_NAME} signature token on the ${kind} page, so the call could not be signed`);
+      }
+      const dataJson = JSON.stringify(data);
+      const t = Date.now();
+      const url = replayUrl(api, { t, sign: replaySign(token, t, dataJson), spmCnt: opts.spmCnt, spmPre: opts.spmPre });
+      let reply: { status: number; text: string } | null = null;
+      try {
+        reply = await evaluate(page, REPLAY_JS, { url, body: `data=${encodeURIComponent(dataJson)}` }, `${kind} replay`, kind === 'detail' ? REPLAY_DETAIL_TIMEOUT_S : REPLAY_SEARCH_TIMEOUT_S);
+      } catch (e) {
+        return this.replayFailed(kind, verdict, `the ${kind} replay did not answer: ${String((e as Error)?.message ?? e).slice(0, 160)}`);
+      }
+      let parsed: any;
+      try { parsed = JSON.parse(String(reply?.text ?? '')); }
+      catch { return this.replayFailed(kind, verdict, `the ${kind} replay answered HTTP ${reply?.status ?? 0} with something that is not JSON: ${String(reply?.text ?? '').slice(0, 120)}`); }
+      const check = validateReplayReply(parsed, kind);
+      if (check.ok) return verdict(true, check.ret, check.data);
+      if (!attempt && replayTokenFailure(check.ret) && (await this.rehydrate(page, kind))) continue;
+      return this.replayFailed(kind, verdict, check.why || `goofish refused the ${kind} replay: ${check.ret}`, check.ret);
+    }
+    return this.replayFailed(kind, verdict, `the ${kind} replay did not answer after one reload and retry`);
   }
 
   /** Pay the session's first load in the background, at boot, on a page of its own.

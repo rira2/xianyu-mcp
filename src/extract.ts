@@ -144,6 +144,53 @@ export const MTOP_READY_JS = (): string => {
 };
 
 /**
+ * Is a goofish page hydrated enough to sign a replay of its own? Not the same question as
+ * `MTOP_READY_JS`, and the difference was measured: the spike called a fresh page as soon as
+ * `_m_h5_tk` existed but before the app had mounted its header, and the in-page fetch never settled
+ * (>18s, probe 3); the same call after the header search input rendered answered in 2.8s (probe 4).
+ * So the readiness signal here is mtop **and** a rendered search input -- the two things every replay
+ * that answered had, and the two things the hung one lacked.
+ *
+ * Read-only and cheap: `getBoundingClientRect` on the inputs already in the document, no layout forced
+ * beyond what the geometry needs, and no interaction.
+ */
+export const REPLAY_READY_JS = (): any => {
+  const { document, window, location } = globalThis as any;
+  const inputs = [...(document?.querySelectorAll?.('input') ?? [])].filter((el: any) => {
+    const r = el.getBoundingClientRect();
+    return r.width >= 100 && r.height >= 20 && r.top < Math.min(400, window?.innerHeight ?? 900);
+  });
+  const mtop = Boolean(window?.lib?.mtop?.request);
+  return { ready: mtop && inputs.length > 0, mtop, search_inputs: inputs.length, path: String(location?.pathname ?? '') };
+};
+
+/**
+ * One signed mtop call, issued as a `fetch` **from the goofish page**. That is the whole trick: the
+ * page's own interceptor appends `bx-ua`, `bx-umidtoken` and `bx_et` to a form body that carries
+ * `data`, and the gateway accepts what it refuses from a Node HTTP client (measured: the identical
+ * captured request through Playwright's own HTTP client got `ECONNRESET`). A body-less fetch gets a
+ * JSON `{"bx-ua": …}` body and `RGV587` instead.
+ *
+ * Never rejects: a failed fetch comes back as status 0 with the message in `text`, because the caller
+ * falls back to the SPA and must not have a tool call taken down by it. The body is always read before
+ * returning -- a resolved `Response` without its text is not an answer.
+ */
+export const REPLAY_JS = async (spec: { url: string; body: string }): Promise<{ status: number; text: string }> => {
+  try {
+    const res = await fetch(spec.url, {
+      method: 'POST',
+      credentials: 'include',
+      cache: 'no-store',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
+      body: spec.body,
+    });
+    return { status: res.status, text: await res.text() };
+  } catch (e) {
+    return { status: 0, text: String(e) };
+  }
+};
+
+/**
  * item_view scrolls down and back so the lazy gallery photos decode first: the scraper filters on
  * naturalWidth, and an undecoded image reports 0.
  */

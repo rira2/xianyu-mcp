@@ -35,6 +35,22 @@ The Python implementation this is a port of is not in this history at all: it li
   answer carries `price_stats` (count/min/p10/p25/median/p75/p90/max/mean in CNY, or null); `sort`
   orders the kept listings by relevance, price or publish time. The default envelope only gains
   `price_stats`, and filters and `detail` still run on full cards.
+- Call goofish's search and item-detail APIs directly, without the SPA. The call is an md5-signed
+  `fetch` issued from a goofish page, where the page's own interceptor attaches the `bx-ua` /
+  `bx-umidtoken` / `bx_et` anti-bot fields; `mtop.taobao.idlemtopsearch.pc.search` and
+  `mtop.taobao.idle.pc.detail` both answer `SUCCESS` that way, where `window.lib.mtop.request` and a
+  Node HTTP client answer `TIMEOUT::接口超时` / `ECONNRESET`. `search_items` answers
+  `via: "search_replay"` / `source: "search_api"` and paginates by re-signing `pageNumber` instead of
+  clicking the pager; `item_view` answers `source: "item_detail_replay"` with `attempts: 0`. Measured:
+  1.06s / 0.96s / 1.09s for search pages 1-3 against 7.5s for one typed search; 0.6-1.2s warm for an
+  item detail (2.2-3.1s under load) against 4-10s for a page load; and three queries at `pages: 2, limit: 60` in 21.8s / 6.6s /
+  3.4s against 40.5s / 12.4s / 16.0s on the typed route. Replay answers go through the same relevance
+  guard, filters and cache writes as the typed ones. Every failure -- missing token, non-`SUCCESS`
+  ret, unparseable body, shape change, timeout, or a relevance-guard rejection -- is logged in
+  `attempt_log` and falls back to the typed search or the item page load, never raised; a failed
+  attempt pauses that route for 60s. Search is signed on a dedicated homepage page (warmed lazily
+  once per process, 7-13s) and detail on the parked item page, because a bundle only signs the APIs it
+  uses. `XIANYU_REPLAY=0` turns the fast path off.
 - Answer `search_items` from the page's own search reply without waiting for the results render: from
   Enter, the reply is raced against a 400ms DOM poll and the first page is published as soon as the
   reply lands, with the poll left as the fallback for a reply that never comes (it still produces the

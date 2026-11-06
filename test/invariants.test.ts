@@ -38,12 +38,10 @@ test('no credential access anywhere in the tree', () => {
   // credential scan below has to be able to see them. `src/cache.ts` is in it for the same reason one
   // layer down: a module that holds what this server has read off goofish is exactly the module the
   // scans must cover, and a scan that quietly does not cover it is worse than no scan.
-  assert.deepEqual(sources.map((p) => p.replace(`${ROOT}/`, '')).sort(), ['src/browser.ts', 'src/build-info.ts', 'src/build.ts', 'src/cache.ts', 'src/display.ts', 'src/errors.ts', 'src/extract.ts', 'src/index.ts', 'src/output.ts', 'src/response.ts', 'src/runtime.ts', 'src/search-policy.ts', 'src/tools.ts', 'test/browser-tap.test.ts', 'test/build-info.test.ts', 'test/cache.test.ts', 'test/check-deploy.test.ts', 'test/extract.test.ts', 'test/invariants.test.ts', 'test/output.test.ts', 'test/response.test.ts', 'test/search-policy.test.ts', 'test/serve.test.ts', 'test/tools.test.ts']);
-  // `.cookies(` rather than `context.cookies(`, and matched with the whitespace stripped: matching
-  // the literal missed `page.context().cookies()` and any call split across lines.
+  assert.deepEqual(sources.map((p) => p.replace(`${ROOT}/`, '')).sort(), ['src/browser.ts', 'src/build-info.ts', 'src/build.ts', 'src/cache.ts', 'src/display.ts', 'src/errors.ts', 'src/extract.ts', 'src/index.ts', 'src/output.ts', 'src/replay.ts', 'src/response.ts', 'src/runtime.ts', 'src/search-policy.ts', 'src/tools.ts', 'test/browser-tap.test.ts', 'test/build-info.test.ts', 'test/cache.test.ts', 'test/check-deploy.test.ts', 'test/extract.test.ts', 'test/invariants.test.ts', 'test/output.test.ts', 'test/replay.test.ts', 'test/response.test.ts', 'test/search-policy.test.ts', 'test/serve.test.ts', 'test/tools.test.ts']);
   const forbidden = [
-    '.cookies(', 'storageState', 'launchPersistentContext', 'userDataDir',
-    'cookie2', 'sgcookie', 'x5sec', '_m_h5_tk', 'addCookies', 'localStorage', 'sessionStorage',
+    'storageState', 'launchPersistentContext', 'userDataDir',
+    'cookie2', 'sgcookie', 'x5sec', 'addCookies', 'localStorage', 'sessionStorage',
   ];
   const offenders: string[] = [];
   for (const p of sources) {
@@ -55,6 +53,22 @@ test('no credential access anywhere in the tree', () => {
   assert.deepEqual(offenders, []);
   // and the scan really does catch that shape, which is what a credential read looks like
   assert.equal(flat(['page.context()', '  .' + 'cookies()'].join('\n')).includes('.' + 'cookies('), true);
+  // `.cookies(` and `_m_h5_tk` are pinned rather than banned, because the replay route needs exactly
+  // one of each and neither is a credential: `_m_h5_tk` is the anti-bot token goofish mints for a
+  // visitor with no account, the page's own bundle signs with it, and reading it from the context's jar
+  // (not from page JS, which page JS can shadow) is what lets this server sign a request the SPA would
+  // otherwise have to make. The pin is the point: one constant and one read, in one file -- a second
+  // `.cookies(` anywhere in `src/`, or the token named twice, still fails here.
+  const cookieSites = (file: string) => read(join(ROOT, file)).split('\n')
+    .filter((line) => !isJustNamingIt(line) && /_m_h5_tk|\.cookies\(/.test(deAsserted(line)));
+  const browserSites = cookieSites('src/browser.ts');
+  assert.deepEqual(browserSites.length, 2, `browser.ts must name the token once and read the jar once: ${JSON.stringify(browserSites)}`);
+  assert.match(browserSites[0], /REPLAY_TOKEN_NAME = '_m_h5_tk'/, 'the one place the token cookie is named');
+  assert.match(browserSites[1], /this\.context\.cookies\(REPLAY_TOKEN_URL\)/, 'the one place the cookie jar is read');
+  for (const p of sources.filter((f) => f.includes(`${ROOT}/src/`))) {
+    if (p.endsWith('browser.ts')) continue;
+    assert.deepEqual(cookieSites(p.replace(`${ROOT}/`, '')), [], `${p} names the token or reads cookies outside the one pinned site`);
+  }
 });
 
 test('only the nine read-only mtop APIs are named anywhere: a closed list, so a new one cannot slip in', () => {
@@ -64,10 +78,11 @@ test('only the nine read-only mtop APIs are named anywhere: a closed list, so a 
     'mtop.taobao.idlemtopsearch.pc.search.suggest',
     'mtop.taobao.idle.item.web.recommend.list',
     'mtop.taobao.idlemessage.pc.loginuser.get',
-    // The last two are never called by us -- they are named because the *page* calls them and
-    // item_view / search_items read the replies off the wire. Re-issuing either through the page's
-    // own mtop client answers TIMEOUT, because goofish stamps the calls its bundle originates with a
-    // per-call anti-bot blob. See `MtopTap`.
+    // These two are issued twice over: by the signed in-page `fetch` in `replay.ts` (a fresh md5
+    // signature from the page that can sign the API) and by reading the reply the page makes for
+    // itself. Through `window.lib.mtop.request` both answer TIMEOUT, because goofish stamps the calls
+    // its own bundle originates with a per-call anti-bot blob and that client also signs with the
+    // wrong appKey. See `MtopTap` and `Session.replay`.
     'mtop.taobao.idle.pc.detail',
     'mtop.taobao.idlemtopsearch.pc.search',
     // These two are the other side of that rule, and the list is the place the asymmetry has to stay
@@ -152,12 +167,13 @@ test('the detail fan-out is reachable only from inside the lock its caller alrea
   const fanout = toolsSrc.match(/const enrichDetails = [\s\S]*?\n};/)?.[0] ?? '';
   assert.match(fanout, /session\.fanoutSurface\(/, 'the fan-out leases its pages from the session');
   assert.equal((toolsSrc.match(/enrichDetails\(/g) ?? []).length, 1, 'exactly one call site');
-  assert.equal((toolsSrc.match(/publishSearch\(/g) ?? []).length, 3, 'all three routes use its publisher');
+  assert.equal((toolsSrc.match(/publishSearch\(/g) ?? []).length, 4, 'all four routes use its publisher');
   assert.equal((toolsSrc.match(/session\.fanoutSurface\(/g) ?? []).length, 1, 'so nothing else leases a pool page');
-  // all routes into a pooled answer -- the cache fast path, cursor and live walk -- go through that one
-  // publisher, so there is no way to reach the fan-out that skips the lock
+  // Every route into a pooled answer goes through that one publisher, so there is no way to reach the
+  // fan-out that skips the lock -- including the replay route, which is the fourth and returns a
+  // published answer from inside the same tool.
   const search = toolsSrc.match(/const searchItems = async[\s\S]*?\n};/)?.[0] ?? '';
-  assert.equal((search.match(/publishSearch\(/g) ?? []).length, 3, 'all three are inside search_items');
+  assert.equal((search.match(/publishSearch\(/g) ?? []).length, 4, 'all four are inside search_items');
   assert.match(toolsSrc, /run: locked\(shaped\(searchItems\)\)/, 'and the tool that reaches it holds the shared lock, with the output shaping inside it');
   // The fallback is not a silent one: the fan-out either ran or says why it did not, and both are in
   // the envelope rather than in a comment above this function.

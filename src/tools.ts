@@ -13,17 +13,19 @@ import { checkpoint, recordPartial, remainingMs } from './runtime.ts';
 import { failureDetails } from './response.ts';
 import { shapeSearchData } from './output.ts';
 import { detailListing, enrichListing, FEED_NORMALIZE_JS, ITEM_SCRAPE_JS, PAGER_CLICK_JS, PAGER_STATE_JS, queryTerms, RAIL_MARKERS, SCROLL_TO_JS, SCRAPE_CARDS_JS, searchListings, SEARCH_INPUT_JS, SEARCH_MARK, SEARCH_STATE_JS, sellerListings, sellerProfileOf } from './extract.ts';
+import { DETAIL_API, SEARCH_API, detailPayload, replayEnabled, searchPayload } from './replay.ts';
 type Data = Record<string, any>;
-// Endpoints observed in goofish bundles. DETAIL_API and SEARCH_API are tapped from page requests
-// because direct calls lack the request stamp; seller endpoints do not require one.
+// Endpoints observed in goofish bundles. DETAIL_API and SEARCH_API are re-issued by the signed replay
+// (`replay.ts`) and tapped from page requests as well, so either can answer; the seller endpoints are
+// called through the page's mtop client and do not require a request stamp.
 const FEED_API = 'mtop.taobao.idlehome.home.webpc.feed';
 // Search's count endpoint works for logged-out visitors even when the results page is declined.
 const HITNUM_API = 'mtop.taobao.idle.filter.hitnum.pc.get';
 const SUGGEST_API = 'mtop.taobao.idlemtopsearch.pc.search.suggest';
 const RECOMMEND_API = 'mtop.taobao.idle.item.web.recommend.list';
 const LOGINUSER_API = 'mtop.taobao.idlemessage.pc.loginuser.get';   // never used to act as a user: it exists only to *prove* the session is logged out
-const DETAIL_API = 'mtop.taobao.idle.pc.detail';
-const SEARCH_API = 'mtop.taobao.idlemtopsearch.pc.search';
+// DETAIL_API and SEARCH_API are the two the signed replay can re-issue; `replay.ts` owns their names
+// and the signature recipe, and both routes here use the same constants.
 // Profile endpoint used by `/personal?userId=`. Requires `userId` and returns baseInfo and modules.
 const SELLER_HEAD_API = 'mtop.idle.web.user.page.head';
 // Seller listings endpoint used by the 宝贝 tab. `nextPage` indicates whether another page exists.
@@ -433,10 +435,12 @@ const typeSearch = async (page: Page, tap: MtopTap, query: string, deadline: num
 };
 
 /**
- * Search works logged out but only by typing: across a 2x2x2 of headed/headless, fresh/persistent and
- * direct-URL/search-input, only the cell that typed into the SPA header input returned results. The
- * dialog's close controls are left alone: measured, clicking them made the result list never render at
- * all, and both scrapers read through the overlay anyway. */
+ * Search works logged out. The signed replay answers first (see `replaySearch` below); the typed route
+ * this comment used to describe is the fallback, and still the only route when replay is off. It works
+ * by typing: across a 2x2x2 of headed/headless, fresh/persistent and direct-URL/search-input, only the
+ * cell that typed into the SPA header input returned results. The dialog's close controls are left alone
+ * on purpose: measured, clicking them meant the result list never rendered at all, and both scrapers
+ * read through the overlay anyway. */
 const searchItems = async (args: SearchArgs): Promise<Data> => {
   let { query, limit = DEFAULT_SEARCH_ITEMS, attempts = SEARCH_ATTEMPTS, pages = 1, detail = 0, timeout_s, expand_synonyms = true, cursor, ...filters } = args;
   const resumed = cursor ? readCursor(cursor, requireQuery(query)) : null;
@@ -497,9 +501,78 @@ const searchItems = async (args: SearchArgs): Promise<Data> => {
       return publishSearch(session, q, found, detail, deadline, { query: q, source: 'search_api', via: 'cache', account_required: false, attempts: 0, attempt_log: log, cache: pageReport(cachedLines), ...found, partial: false, next_cursor: continuation(pagesWanted + 1, found.remaining_items, Date.now() - oldest * 1000), effective_limit: cap, effective_max_items: searchCap(), requested_limit: limit });
     }
   }
+  /**
+   * The signed-replay route: the same search API the page's own search calls, signed and issued from
+   * the page that can sign it, so it returns the same 30-listing payloads the typed route reads off the
+   * wire. Measured: 1.06s for a page, 0.96s for page 2 and 1.09s for page 3, against 7.5s for one typed
+   * search plus 5-9.5s per pager click.
+   *
+   * Tried once per call, before anything navigates or types. Returns null on any failure -- no replay
+   * on the session, the switch off, a refusal, a shape change, a timeout, an empty first page or a
+   * result set the relevance guard refuses -- and every one of those is named in `log` first. The
+   * caller then types, unchanged. The pages the caller asked for are a floor, exactly as in the typed
+   * route: while the kept set is short of `limit`, up to two more pages are fetched.
+   */
+  let replayTried = false;
+  const replaySearch = async (attemptNo: number): Promise<Data | null> => {
+    if (!replayEnabled() || typeof session?.replay !== 'function') return null;
+    const payloads: any[] = [], pageLines: { page: number; hit: boolean; age_s: number | null; observed_at: string }[] = [];
+    let nextPage = startPage, stopReason: string | null = null;
+    const fetchPage = async (pn: number): Promise<'ok' | 'end' | 'fail'> => {
+      if (Date.now() >= deadline) { stopReason = stopReason ?? 'timeout'; return 'fail'; }
+      let reply: any;
+      try { reply = await session.replay(SEARCH_API, searchPayload(q, pn), { spmCnt: 'a21ybx.search.0.0', spmPre: 'a21ybx.home.searchInput.0' }); }
+      catch (e: unknown) { log.push({ attempt: attemptNo, via: 'search_replay', page: pn, ok: false, why: `${(e as any)?.error_type ?? 'Error'}: ${String((e as any)?.message ?? e).slice(0, 120)}` }); return 'fail'; }
+      if (!reply?.ok) { log.push({ attempt: attemptNo, via: 'search_replay', page: pn, ok: false, ret: String(reply?.ret ?? ''), why: String(reply?.why ?? 'the replay did not answer') }); return 'fail'; }
+      if (!Array.isArray(reply.data?.resultList)) { log.push({ attempt: attemptNo, via: 'search_replay', page: pn, ok: false, why: 'unexpected_payload: the replay carried no resultList' }); return 'fail'; }
+      const items = searchListings(reply.data).length;
+      if (!items) { log.push({ attempt: attemptNo, via: 'search_replay', page: pn, ok: true, items: 0 }); return 'end'; }
+      payloads.push(reply.data);
+      pageLines.push({ page: pn, hit: false, age_s: null, observed_at: new Date().toISOString() });
+      putSearchPage(q, pn, reply.data);
+      log.push({ attempt: attemptNo, via: 'search_replay', page: pn, ok: true, items, ms: Number(reply.ms) || 0 });
+      nextPage = pn + 1;
+      return 'ok';
+    };
+    // A failure among the pages the caller explicitly asked for sends the call to the typed route,
+    // even when the earlier ones answered: the typed route is the one that promises the set that was
+    // asked for, and half a request answered is not that promise. A failure during the *top-up* -- the
+    // extra pages fetched only because the kept set was short -- keeps what the replay already
+    // answered, the way a pager click that stops mid-walk does, and the answer says why it stopped.
+    for (let pn = startPage; pn <= pagesWanted; pn++) {
+      const state = await fetchPage(pn);
+      if (state === 'fail') return null;
+      if (state === 'end') { stopReason = 'end_of_pages'; break; }
+    }
+    if (!payloads.length) return null;
+    let found: any = await finish(payloads, q, cap, (rows: any[]) => FEED_NORMALIZE_JS({ rows }));
+    if (!found) return null;
+    while (found.accepted && (found.count ?? 0) < cap && nextPage <= deepLimit) {
+      const state = await fetchPage(nextPage);
+      if (state === 'fail') { stopReason = stopReason ?? 'replay_failed'; break; }
+      if (state === 'end') { stopReason = 'end_of_pages'; break; }
+      found = (await finish(payloads, q, cap, (rows: any[]) => FEED_NORMALIZE_JS({ rows }))) ?? found;
+    }
+    if (!found.accepted) {
+      // The guard runs over replay data exactly as it does over a tapped one: a page of unrelated
+      // titles is not an answer, so the typed path gets its turn rather than this code publishing it.
+      log.push({ attempt: attemptNo, via: 'search_replay', ok: false, retryable: 'irrelevant_api_results', ...(found.diagnostics ?? {}) });
+      return null;
+    }
+    const oldest = observationAge(pageLines);
+    return publishSearch(session, q, found, detail, deadline, { query: q, source: 'search_api', via: 'search_replay', account_required: false, attempts: attemptNo, attempt_log: log, cache: pageReport(pageLines), ...found,
+      partial: Boolean(stopReason && stopReason !== 'end_of_pages'), stop_reason: stopReason,
+      next_cursor: continuation(stopReason === 'end_of_pages' ? MAX_SEARCH_PAGES + 1 : nextPage, found.remaining_items, Date.now() - oldest * 1000),
+      effective_limit: cap, effective_max_items: searchCap(), requested_limit: limit,
+      retry_after_s: ['rate_limited', 'risk_control'].includes(stopReason ?? '') ? 60 : 0 });
+  };
   for (let attemptNo = 1; attemptNo <= maxAttempts; attemptNo++) {
     checkpoint();
     if (Date.now() >= deadline) break;
+    // The fast path first: one signed replay per call, before the page is touched at all. When it
+    // answers, this call is over -- no load, no keystroke, no pager. When it does not, its failure is
+    // already in `log` and the typed attempt below runs exactly as it always has.
+    if (!replayTried) { replayTried = true; const fast = await replaySearch(attemptNo); if (fast) return fast; }
     // A failed page load is a declined attempt, not a fatal error. This network throws
     // ERR_INSUFFICIENT_RESOURCES / ERR_ADDRESS_UNREACHABLE often enough that aborting the whole call
     // would make search useless. The clock is checked at the foot of the loop either way, so ten failed
@@ -894,13 +967,17 @@ const itemView = async ({ item_id }: ItemArgs): Promise<Data> => {
   // no item pages to logged-out visitors. It does: the detail API answers SUCCESS anonymously with
   // title, gallery, description and seller statistics.
   const session = getSession(), read = await readListing(session, item, deadline);
+  // The replay attempt travels with the answer, whether it answered or not: a caller comparing two
+  // listings should not have to infer from `attempts: 0` that a signed API call happened instead of a
+  // page load.
+  const attemptLog = read.replay ? [{ attempt: 1, via: 'detail_replay', ...read.replay }] : [];
   if (read.listing) {
     const l = read.listing;
     // `item_id` is added here rather than in `readListing` because the two routes return different
     // shapes -- the API route has it in the payload, the DOM route as `page_item_id` -- and the
     // envelope has to be the same whichever one answered.
     return { ...l, item_id: item, page_item_id: item, url: `${HOME}item?id=${item}`, account_required: false,
-      attempts: read.tries, wants: asCount(l.want_count), browses: asCount(l.browse_count),
+      attempts: read.tries, ...(attemptLog.length ? { attempt_log: attemptLog } : {}), wants: asCount(l.want_count), browses: asCount(l.browse_count),
       reco_anchors: 0, image_candidates: (l.image_urls || []).length,
       // The cache decision travels with the answer, always. `attempts: 0` beside `cache.hit: true`
       // means no page was loaded and goofish was never asked: a ~0s repeat view, publishable as one
@@ -910,28 +987,64 @@ const itemView = async ({ item_id }: ItemArgs): Promise<Data> => {
   }
   // Nothing to report. Name the cause rather than the symptom.
   const payload = read.payload;
-  const why = payload?.api_ret ? `goofish's own detail API refused it: ${payload.api_ret}`
+  const replayWhy = read.replay && !read.replay.ok ? ` The signed replay said: ${String(read.replay.ret || read.replay.why).slice(0, 160)}.` : '';
+  const why = (payload?.api_ret ? `goofish's own detail API refused it: ${payload.api_ret}`
     : payload?.declined ? `goofish served its ${payload.declined === 'site_error' ? 'own "网络不见了" error page' : '"非法访问" risk-control page'} instead of the app`
     : payload?.api_item_id ? `the page answered about item ${payload.api_item_id} instead of ${item}`
     : payload?.site_error ? 'goofish served its own "网络不见了" error page on every attempt'
     : payload?.rail_only ? 'every load mounted the app and held only recommendation cards, with no listing in it'
-    : 'the page stayed an empty shell';
+    : 'the page stayed an empty shell') + replayWhy;
   throw new DetailUnavailableError(
     `item ${item} could not be read for this anonymous visitor after ${read.tries} page load(s) in ${Math.round((Date.now() - started) / 1000)}s: ${why}. Most often this id is sold, removed, or too old to still be live -- goofish answers a dead id with no listing rather than an error. `
     + `Page text: ${JSON.stringify(String(payload?.head_preview || '').slice(0, 160))}`);
 };
+
+/** What a caller is told about the signed detail replay: whether it answered, how long it took and,
+ *  when it did not, goofish's own reason. The payload itself is not part of it. */
+type ReplayNote = { ok: boolean; ms: number; ret: string; why: string };
+
+/** One attempt at issuing the detail API directly, before any page is loaded. Never throws: `null`
+ *  means the fast path is off for this session, and every other outcome is a note (with the reply's
+ *  data when it answered) that the read publishes and then falls back from. */
+const replayListing = async (session: any, item: string): Promise<(ReplayNote & { data: any }) | null> => {
+  if (!replayEnabled() || typeof session?.replay !== 'function') return null;
+  try {
+    const r = await session.replay(DETAIL_API, detailPayload(item), { spmCnt: 'a21ybx.item.0.0' });
+    return { ok: Boolean(r?.ok), ms: Number(r?.ms) || 0, ret: String(r?.ret ?? ''), why: String(r?.why ?? ''), data: r?.data ?? null };
+  } catch (e: unknown) {
+    return { ok: false, ms: 0, ret: '', why: `the replay attempt threw ${(e as any)?.error_type ?? 'Error'}: ${String((e as any)?.message ?? e).slice(0, 120)}`, data: null };
+  }
+};
+const noteOf = (r: (ReplayNote & { data: any }) | null): ReplayNote | null => (r ? { ok: r.ok, ms: r.ms, ret: r.ret, why: r.why } : null);
 
 /**
  * Loads an item page, reads that page's own detail reply, returns the listing. Never throws; a caller
  * reading 20 listings wants one bad listing reported, not an exception. It owns the navigation too --
  * the reply exists only once the page has loaded -- and it is where the listing cache sits, so
  * `item_view`, `detail` and `resolveSeller` share one check. */
-const readListing = async (session: any, item: string, deadline: number, surface?: DomSurface): Promise<{ listing: any | null; payload: any; tries: number; page: Page | null; cache: CacheVerdict }> => {
+const readListing = async (session: any, item: string, deadline: number, surface?: DomSurface): Promise<{ listing: any | null; payload: any; tries: number; page: Page | null; cache: CacheVerdict; replay: ReplayNote | null }> => {
   const warm = getItem(item);
-  if (warm) return { listing: warm.value, payload: {}, tries: 0, page: null, cache: warm.verdict };
+  if (warm) return { listing: warm.value, payload: {}, tries: 0, page: null, cache: warm.verdict, replay: null };
   // Published on every miss as well as every hit, so the envelope's shape does not depend on where
   // the answer came from -- the same rule the typed/missing block follows per listing route.
   const live = (): CacheVerdict => missed(itemKey(item), itemTtl(), 'this listing');
+  // The signed replay first -- but only when no page has been loaded yet. One mtop call with a fresh
+  // signature measures 0.6-3.1s when it answers, against 4-10s for a page load; a fan-out surface, on
+  // the other hand, is leased and loaded *before* this function runs, so a replay there would add its
+  // latency to a load that already happened. It is never allowed to fail the read either way: every
+  // outcome is a note that travels out with the answer, and any failure falls through to the page
+  // route below unchanged. `tries: 0` on a replay answer says no page was loaded.
+  const replay = surface ? null : await replayListing(session, item);
+  if (replay?.ok) {
+    const listing = detailListing(replay.data, item);
+    if (listing) {
+      const full = { ...enrichListing(listing), source: 'item_detail_replay' };
+      putItem(item, full);
+      return { listing: full, payload: {}, tries: 0, page: null, cache: live(), replay: { ok: true, ms: replay.ms, ret: replay.ret, why: '' } };
+    }
+    replay.ok = false;
+    replay.why = 'the replay answered SUCCESS but the payload did not read as this listing';
+  }
   const page: Page = surface ? surface.page : await session.open(`${HOME}item?id=${item}`);
   const tap = surface ? surface.tap : session.domTap;
   const land = surface ? surface.load : session.lastLoad;   // the verdict belongs to the load that made it
@@ -950,7 +1063,7 @@ const readListing = async (session: any, item: string, deadline: number, surface
         if (listing) {
           const full = { ...enrichListing(listing), source: 'item_detail_api' };
           putItem(item, full);
-          return { listing: full, payload, tries, page, cache: live() };
+          return { listing: full, payload, tries, page, cache: live(), replay: noteOf(replay) };
         }
         // It answered with a different listing, or with none. That is a page that is not the one
         // that was asked for, and the id check below would refuse it -- but saying so now is
@@ -993,9 +1106,9 @@ const readListing = async (session: any, item: string, deadline: number, surface
       const fields = { ...cached, ...blank, item_id: item, page_item_id: item };
       return { listing: { ...enrichListing(fields), source: 'search_card_cache', attempts: tries, page_attempts: tries,
         note: `the item page did not answer for this listing (${payload?.api_ret || payload?.site_error ? 'refused' : 'rendered no detail block'}), so this is the listing as an earlier ${cached.detailed ? 'detail read' : 'search'} in this session published it${cached.detailed ? '' : '. The description, the want and browse counts and the seller\'s statistics live on the item page and are reported missing rather than guessed'}.`,
-        ...Object.fromEntries(ITEM_FIELDS.map((f) => [f, fields[f] ?? (f === 'image_urls' ? [] : '')])) }, payload, tries, page, cache: live() };
+        ...Object.fromEntries(ITEM_FIELDS.map((f) => [f, fields[f] ?? (f === 'image_urls' ? [] : '')])) }, payload, tries, page, cache: live(), replay: noteOf(replay) };
     }
-    return { listing: null, payload, tries, page, cache: live() };
+    return { listing: null, payload, tries, page, cache: live(), replay: noteOf(replay) };
   }
   // Unconditional: a page that renders the detail block but has no `?id=` in its URL is a redirect or
   // a challenge page, not the listing. Skipping the check when `served` is empty is what let an
@@ -1008,7 +1121,7 @@ const readListing = async (session: any, item: string, deadline: number, surface
   const rendered = Object.fromEntries(ITEM_FIELDS.map((f) => [f, payload[f] ?? (f === 'image_urls' ? [] : '')]));
   const listing = { ...enrichListing(rendered), source: 'item_page_dom' };
   putItem(item, listing);
-  return { listing, payload, tries, page, cache: live() };
+  return { listing, payload, tries, page, cache: live(), replay: noteOf(replay) };
 };
 
 /** What this server can and cannot do right now, verified against the live site. A diagnostic must
@@ -1163,10 +1276,10 @@ export const TOOLS: ToolDef[] = [
   tool({ name: 'browse_feed', description: 'Read pages of the public homepage feed. Returns listings, count and page reports. This feed is not a keyword search and has no verified upstream filters. Use search_items for a product query. Args: page_number (1-10000), pages (1-25), limit (1-500, default 60).' + NO_ACCOUNT, schema: FEED_ARGS, run: browseFeed }),
   tool({ name: 'search_count', description: 'Get Goofish’s keyword inventory estimate, not the number of cards this server can retrieve. A positive count does not prove search_items can load results, and may include broad matches. Refusals and unreadable counts are errors, never zero. Args: query.' + NO_ACCOUNT, schema: COUNT_ARGS, run: searchCount }),
   tool({ name: 'search_suggest', description: 'Get Goofish’s autocomplete suggestions for a query prefix. Returns suggestions and count; this is not a product search. Args: query, limit (1-500, default 20).' + NO_ACCOUNT, schema: SUGGEST_ARGS, run: searchSuggest }),
-  tool({ name: 'search_items', description: 'Search product listings by typing a query into Goofish. Only relevant titles are returned; punctuation and spacing are normalized, and Xeon/至强 are equivalent unless expand_synonyms:false. Args: query; pages (1-10, default 1, with up to 2 top-up pages); limit (1-300, default 120, further capped by XIANYU_SEARCH_MAX_ITEMS); detail (0-50, default 0, enrich a shortlist); attempts (1-10, default 4); timeout_s (1-600, bounds total time including queue and detail). Optional filters: min_price/max_price in CNY, city, province, exclude_keywords, form_factor (pcie/sxm2/sxm3/sxm4/sxm5), bare_card_only. Filters run on fetched cards, not at Goofish; unknown price/location/hardware fails a requested filter. Bare-card matching requires explicit title evidence. Read status, diagnostics, effective_limit and freshness. Partial calls retain items and next_cursor; resume with the same query and cursor (10-minute process-local lifetime), preserving original filters. Errors report retry_after_s; do not retry during cooldown. Prices and counts are numeric under typed, with raw strings preserved. compact:true keeps only item_id, rank, title, price, price_amount, city, want_count, seller, url (plus tags/publish_time when the card has them), drops attempt_log and diagnostics.sample_titles, and returns the same listings in a fraction of the bytes. sort (relevance default, price_asc, price_desc, newest) reorders the kept listings and renumbers rank; an unknown price or date sorts last. Every answer carries price_stats: count, min, p10, p25, median, p75, p90, max and mean over typed.price_amount, currency CNY, or null when no kept listing carried a numeric price.' + NO_ACCOUNT, schema: SEARCH_ARGS, run: locked(shaped(searchItems)) }),
+  tool({ name: 'search_items', description: 'Search product listings by calling Goofish’s own search API from a live page (a signed replay), falling back to typing into the SPA when Goofish refuses. Only relevant titles are returned; punctuation and spacing are normalized, and Xeon/至强 are equivalent unless expand_synonyms:false. Args: query; pages (1-10, default 1, with up to 2 top-up pages); limit (1-300, default 120, further capped by XIANYU_SEARCH_MAX_ITEMS); detail (0-50, default 0, enrich a shortlist); attempts (1-10, default 4); timeout_s (1-600, bounds total time including queue and detail). Optional filters: min_price/max_price in CNY, city, province, exclude_keywords, form_factor (pcie/sxm2/sxm3/sxm4/sxm5), bare_card_only. Filters run on fetched cards, not at Goofish; unknown price/location/hardware fails a requested filter. Bare-card matching requires explicit title evidence. Read status, diagnostics, effective_limit and freshness; `via` names the route that answered (search_replay when the signed API call did, searchbox when the page had to be typed into, cache when nothing was asked). Partial calls retain items and next_cursor; resume with the same query and cursor (10-minute process-local lifetime), preserving original filters. Errors report retry_after_s; do not retry during cooldown. Prices and counts are numeric under typed, with raw strings preserved. compact:true keeps only item_id, rank, title, price, price_amount, city, want_count, seller, url (plus tags/publish_time when the card has them), drops attempt_log and diagnostics.sample_titles, and returns the same listings in a fraction of the bytes. sort (relevance default, price_asc, price_desc, newest) reorders the kept listings and renumbers rank; an unknown price or date sorts last. Every answer carries price_stats: count, min, p10, p25, median, p75, p90, max and mean over typed.price_amount, currency CNY, or null when no kept listing carried a numeric price.' + NO_ACCOUNT, schema: SEARCH_ARGS, run: locked(shaped(searchItems)) }),
   tool({ name: 'related_items', description: 'Read products Goofish recommends for an item; these are recommendations, not keyword matches. Omit item_id for generic suggestions. Returns items and count. Args: item_id (digits or item URL, optional), limit (1-500, default 30), page (1-10000).' + NO_ACCOUNT, schema: RELATED_ARGS, run: relatedItems }),
   tool({ name: 'seller_profile', description: 'Read a seller’s public profile and trust fields. Pass exactly one of user_id (seller digits or profile URL) or item_id (listing digits or URL). A user_id needs one API call; item_id first loads the listing and can add city, sales, tenure and reply rate. Unknown facts are null and named in fields_missing. No account is required.' + NO_ACCOUNT, schema: SELLER_ARGS, run: sellerProfile }),
   tool({ name: 'seller_items', description: 'Read a seller’s listings. Pass exactly one of user_id or item_id; item_id first loads the listing to identify its seller. Each page contains at most 20 cards; limit (1-20, default 20) only truncates that page. Walk page (1-50) while has_more is true. Returns effective_limit, page_size, items and numeric fields under typed.' + NO_ACCOUNT, schema: SELLER_ITEMS_ARGS, run: sellerItems }),
-  tool({ name: 'item_view', description: 'Read one listing’s description, price, photos and available seller statistics. Args: item_id (digits or item URL). Cache reports observation age; a price may have changed since. source names the route: item_detail_api is the full reply, item_page_dom is rendered content, search_card_cache is a previously observed card. fields_missing names unavailable facts. Removed, mismatched or unreadable listings are explicit errors.' + NO_ACCOUNT, schema: ITEM_ARGS, run: locked(itemView) }),
+  tool({ name: 'item_view', description: 'Read one listing’s description, price, photos and available seller statistics. Args: item_id (digits or item URL). Cache reports observation age; a price may have changed since. source names the route: item_detail_replay is the signed API call (no page load), item_detail_api is the page’s own full reply, item_page_dom is rendered content, search_card_cache is a previously observed card. A failed replay is listed in attempt_log and falls back to the page. fields_missing names unavailable facts. Removed, mismatched or unreadable listings are explicit errors.' + NO_ACCOUNT, schema: ITEM_ARGS, run: locked(itemView) }),
   tool({ name: 'recommendations', description: 'Read recommendation cards from a Goofish page. If the page cannot render recommendations, fall back to the public feed and report fallback_reason and source. These results are not keyword matches. Args: limit (1-500, default 30), url (optional HTTPS Goofish URL).' + NO_ACCOUNT, schema: RECO_ARGS, run: locked(recommendations) }),
 ];

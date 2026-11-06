@@ -102,6 +102,7 @@ full answer, base ref and fetch included, is what it runs when it has to rebuild
 | `XIANYU_RECOMMENDATIONS_BUDGET_S` | 45 | wall-clock budget for the `recommendations` retry loop (5–600s) |
 | `XIANYU_SELLER_PROFILE_BUDGET_S` | 90 | wall-clock budget for the item-page hop `seller_profile` / `seller_items` make when given an `item_id` (5–600s). A lookup by `user_id` runs no loop and spends none of it |
 | `XIANYU_SEARCH_MAX_ITEMS` | 300 | ceiling for one `search_items` call, in listings -- clamps both `limit` and how deep the pager walk goes (30–300), so a huge walk stays inside `XIANYU_SEARCH_BUDGET_S` |
+| `XIANYU_REPLAY` | `1` | `0` turns the signed in-page mtop replay off entirely: `search_items` types into the SPA and `item_view` loads the item page, exactly as before the fast path existed. Read per call, no restart -- see [the replay route](#search-by-replay-and-the-keystroke-as-fallback). |
 | `XIANYU_DETAIL_FANOUT` | 2 | how many listing pages `detail` loads at once (0–4), `0` reads them one at a time -- see [the detail fan-out](#detail-reads-two-listings-at-a-time-and-says-when-it-stops) |
 | `XIANYU_CACHE` | `1` | `0` turns the item-detail / search-page cache off entirely, no restart -- see [the cache](#repeat-views-are-cached-and-the-cache-says-so) |
 | `XIANYU_CACHE_ITEM_TTL_S` | 45 | how long a listing read in full may be served again (1–600) |
@@ -249,17 +250,22 @@ endpoint goofish's own `/personal?userId=` page calls, and this server reads it 
 that page's own mtop client -- from a page that never makes the call. That works, and it is the opposite
 of what happens with `mtop.taobao.idle.pc.detail`:
 
-| endpoint | the page calls it? | issued by this server |
-|---|---|---|
-| `mtop.taobao.idle.pc.detail` (item detail) | yes | **`TIMEOUT::接口超时`** |
-| `mtop.taobao.idlemtopsearch.pc.search` | yes | **`TIMEOUT::接口超时`** |
-| `mtop.idle.web.user.page.head` (seller profile) | no | **`SUCCESS::调用成功`** |
-| `mtop.idle.web.xyh.item.list` (seller's listings) | no | **`SUCCESS::调用成功`** |
+| endpoint | the page calls it? | through `window.lib.mtop.request` | as a signed in-page `fetch` |
+|---|---|---|---|
+| `mtop.taobao.idle.pc.detail` (item detail) | yes | **`TIMEOUT::接口超时`** | **`SUCCESS::调用成功`** |
+| `mtop.taobao.idlemtopsearch.pc.search` | yes | **`TIMEOUT::接口超时`** | **`SUCCESS::调用成功`** |
+| `mtop.idle.web.user.page.head` (seller profile) | no | **`SUCCESS::调用成功`** | not needed |
+| `mtop.idle.web.xyh.item.list` (seller's listings) | no | **`SUCCESS::调用成功`** | not needed |
 
-goofish stamps a per-call anti-bot blob onto the requests its own bundle originates, and a request we
-synthesise does not carry it. So for an endpoint the current page happens to use, the only honest route
-is to let the page make the call and read the reply off the wire -- which is what `item_view` and
-`search_items` do, and what the seller tools do for the one hop they cannot avoid. For an endpoint the
+goofish stamps a per-call anti-bot blob onto the requests its own bundle originates, and neither a
+request we synthesise in Node nor one `window.lib.mtop.request` signs carries it -- that client also
+uses a different appKey (12574478) and drops the API's own URL parameters, which is why it answers
+`TIMEOUT` even for an endpoint the page uses. A `fetch` issued *from the page's own JavaScript* is
+different: the page's interceptor appends the blob to a form body carrying `data`, and the gateway
+accepts it. That is [the replay route](#search-by-replay-and-the-keystroke-as-fallback), and it is why
+the same two endpoints move from the `TIMEOUT` column to the `SUCCESS` one. Reading the page's own
+reply off the wire -- what `item_view` and `search_items` fall back to -- remains the route when the
+replay fails, and it is what the seller tools do for the one hop they cannot avoid. For an endpoint the
 page never uses there is nothing to stamp, so the same client answers directly. Response interception
 can only ever report a call the page already decided to make, which is why a seller profile was not
 reachable before and is now.
@@ -307,21 +313,43 @@ makes results appear. That is a real-browser-profile observation and this code i
 recorded and not designed around. The one thing measured here is that the click, on this client, is
 harmful.
 
-## Search is a keystroke, not a URL
+## Search by replay, and the keystroke as fallback
 
-`search_items` does not navigate to `/search?q=`. It loads goofish's **homepage**, finds the SPA's own
-header search input, focuses it, types the query and presses Enter -- and the results it returns are the
-search call the page makes for itself, read off the wire. That call cannot be re-issued by this server:
-`mtop.taobao.idlemtopsearch.pc.search`, with the payload the page itself sent, answers
-`TIMEOUT::接口超时` when it is, for the same reason item detail does (see
-[item_view](#item_view-reads-the-calls-the-page-makes)). Letting the page ask is the only route, and
-it is the richer one: 30 structured results per query, each with a price, a want count, a city and a
-photo, where the DOM card this used to scrape could see a title and little else.
+`search_items` calls goofish's own search API directly. The call is an md5-signed `fetch` issued from
+**inside the goofish page**: the page's own interceptor appends `bx-ua`, `bx-umidtoken` and `bx_et` to
+a form body carrying `data`, and the gateway accepts that -- where it refuses the identical request
+from a Node HTTP client (`ECONNRESET`) or from `window.lib.mtop.request` (`TIMEOUT::接口超时`, wrong
+appKey and no API URL parameters). Measured on 2026-11-07: **1.06s** for a 30-result search page,
+**0.96s** for page 2 and **1.09s** for page 3 with zero item-id overlap, against **7.5s** for one typed
+search.
 
-The answer comes off the wire before the page draws it. The search call the page makes carries the
-data that is returned and lands ahead of the render that uses it, so the tap is registered the moment
-Enter is pressed and the first page is answered as soon as the reply arrives. The DOM poll -- a 400ms
-tick, which is also the fallback for a reply that never comes and the only source of the
+Pagination is the payload's own `pageNumber`, re-signed and re-posted, so a second page is a call and
+not a click. `search_items` answers `via: "search_replay"` and `source: "search_api"` when the replay
+answered, and its `attempt_log` names every page it fetched (`via: "search_replay"`, page, items, ms).
+Replay pages go through the same cache the typed route writes, so a deeper walk reuses them. The
+answer is held to exactly the same relevance guard and filters: a replay page that is really the
+recommendation rail is refused, and the typed route takes its place.
+
+**The fast path never fails a tool.** A missing token, a non-`SUCCESS` ret, a body that is not JSON, a
+shape change or a timeout is logged in `attempt_log` and the call falls through to the route below,
+unchanged -- including a replay the relevance guard refuses. `XIANYU_REPLAY=0` turns the fast path off
+entirely.
+
+**Why search is signed on a homepage and item detail on an item page.** goofish signs an in-page
+`fetch` with whatever the page's own bundle can sign, and a bundle only signs the APIs it uses. A
+search replay issued from the item page this server parks on never settled (>60s on two runs, >20s on
+a third), while the same call from a homepage answered 7/7 with 30 results each (2.7–12.0s); a detail
+replay from a homepage did not settle either, and 2/2 from an item page did (2.2–3.1s). So search is
+signed on a dedicated third page, loaded on the homepage once per process (measured **7.0–13.0s**,
+lazily, then reused for the session), and detail on the item page the server already parks on. A
+failed replay pauses that route for 60 seconds: an in-page fetch goofish ignores never settles, and a
+scan should pay one hung attempt rather than one per query or per listing.
+
+The typed route below is the fallback, and it is still measured rather than preferred. The answer comes
+off the wire before the page draws it: the search call the page makes carries the data that is
+returned and lands ahead of the render that uses it, so the tap is registered the moment Enter is
+pressed and the first page is answered as soon as the reply arrives. The DOM poll -- a 400ms tick,
+which is also the fallback for a reply that never comes and the only source of the
 `enter-did-not-submit` verdict -- no longer gates the answer; the pager is the one DOM dependency
 left, and only when more than one page is wanted (or the shortfall top-up runs).
 
@@ -343,14 +371,15 @@ what it is.
 
 ### Depth: `pages` and `detail`
 
-One search reply is 30 listings, and the search API cannot be re-issued -- replaying the page's own
-payload through the same client answers `TIMEOUT::接口超时`, for the same anti-bot reason item detail
-does. Scrolling the results page does not paginate. So the only way past 30 is the page's own pager,
-which this server clicks: a DOM `click()`, not a Playwright pointer click, so the login dialog's
-`ant-modal-mask` cannot intercept it the way it eats every other click here. It is the search page's
-own pagination control, not a dialog dismissal.
+One search reply is 30 listings. On the replay route the next page is the payload's `pageNumber`,
+re-signed and re-posted: 30 fresh listings per call, measured at 0.96s and 1.09s for pages 2 and 3,
+zero id overlap. Scrolling the results page does not paginate, and `window.lib.mtop.request` answers
+`TIMEOUT::接口超时` for the same API -- the pager below is the *typed* fallback's only way past 30.
 
-Measured: **30 new listings per page, 5–9.5s, zero overlap**, against 13–25s for a fresh page load.
+On the typed route this server clicks the page's own pager: a DOM `click()`, not a Playwright pointer
+click, so the login dialog's `ant-modal-mask` cannot intercept it the way it eats every other click
+here. It is the search page's own pagination control, not a dialog dismissal. Measured on that route:
+**30 new listings per page, 5–9.5s, zero overlap**, against 13–25s for a fresh page load.
 
 How many of a page's 30 actually match is not 30. goofish's ranking drifts between requests, so
 across three separate sessions `pages: 2` gave **25, 28 and 55** matches of 60 scanned, and a page
@@ -366,9 +395,12 @@ a thin market at about 14s extra rather than letting a degraded page silently un
 | `pages: 4` | 90 | **81–82** | 19–36s |
 
 `detail: N` reads the top N of the ranked results in full -- description, every photo, and the seller
-with their city, tenure, sales count, rating, reply rate, signature and 芝麻 status. It is **one page
-load per listing -- measured at a median of 13.4s warm** (n=8, 8/8 answered: 4.5s to `domcontentloaded`,
-then goofish's own detail call lands 9–17s after that) -- and `item_view` cannot skip it: an SPA route
+with their city, tenure, sales count, rating, reply rate, signature and 芝麻 status. On the shared
+route the signed detail replay answers first (2.2–3.1s when goofish allows it) and a page is loaded
+only when it does not; the fan-out below always loads, because its pages are leased and loaded before
+the read starts, so a replay there would only add latency. A page load is **measured at a median of
+13.4s warm** (n=8, 8/8 answered: 4.5s to `domcontentloaded`, then goofish's own detail call lands
+9–17s after that) -- and `item_view` cannot skip it: an SPA route
 change is not available at all (0/8 answered in 32s, because the item page is a micro-frontend with no
 reachable router and no item links to click). What `detail` *can* do is stop loading them one after
 another. See [the next section](#detail-reads-two-listings-at-a-time-and-says-when-it-stops).
@@ -597,14 +629,15 @@ other figure is that same warm session. Treat these as order of magnitude, not a
 | `search_items` -- first of a session | 20.9s | 10 matches, `search_api` |
 | `search_items` -- later, warm page | 13.6–14.9s | 10 matches, `search_api` |
 | `item_view` | 6.4–9.5s | 5/5 live listings, `item_detail_api`, `fields_missing: []` |
+| `item_view` -- signed replay, warm | 0.6–1.2s | `item_detail_replay`, `attempts: 0`, `fields_missing: []` |
 | `recommendations` | 17.7s | 20 real listings, `dom_recommendation` |
 
 Two things do the work. The mtop-only tools run on a page of their own that never navigates, so
 they cost one request and no page load -- 0.4–2.2s warm -- and they no longer queue behind a search. And
 only the *first* `search_items` of a session pays for a page load: later ones retype into the header
 input of the page already showing results, which is an SPA route change, 13–15s against 21s for a cold
-load. `item_view` reads the call the page makes for itself, which is both the only route that works and
-far cheaper than the reload-and-retry loop it replaced.
+load. `item_view` reads the call the page makes for itself, which is far cheaper than the
+reload-and-retry loop it replaced.
 
 Re-measured on 2026-11-07 for the reply-first search, with the repo's own harness
 (`node scripts/bench-scan.mjs`), one process, headed, three queries at `pages: 1, limit: 60`:
@@ -620,6 +653,21 @@ search's own reply took 7–12s, and one reply carries 30 listings, so `limit: 6
 those calls walk one or two pages afterwards at 5–9.5s each -- the pager dependency described above,
 not a render wait. The same three queries at `limit: 30` measured 29.7s for the first call and then
 16.1s and 11.3s. What is left is the reply's own latency and the pager, not a wait this server adds.
+
+The signed replay removes that floor. Same harness, same box, one process, three queries at
+`pages: 2, limit: 60`, measured 2026-11-07:
+
+| query | wall | route | listings | pages fetched |
+|---|---|---|---|---|
+| `thinkpad x220` (the session's first call, which pays the replay page's one-time warm-up) | 21.8s | `search_replay` | 60 | 3 |
+| `iphone 13` | 6.6s | `search_replay` | 60 | 4 |
+| `kindle paperwhite` | 3.4s | `search_replay` | 60 | 2 |
+
+`pages: 2` fetched 2 pages and then topped up while the kept set was short of `limit`, which is why
+the counts above are 2-4 pages for 60 listings. The first call's 21.8s is a cold Chromium plus the
+homepage replay page's warm-up; the third is the steady state and it is two API calls. Compare the
+reply-first table above: 40.5s / 12.4s / 16.0s for the same three queries on the typed route with the
+same output shape.
 
 Each MCP call now has a total deadline, including time in the DOM queue. `search_items.timeout_s`
 overrides the default; browser waits and navigation are capped by the remaining time. Expired work
@@ -646,18 +694,26 @@ will not paint, and is live listings either way. The MCP server itself was drive
 stdio: `initialize`, `tools/list` returning all ten with their schemas and the no-account note on each,
 and a live `search_count` returning `{"ok":true,...,"match_count":28846}`.
 
-### `item_view` reads the calls the page makes
+### `item_view` calls the detail API, and reads the page's call when it cannot
 
-goofish does not serve item detail to a request *this server* makes. Its own detail call,
-`mtop.taobao.idle.pc.detail`, answers `TIMEOUT::接口超时` when re-issued through the page's mtop client
-with the payload the page itself sent -- goofish stamps the requests its own bundle originates with a
-per-call anti-bot blob, and a request we synthesise does not carry it. The same API, called by the page,
-answers `SUCCESS::调用成功` and carries the listing.
+`item_view` issues `mtop.taobao.idle.pc.detail` itself: the same md5-signed in-page `fetch` the search
+route uses, from the item page the server keeps parked. Measured **0.6s, 1.1s and 1.2s** on warm calls
+(2.2–3.1s while the site was under load; the first call of a process pays the page load that parks the
+page), against 4–10s for a page load. It answers `source: "item_detail_replay"`; a failure is published
+in `attempt_log` and falls straight through to the page route below, never raised.
 
-So `item_view` loads the item page and reads the reply that page makes for itself, off the wire. That
-is the only route that works, and it is also the richer one: the reply holds the title, the full photo
-gallery, the description, the 品牌/成色/已用年限 attribute block, the seller's city, tenure, sales
-count, positive rate, signature, reply rate and avatar, plus favourites, quantity and shipping.
+That route is not guaranteed: the detail API is the one goofish's risk control refuses most readily,
+and a refusal (`RGV587_ERROR::SM::哎哟喂,被挤爆啦`) is exactly what the fallback is for. A `TIMEOUT` or a
+refusal pauses the detail replay for 60 seconds, so a `detail: 50` walk pays at most one failed attempt
+before it goes back to loading pages.
+
+The page route, unchanged: goofish's own detail call answers `SUCCESS::调用成功` and carries the
+listing, so `item_view` loads the item page and reads the reply that page makes for itself, off the
+wire. `window.lib.mtop.request` cannot do this (`TIMEOUT::接口超时` when re-issued with the payload the
+page itself sent: wrong appKey, missing URL parameters, and no anti-bot blob), and a Node HTTP client
+cannot either. That route is also the richer one: the reply holds the title, the full photo gallery,
+the description, the 品牌/成色/已用年限 attribute block, the seller's city, tenure, sales count,
+positive rate, signature, reply rate and avatar, plus favourites, quantity and shipping.
 
 This replaces a premise this README used to state, in three comments in the source and in the tool
 description: that "goofish does not serve item pages to logged-out visitors". It does. Measured on
@@ -669,6 +725,7 @@ strips on a page whose listing was a nail gun.
 
 | | when | what you get |
 |---|---|---|
+| `source: item_detail_replay` | the signed detail replay answered | everything listed above, exact -- and `attempts: 0`, because no page was loaded |
 | `source: item_detail_api` | the page's detail call answered | everything listed above, exact |
 | `source: item_page_dom` | no API reply, but the detail block rendered | the ten DOM-scrapable fields, title included |
 | `source: search_card_cache` | the page would not answer, but an earlier search in this session returned the id | title, price, city, want count, photo -- and `fields_missing` naming the description and the seller statistics |
@@ -694,9 +751,14 @@ page -- named as `site_error`, and retried rather than waited on.
 - No account, ever. A brand-new browser context per session. `loginuser.get` is called only to
   *prove* the session is logged out, never to act as one, and `capabilities` reports `session_state`
   from what that probe actually returned -- not from the fact that it failed.
-- No credentials. No cookie, storage-state or persistent-profile API appears anywhere in `src/`
-  or `test/`; the test that enforces it matches `.cookies(` with whitespace stripped, so
-  `page.context().cookies()` and a call split across lines cannot slip through either.
+- No credentials, and one token. No storage-state, persistent-profile or cookie-writing API appears
+  anywhere in `src/` or `test/`, and no login cookie is read. The one cookie this server touches is
+  goofish's `_m_h5_tk` -- the anonymous per-visitor anti-bot token the page's own bundle signs with --
+  read once, in `Session.replayToken`, from the browser context's jar rather than from page JS
+  (`document.cookie` can be shadowed by the page). A test pins that: `.cookies(` and `_m_h5_tk` may
+  appear in exactly one constant and one line of `browser.ts`, and nowhere else in `src/`; the
+  whitespace-stripped match means `page.context().cookies()` and a call split across lines are still
+  caught. The token is not an account: it is minted for a fresh, empty, logged-out context.
 - No orphaned browsers. The server holds a real windowed Chromium, so shutdown is deliberate: a
   client closing stdin, a signal, and an unexpected exit all route through one bounded teardown, and
   a `browser.close()` that hangs is SIGKILLed rather than left running. Two measured defects are
@@ -710,10 +772,10 @@ page -- named as `site_error`, and retried rather than waited on.
   after every fix: 0 processes left, 0 orphans.
 - Read-only. No publish, delete, message, upload or account tool exists. The nine mtop API names the
   server may use are a closed list -- only `window.lib.mtop.request`, the client method the whole
-  design rests on, is exempt -- and a test fails if any other `mtop.*` name appears. Seven are called
-  by this server; the other two (`idle.pc.detail`, `idlemtopsearch.pc.search`) are named because the
-  *page* calls them and the server reads the replies -- see
-  [item_view](#item_view-reads-the-calls-the-page-makes).
+  design rests on, is exempt -- and a test fails if any other `mtop.*` name appears. All nine are
+  reachable: seven through that client, and `idle.pc.detail` / `idlemtopsearch.pc.search` through the
+  signed in-page `fetch` (and through the page's own calls, whose replies the server reads) -- see
+  [item_view](#item_view-calls-the-detail-api-and-reads-the-pages-call-when-it-cannot).
 - The lock is taken where a page is read, not by a list of tools. The three DOM tools hold the
   shared navigating page, and the mtop-only ones never queue behind a 70s search. The two seller tools
   are the case that forces the rule to be stated that way: mtop-only given a `user_id`, and holding the

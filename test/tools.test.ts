@@ -15,10 +15,10 @@ import { BOOT_URL, DETAIL_POOL_MAX, exclusive, HOME, MtopTap, reloadFresh, Sessi
 import { BrowserError, DetailUnavailableError, GatedError, NavigationError, ParseError, SearchUnavailableError, XianyuError } from '../src/errors.ts';
 import { FEED_NORMALIZE_JS, ITEM_SCRAPE_JS, MTOP_READY_JS, PAGER_CLICK_JS, PAGER_STATE_JS, SCRAPE_CARDS_JS, SEARCH_INPUT_JS, SEARCH_STATE_JS } from '../src/extract.ts';
 import { budget, fanoutSize, ITEM_FIELDS, resetCardCache, TOOLS } from '../src/tools.ts';
-import { reset as resetCaches } from '../src/cache.ts';
+import { getItem, getSearchPage, putSearchPage, reset as resetCaches } from '../src/cache.ts';
+import { DETAIL_API } from '../src/replay.ts';
 import { z } from 'zod';
 import { executeTool, resetCooldown } from '../src/response.ts';
-import { getSearchPage, putSearchPage } from '../src/cache.ts';
 
 const run = (name: string) => {
   const t = TOOLS.find((x) => x.name === name);
@@ -72,7 +72,7 @@ const refused = (ret: string) => ({ ret, ok: false, data: null });
  *  `domDelayMs` is the time between Enter and the SPA's route change: the page keeps the pre-search
  *  URL for that long, so a test can put a slow render behind an already-arrived mtop reply. `mtopMs`
  *  is the same idea on the other side, delaying the tap's reply delivery rather than the render. */
-const makeSession = (payloads: { cards?: any[]; item?: any[]; scrape?: any[]; search?: any; swallow?: number; mtop?: Record<string, any[]>; poolMs?: number; poolSilent?: boolean; domDelayMs?: number; mtopMs?: number; liveMtop?: boolean } = {}, raw: any = {}, sleepMs = 0, hijack = '', hijackAfter: 'open' | 'read' = 'open') => {
+const makeSession = (payloads: { cards?: any[]; item?: any[]; scrape?: any[]; search?: any; swallow?: number; mtop?: Record<string, any[]>; poolMs?: number; poolSilent?: boolean; domDelayMs?: number; mtopMs?: number; liveMtop?: boolean; replay?: (api: string, data: any, opts?: any) => any } = {}, raw: any = {}, sleepMs = 0, hijack = '', hijackAfter: 'open' | 'read' = 'open') => {
   const queues: Record<any, any[]> = { [FEED_NORMALIZE_JS as any]: [...(payloads.cards ?? [])], [ITEM_SCRAPE_JS as any]: [...(payloads.item ?? [])], [SCRAPE_CARDS_JS as any]: [...(payloads.scrape ?? [])] };
   // `liveMtop`: the tap is the real `MtopTap` and the fake page announces the seeded replies through
   // `record` at Enter and at each pager click, so a test sees the tap's delivery rule rather than a
@@ -164,6 +164,10 @@ const makeSession = (payloads: { cards?: any[]; item?: any[]; scrape?: any[]; se
     },
     call: async (spec: any) => { s.specs.push(spec); return s.raw; },
   };
+  // The signed-replay fast path, present only when a test asks for it. A session without it is a
+  // session where `XIANYU_REPLAY=0` was set or the browser is too old to try: the tools then take the
+  // typed route with no extra log line, which is what every other test here expects.
+  if (payloads.replay) s.replay = async (api: string, data: any, opts?: any) => payloads.replay!(api, data, opts);
   return s;
 };
 
@@ -273,7 +277,7 @@ const realSession = (opts: Parameters<typeof drivenPage>[0] = {}) => {
 // cleared between tests the same way the env budget is: a test that seeded one would otherwise have
 // the next item_view or search_items answered from it -- and, worse, would stop exercising the
 // refusal paths, since a cached listing never reaches them.
-test.afterEach(() => { setSession(null); resetCardCache(); resetCaches(); for (const g of ['document', 'location', 'window']) delete (globalThis as any)[g]; for (const k of ['SEARCH', 'ITEM_VIEW', 'RECOMMENDATIONS']) delete process.env[`XIANYU_${k}_BUDGET_S`]; delete process.env.XIANYU_SEARCH_MAX_ITEMS; delete process.env.XIANYU_DETAIL_FANOUT; });
+test.afterEach(() => { setSession(null); resetCardCache(); resetCaches(); for (const g of ['document', 'location', 'window']) delete (globalThis as any)[g]; for (const k of ['SEARCH', 'ITEM_VIEW', 'RECOMMENDATIONS']) delete process.env[`XIANYU_${k}_BUDGET_S`]; delete process.env.XIANYU_SEARCH_MAX_ITEMS; delete process.env.XIANYU_DETAIL_FANOUT; delete process.env.XIANYU_REPLAY; });
 
 const cards = (ids: string[]) => ({ ok: true, ret: 'SUCCESS::调用成功', data: { cardList: ids.map((id) => ({ cardData: { itemId: id, title: `t${id}`, soldPrice: '5' } })) } });
 const listed = (ids: string[]) => ids.map((id) => ({ item_id: id, title: `t${id}`, price: '5', city: '杭州', seller: 'a', want_count: '1', image_urls: [], url: `https://www.goofish.com/item?id=${id}` }));
@@ -834,6 +838,166 @@ test('a search that submits but never answers still fails with the existing taxo
     return true;
   });
   assert.equal(s.opened.length, 2, 'it retried with a fresh load before giving up');
+});
+
+// ---------------------------------------------------------------- the signed-replay fast path
+
+/** One 30-result search reply for a given page number, so a fake replay can answer page 1 and page 2
+ *  with different listings the way goofish does. */
+const replayPageReply = (pn: number) => searchReply('thinkpad x220', Array.from({ length: 30 }, (_, i) => [`联想Thinkpad X220 笔记本 第${pn}页 ${i}`, String(pn * 1000 + i), String(100 + i), '北京', '3']));
+const replayAnswer = (data: any) => ({ ok: true, ret: 'SUCCESS::调用成功', data: replayPageReply(Number(data.pageNumber)), ms: 11 });
+
+test('search_items answers from a signed replay without touching the search box, and its pages are cached', async () => {
+  const calls: any[] = [];
+  const s = use(makeSession({ replay: async (api: string, data: any, opts: any) => { calls.push({ api, data, opts }); return replayAnswer(data); } }));
+  const out = await run('search_items')({ query: 'thinkpad x220', limit: 60, pages: 1 });
+  assert.equal(out.via, 'search_replay');
+  assert.equal(out.source, 'search_api');
+  assert.equal(out.count, 60, 'the one page asked for held 30, so the top-up walked the second exactly as the typed route would');
+  assert.equal(new Set(out.items.map((i: any) => i.item_id)).size, 60, 'two pages, no repeated listing');
+  assert.equal(out.scraped_cards, 60);
+  assert.equal(out.query_hits, 60, 'the guard ran over the pooled replay data');
+  assert.equal(s.search.value, '', 'nothing was typed');
+  assert.deepEqual(s.opened, [], 'no page was loaded');
+  assert.deepEqual(s.pagers, [], 'the pager was never clicked');
+  // the two calls carry the page number, the query and the page parameters the page itself sends
+  assert.deepEqual(calls.map((c) => [c.api, c.data.pageNumber, c.data.keyword, c.opts.spmCnt, c.opts.spmPre]), [
+    ['mtop.taobao.idlemtopsearch.pc.search', 1, 'thinkpad x220', 'a21ybx.search.0.0', 'a21ybx.home.searchInput.0'],
+    ['mtop.taobao.idlemtopsearch.pc.search', 2, 'thinkpad x220', 'a21ybx.search.0.0', 'a21ybx.home.searchInput.0'],
+  ]);
+  // Published as evidence, and every page stored through the same cache the typed route writes.
+  const logged = out.attempt_log.filter((e: any) => e.via === 'search_replay');
+  assert.deepEqual(logged.map((e: any) => [e.page, e.ok, e.items]), [[1, true, 30], [2, true, 30]]);
+  assert.ok(getSearchPage('thinkpad x220', 1), 'page 1 is in the search-page cache');
+  assert.ok(getSearchPage('thinkpad x220', 2), 'and so is the page the top-up fetched');
+  assert.deepEqual(out.cache.pages.map((p: any) => [p.page, p.hit]), [[1, false], [2, false]], 'both pages were read live, and the cache block says so');
+});
+
+test('a replay page that fails during the top-up still publishes what it already answered, as partial', async () => {
+  // The requested page answered 30 of the 60 asked for; the top-up page is refused. That is what a
+  // pager click stopping mid-walk is on the typed route: keep the validated pages and say so, rather
+  // than spending a 30s typed search to re-fetch page 1.
+  const s = use(makeSession({ replay: async (api: string, data: any) => data.pageNumber === 1
+    ? { ok: true, ret: 'SUCCESS::调用成功', data: replayPageReply(1), ms: 10 }
+    : { ok: false, ret: 'RGV587_ERROR::SM::被挤爆啦', why: 'goofish refused the replay: RGV587_ERROR::SM::被挤爆啦', ms: 9 } }));
+  const out = await run('search_items')({ query: 'thinkpad x220', pages: 1, limit: 60 });
+  assert.equal(out.via, 'search_replay');
+  assert.equal(out.partial, true);
+  assert.equal(out.stop_reason, 'replay_failed');
+  assert.equal(out.count, 30);
+  assert.equal(out.pages_fetched, 1);
+  assert.equal(out.scraped_cards, 30);
+  assert.equal(s.search.value, '', 'no typed fallback was needed');
+  const failed = out.attempt_log.find((e: any) => e.via === 'search_replay' && e.ok === false);
+  assert.match(failed.ret, /RGV587/, 'and the reason the walk stopped is in the log');
+});
+
+test('a refused replay falls through to the typed path in the same attempt, and the refusal is in the log', async () => {
+  const c = searchCase('thinkpad x220', [['联想Thinkpad X220 笔记本 甲', '1001', '300', '北京', '1'], ['联想Thinkpad X220 笔记本 乙', '1002', '100', '上海', '2']]);
+  let replayCalls = 0;
+  const s = use(makeSession({ cards: [c.rows], mtop: c.mtop, replay: async () => { replayCalls++; return { ok: false, ret: 'RGV587_ERROR::SM::哎哟喂,被挤爆啦,请稍后重试!', why: 'goofish refused the replay: RGV587_ERROR::SM::哎哟喂,被挤爆啦,请稍后重试!', ms: 9 }; } }));
+  const out = await run('search_items')({ query: 'thinkpad x220', limit: 10 });
+  assert.equal(out.via, 'searchbox', 'the SPA answered');
+  assert.equal(out.source, 'search_api');
+  assert.equal(out.count, 2);
+  assert.equal(replayCalls, 1, 'the fast path is tried once per call, never in a loop');
+  assert.equal(s.search.value, 'thinkpad x220', 'the keyboard was used, as the fallback promises');
+  const refused = out.attempt_log.find((e: any) => e.via === 'search_replay');
+  assert.ok(refused, 'the replay failure is published, not swallowed');
+  assert.equal(refused.ok, false);
+  assert.match(refused.ret, /RGV587/);
+});
+
+test('a replay that throws is a fallback, not a failed tool', async () => {
+  const c = searchCase('thinkpad x220', [['联想Thinkpad X220 笔记本 甲', '1001', '300', '北京', '1']]);
+  const s = use(makeSession({ cards: [c.rows], mtop: c.mtop, replay: async () => { throw new Error('the page went away mid-replay'); } }));
+  const out = await run('search_items')({ query: 'thinkpad x220', limit: 10 });
+  assert.equal(out.via, 'searchbox');
+  assert.equal(out.count, 1);
+  assert.equal(s.search.value, 'thinkpad x220');
+  assert.match(String(out.attempt_log.find((e: any) => e.via === 'search_replay')?.why), /page went away/);
+});
+
+test('a replay the relevance guard refuses is not an answer: the typed path still is', async () => {
+  const irrelevant = {
+    resultList: Array.from({ length: 20 }, (_, i) => ({
+      data: { item: { main: {
+        clickParam: { args: { item_id: String(700 + i), price: '9' } },
+        exContent: { area: '南宁', detailParams: { itemId: String(700 + i), title: `木瓜丝广西特产 ${i}`, soldPrice: '9' } },
+      } } },
+      style: 'card', type: 'item',
+    })),
+  };
+  const c = searchCase('thinkpad x220', [['联想Thinkpad X220 笔记本 甲', '1001', '300', '北京', '1']]);
+  const s = use(makeSession({ cards: [c.rows], mtop: c.mtop, replay: async () => ({ ok: true, ret: 'SUCCESS::调用成功', data: irrelevant, ms: 10 }) }));
+  const out = await run('search_items')({ query: 'thinkpad x220', limit: 10 });
+  assert.equal(out.via, 'searchbox', 'a replay set that fails the guard falls back to typing, exactly as a refused one does');
+  assert.equal(out.count, 1);
+  assert.equal(s.search.value, 'thinkpad x220');
+  const rejected = out.attempt_log.find((e: any) => e.via === 'search_replay' && e.retryable === 'irrelevant_api_results');
+  assert.ok(rejected, 'the guard rejection is named in the log');
+});
+
+test('XIANYU_REPLAY=0 turns the fast path off entirely: neither tool calls it', async () => {
+  process.env.XIANYU_REPLAY = '0';
+  const c = searchCase('thinkpad x220', [['联想Thinkpad X220 笔记本 甲', '1001', '300', '北京', '1']]);
+  let calls = 0;
+  const s = use(makeSession({ cards: [c.rows], mtop: { ...c.mtop, [DETAIL_API]: [ok({ itemDO: { itemId: '2002', title: '联想Thinkpad X220 笔记本 乙', soldPrice: '199' }, sellerDO: {} })] }, item: [UNRENDERED],
+    replay: async () => { calls++; throw new Error('the kill switch let a replay through'); } }));
+  const out = await run('search_items')({ query: 'thinkpad x220', limit: 10 });
+  assert.equal(out.via, 'searchbox');
+  assert.equal(s.search.value, 'thinkpad x220', 'the keyboard was used');
+  const view = await run('item_view')({ item_id: '2002' });
+  assert.equal(view.source, 'item_detail_api', 'the page route answered');
+  assert.equal(calls, 0, 'the kill switch is checked before the session is asked');
+});
+
+test('item_view answers from a signed detail replay, publishing the route and filling the item cache', async () => {
+  const detail = { itemDO: { itemId: '856961429564', title: '联想Thinkpad X220 笔记本电脑', soldPrice: '329', wantCnt: 5, browseCnt: 900, desc: '成色好' }, sellerDO: { nick: '卖家', city: '北京', hasSoldNumInteger: 12, userRegDay: 730, newGoodRatioRate: '99%' } };
+  const seen: any[] = [];
+  const s = use(makeSession({ replay: async (api: string, data: any, opts: any) => { seen.push({ api, data, opts }); return { ok: true, ret: 'SUCCESS::调用成功', data: detail, ms: 2100 }; } }));
+  const out = await run('item_view')({ item_id: '856961429564' });
+  assert.equal(out.source, 'item_detail_replay');
+  assert.equal(out.title, '联想Thinkpad X220 笔记本电脑');
+  assert.equal(out.price, '329');
+  assert.equal(out.attempts, 0, 'no page load was needed');
+  assert.deepEqual(s.opened, []);
+  assert.deepEqual(seen.map((x) => [x.api, x.data, x.opts]), [[DETAIL_API, { itemId: '856961429564' }, { spmCnt: 'a21ybx.item.0.0' }]]);
+  assert.equal(out.attempt_log[0].via, 'detail_replay');
+  assert.equal(out.attempt_log[0].ok, true);
+  // The same cache key the page route uses, so a repeat view is still a cache hit rather than a replay.
+  const cached = getItem('856961429564');
+  assert.ok(cached, 'the listing is in the item cache');
+  assert.equal(cached!.value.source, 'item_detail_replay');
+});
+
+test('the detail fan-out does not pay for a replay on a page it has already loaded', async () => {
+  // `enrichDetails` leases a page and loads the listing BEFORE `readListing` runs, so a replay there
+  // costs ~3s per listing and saves nothing. It must not be attempted: the fan-out's own reply is
+  // already in flight when the read starts.
+  const c = searchCase('thinkpad x220', [['联想Thinkpad X220 笔记本 甲', '1001', '300', '北京', '1'], ['联想Thinkpad X220 笔记本 乙', '1002', '100', '上海', '2']]);
+  let replayCalls = 0;
+  use(makeSession({ cards: [c.rows], mtop: c.mtop, replay: async (api: string) => { if (api === DETAIL_API) replayCalls++; return { ok: false, ret: '', why: 'not attempted on a loaded page', ms: 3 }; } }));
+  const out = await run('search_items')({ query: 'thinkpad x220', limit: 10, detail: 2 });
+  assert.equal(out.detailed, 2, 'both listings were read from their own pages');
+  assert.equal(replayCalls, 0, 'the already-loaded page is the answer; a replay would only add latency');
+});
+
+test('item_view falls back to the item page when the detail replay fails, and says why', async () => {
+  const s = use(makeSession({
+    item: [UNRENDERED],
+    mtop: { [DETAIL_API]: [ok({ itemDO: { itemId: '856961429564', title: '联想Thinkpad X220 笔记本电脑', soldPrice: '329' }, sellerDO: {} })] },
+    replay: async () => ({ ok: false, ret: 'FAIL_SYS_TOKEN_EXPIRED::令牌过期', why: 'the token rotated and the one reload did not mint another', ms: 1200 }),
+  }));
+  const out = await run('item_view')({ item_id: '856961429564' });
+  assert.equal(out.source, 'item_detail_api', 'the page\'s own reply answered');
+  assert.equal(out.attempts, 1, 'one page was loaded');
+  assert.equal(s.opened.length, 1);
+  const failed = out.attempt_log.find((e: any) => e.via === 'detail_replay');
+  assert.ok(failed, 'the replay attempt travels with the answer');
+  assert.equal(failed.ok, false);
+  assert.match(failed.ret, /FAIL_SYS_TOKEN_EXPIRED/);
+  assert.match(String(failed.why), /reload/);
 });
 
 /** Three real search cards, one of them priced 面议: `searchCase` builds the mtop reply and the rows
