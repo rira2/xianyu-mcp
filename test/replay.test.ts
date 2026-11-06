@@ -14,6 +14,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { Session, setSession } from '../src/browser.ts';
 import { MTOP_READY_JS, REPLAY_READY_JS } from '../src/extract.ts';
+import { withDeadline } from '../src/runtime.ts';
 import {
   APP_KEY, DETAIL_API, SEARCH_API, detailPayload, replayEnabled, replaySign, replayUrl,
   searchPayload, validateReplayReply,
@@ -259,6 +260,34 @@ test('concurrent replays are issued one at a time on the page that signs them', 
   assert.equal(a.ok && b.ok, true);
   assert.equal(page.calls.length, 2);
   assert.deepEqual(page.calls.map((c: any) => new URL(c.url).searchParams.get('t') !== null), [true, true]);
+});
+
+test('Session.replay will not start on a budget that cannot also pay the typed route', async () => {
+  // The gate has to be about the call's clock, not about whether it has one: a 20s attempt begun with
+  // a second left is how a search that used to answer came back "Call deadline reached".
+  const { s, page } = sessionReplaying([{ status: 200, text: JSON.stringify({ ret: ['SUCCESS::调用成功'], data: { resultList: [] } }) }]);
+  await withDeadline(1, async () => {
+    const search = await s.replay(SEARCH_API, searchPayload('x', 1));
+    assert.equal(search.ok, false);
+    assert.match(String(search.why), /attempt \+ \d+s reserve/i, 'the entry gate names the attempt it could not pay for');
+    const detail = await s.replay(DETAIL_API, detailPayload('1'));
+    assert.equal(detail.ok, false);
+    assert.match(String(detail.why), /attempt \+ \d+s reserve/i);
+  });
+  assert.equal(page.calls.length, 0, 'no fetch was issued when the call could not afford it');
+});
+
+test('a stale token does not buy a reload the call cannot afford', async () => {
+  // 40s passes the search entry gate (35s) but is short of the 45s a reload-and-retry would need.
+  const stale = JSON.stringify({ ret: ['FAIL_SYS_TOKEN_EXPIRED::令牌过期'] });
+  const { s, page } = sessionReplaying([{ status: 200, text: stale }]);
+  await withDeadline(40, async () => {
+    const verdict = await s.replay(SEARCH_API, searchPayload('x', 1));
+    assert.equal(verdict.ok, false);
+    assert.match(verdict.ret, /FAIL_SYS_TOKEN_EXPIRED/, 'the token failure is reported, not swallowed');
+    assert.match(String(verdict.why), /reload-and-retry/i);
+  });
+  assert.equal(page.calls.length, 1, 'one fetch, no reload paid out of the typed route\'s reserve');
 });
 
 test('XIANYU_REPLAY=0 makes Session.replay a no-op that never touches the browser', async () => {

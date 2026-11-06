@@ -10,11 +10,11 @@ import type { CacheVerdict } from './cache.ts';
 import { DETAIL_POOL_MAX, type DomSurface, type MtopTap, type MtopReply } from './browser.ts';
 import { ensureGoofishUrl, evaluate, exclusive, getSession, HOME, reloadFresh, settle } from './browser.ts';
 import { compact, filterRows, matchesGroups, queryDiagnostics, readCursor, saveCursor, termGroups, type Filters } from './search-policy.ts';
-import { checkpoint, recordPartial, remainingMs } from './runtime.ts';
+import { checkpoint, recordPartial, remainingBudgetMs, remainingMs } from './runtime.ts';
 import { cooldown, failureDetails } from './response.ts';
 import { shapeSearchData } from './output.ts';
 import { detailListing, enrichListing, FEED_NORMALIZE_JS, ITEM_SCRAPE_JS, PAGER_CLICK_JS, PAGER_STATE_JS, queryTerms, RAIL_MARKERS, SCROLL_TO_JS, SCRAPE_CARDS_JS, searchListings, SEARCH_INPUT_JS, SEARCH_MARK, SEARCH_STATE_JS, sellerListings, sellerProfileOf } from './extract.ts';
-import { DETAIL_API, SEARCH_API, detailPayload, replayEnabled, searchPayload } from './replay.ts';
+import { DETAIL_API, SEARCH_API, detailPayload, replayEnabled, replayMinBudgetMs, searchPayload } from './replay.ts';
 type Data = Record<string, any>;
 // Endpoints observed in goofish bundles. DETAIL_API and SEARCH_API are re-issued by the signed replay
 // (`replay.ts`) and tapped from page requests as well, so either can answer; the seller endpoints are
@@ -524,6 +524,15 @@ const searchItems = async (args: SearchArgs): Promise<Data> => {
   let replayTried = false;
   const replaySearch = async (attemptNo: number): Promise<Data | null> => {
     if (!replayEnabled() || typeof session?.replay !== 'function') return null;
+    // The same gate `Session.replay` applies, repeated at the call site because a session is
+    // duck-typed: a fast path that starts with less than its own attempt plus the typed route's
+    // reserve can consume the deadline the typed route needs, and the caller sees "Call deadline
+    // reached" where the pre-replay search answered.
+    const left = deadline - Date.now();
+    if (left < replayMinBudgetMs('search')) {
+      log.push({ attempt: attemptNo, via: 'search_replay', ok: false, why: `the replay was not attempted: the call has ${Math.max(0, Math.round(left / 1000))}s left, less than the ${Math.round(replayMinBudgetMs('search') / 1000)}s it needs and the typed route's reserve` });
+      return null;
+    }
     const payloads: any[] = [], pageLines: { page: number; hit: boolean; age_s: number | null; observed_at: string }[] = [];
     let nextPage = startPage, stopReason: string | null = null;
     const fetchPage = async (pn: number): Promise<'ok' | 'end' | 'fail'> => {
@@ -547,9 +556,26 @@ const searchItems = async (args: SearchArgs): Promise<Data> => {
     // asked for, and half a request answered is not that promise. A failure during the *top-up* -- the
     // extra pages fetched only because the kept set was short -- keeps what the replay already
     // answered, the way a pager click that stops mid-walk does, and the answer says why it stopped.
+    //
+    // The pages that did answer are still put on the call's partial slot before the typed route runs.
+    // Without that, a typed attempt that then hits the deadline publishes "Call deadline reached" with
+    // nothing, even though the validated replay cards are already in this process's cache -- which is
+    // the regression the fast path's failure branch must not create.
+    const recordReplayPartial = async (): Promise<void> => {
+      if (!payloads.length) return;
+      const valid = await finish(payloads, q, cap, (rows: any[]) => FEED_NORMALIZE_JS({ rows }));
+      if (!valid?.accepted) return;
+      const oldest = observationAge(pageLines);
+      const partial = { query: q, source: 'search_api', via: 'search_replay', account_required: false, attempt_log: [...log], ...valid, partial: true,
+        next_cursor: continuation(nextPage, valid.remaining_items, Date.now() - oldest * 1000), effective_limit: cap, effective_max_items: searchCap(), requested_limit: limit, cache: pageReport(pageLines),
+        freshness: { oldest_observation_age_s: oldest, oldest_observed_at: new Date(Date.now() - oldest * 1000).toISOString(), cached: pageLines.some(p => p.hit), price_last_changed_at: null } };
+      delete partial.remaining_items; delete partial.accepted;
+      pageProgress = partial;
+      recordPartial(partial);
+    };
     for (let pn = startPage; pn <= pagesWanted; pn++) {
       const state = await fetchPage(pn);
-      if (state === 'fail') return null;
+      if (state === 'fail') { await recordReplayPartial(); return null; }
       if (state === 'end') { stopReason = 'end_of_pages'; break; }
     }
     if (!payloads.length) return null;
@@ -1016,9 +1042,16 @@ type ReplayNote = { ok: boolean; ms: number; ret: string; why: string };
 
 /** One attempt at issuing the detail API directly, before any page is loaded. Never throws: `null`
  *  means the fast path is off for this session, and every other outcome is a note (with the reply's
- *  data when it answered) that the read publishes and then falls back from. */
-const replayListing = async (session: any, item: string): Promise<(ReplayNote & { data: any }) | null> => {
+ *  data when it answered) that the read publishes and then falls back from. `deadline` is the tool's
+ *  own clock; the gate uses whichever is smaller, that or the call deadline, because `item_view`'s
+ *  budget and the envelope's deadline are set independently. */
+const replayListing = async (session: any, item: string, deadline: number): Promise<(ReplayNote & { data: any }) | null> => {
   if (!replayEnabled() || typeof session?.replay !== 'function') return null;
+  const left = Math.min(remainingBudgetMs(), deadline - Date.now());
+  if (left < replayMinBudgetMs('detail')) {
+    // A named no-op rather than a fetch: the item page route has to keep the rest of the call.
+    return { ok: false, ms: 0, ret: '', why: `the detail replay was not attempted: the call has ${Math.max(0, Math.round(left / 1000))}s left, less than the ${Math.round(replayMinBudgetMs('detail') / 1000)}s it needs and the page route's reserve`, data: null };
+  }
   try {
     const r = await session.replay(DETAIL_API, detailPayload(item), { spmCnt: 'a21ybx.item.0.0' });
     return { ok: Boolean(r?.ok), ms: Number(r?.ms) || 0, ret: String(r?.ret ?? ''), why: String(r?.why ?? ''), data: r?.data ?? null };
@@ -1045,7 +1078,7 @@ const readListing = async (session: any, item: string, deadline: number, surface
   // latency to a load that already happened. It is never allowed to fail the read either way: every
   // outcome is a note that travels out with the answer, and any failure falls through to the page
   // route below unchanged. `tries: 0` on a replay answer says no page was loaded.
-  const replay = surface ? null : await replayListing(session, item);
+  const replay = surface ? null : await replayListing(session, item, deadline);
   if (replay?.ok) {
     const listing = detailListing(replay.data, item);
     if (listing) {
@@ -1054,6 +1087,9 @@ const readListing = async (session: any, item: string, deadline: number, surface
       return { listing: full, payload: {}, tries: 0, page: null, cache: live(), replay: { ok: true, ms: replay.ms, ret: replay.ret, why: '' } };
     }
     replay.ok = false;
+    // The ret was SUCCESS; keeping it beside `ok: false` made the failure note read "The signed
+    // replay said: SUCCESS::调用成功." The reason the fast path fell back is the shape, not the ret.
+    replay.ret = '';
     replay.why = 'the replay answered SUCCESS but the payload did not read as this listing';
   }
   const page: Page = surface ? surface.page : await session.open(`${HOME}item?id=${item}`);

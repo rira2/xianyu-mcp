@@ -30,6 +30,21 @@ export const H5API_ORIGIN = 'https://h5api.m.goofish.com';
  *  falls back to the typed search and the item page load. */
 export const replayEnabled = (): boolean => process.env.XIANYU_REPLAY !== '0';
 
+/**
+ * How long one attempt may run before the fast path gives up: measured answers were 1.0-1.2s for a
+ * search page and 0.6-3.1s for a detail, and a hung in-page fetch never settles at all, so this bound
+ * is what turns a hang into a fallback. In milliseconds because the budget gate below adds to it.
+ */
+export const REPLAY_ATTEMPT_MS = { search: 20_000, detail: 12_000 } as const;
+/** What a replay must leave on the call's clock for the route behind it. The typed search costs a page
+ *  load plus a keystroke (measured 15-60s) and an item page 4-10s; this is the floor that keeps a
+ *  failed fast path from turning an answer into "Call deadline reached". */
+export const REPLAY_RESERVE_MS = 15_000;
+/** The smallest remaining call budget a replay of `kind` may start on: one full attempt plus the
+ *  reserve the typed route needs. 35s for a search, 27s for a detail. `Session.replay` and both tool
+ *  call sites read this one number, so the gate cannot drift from the bound it must leave room for. */
+export const replayMinBudgetMs = (kind: 'search' | 'detail'): number => REPLAY_ATTEMPT_MS[kind] + REPLAY_RESERVE_MS;
+
 /** The page's own search payload. A fresh object every call, including the nested ones: the payload is
  *  stringified to sign it, so a shared nested object would make one call's mutation another's
  *  signature input. */

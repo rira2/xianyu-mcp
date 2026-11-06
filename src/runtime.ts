@@ -6,6 +6,10 @@ const calls = new AsyncLocalStorage<Call>();
 export const deadlineError = () => Object.assign(new XianyuError('Call deadline reached; no additional work will be started.'), { details: { reason: 'timeout', retryable: true, retry_after_s: 0 } });
 export const checkpoint = () => { const c = calls.getStore(); if (c && (c.expired || Date.now() >= c.deadline)) throw deadlineError(); };
 export const remainingMs = (fallback: number): number => { checkpoint(); const c = calls.getStore(); return c ? Math.max(1, Math.min(fallback, c.deadline - Date.now())) : fallback; };
+/** The call's remaining budget in ms, or `Infinity` when this call has no deadline. Unlike
+ *  `remainingMs`, it never throws: work that is deciding whether to *start* -- not work already in
+ *  flight -- has to read an expired clock as zero, because the decision belongs to the fallback. */
+export const remainingBudgetMs = (): number => { try { return remainingMs(Number.POSITIVE_INFINITY); } catch { return 0; } };
 export const recordPartial = (partial: any) => { const c = calls.getStore(); if (c) c.partial = structuredClone(partial); };
 export const withDeadline = async <T>(seconds: number, fn: () => Promise<T>): Promise<T> => {
   const call: Call = { deadline: Date.now() + seconds * 1000, expired: false, partial: null };

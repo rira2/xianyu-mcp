@@ -28,9 +28,9 @@
 import type { Browser, BrowserContext, Page } from 'playwright';
 import { BrowserError, NavigationError } from './errors.ts';
 import { acquireDisplay, stopDisplay } from './display.ts';
-import { checkpoint, remainingMs } from './runtime.ts';
+import { checkpoint, remainingBudgetMs, remainingMs } from './runtime.ts';
 import { MTOP_CALL_JS, MTOP_READY_JS, REPLAY_JS, REPLAY_READY_JS } from './extract.ts';
-import { DETAIL_API, replayEnabled, replaySign, replayTokenFailure, replayUrl, validateReplayReply } from './replay.ts';
+import { DETAIL_API, H5API_ORIGIN, REPLAY_ATTEMPT_MS, REPLAY_RESERVE_MS, replayEnabled, replayMinBudgetMs, replaySign, replayTokenFailure, replayUrl, validateReplayReply } from './replay.ts';
 const ALLOWED_HOSTS = ['www.goofish.com', 'goofish.com'];
 
 // The values here are URL parts, so they carry their separators ('https:').
@@ -63,11 +63,9 @@ const MTOP_TIMEOUT_S = 240;
 // evaluate runs 90s by default, so the probe needs its own bound or the wait is not the one it
 // claims to be.
 const MTOP_READY_MS = 6000, PROBE_TIMEOUT_S = 5;
-// The signed-replay fast path's own bounds. The replay latencies measured on this machine
-// (2026-11-07) were 1.06s and 1.0-12.0s for a search page and 0.6-3.1s for a detail: these are the
-// ceilings that still caught every answer, not targets. A hung in-page fetch never settles at all --
-// it is not a slow answer -- so the bound is what turns one into a fallback.
-const REPLAY_SEARCH_TIMEOUT_S = 20, REPLAY_DETAIL_TIMEOUT_S = 12;
+// The signed-replay fast path's own bounds live in `replay.ts` (`REPLAY_ATTEMPT_MS`,
+// `REPLAY_RESERVE_MS`): the same numbers decide whether an attempt may start, so the gate cannot
+// drift from the bound it has to leave the typed route room for. See `REPLAY_ATTEMPT_S` below.
 // The homepage replay page's one-time hydration: measured 7.0-13.0s, against the spike's 22.6s for
 // the header input to render on a cold link.
 const REPLAY_WARM_MS = 30_000;
@@ -86,7 +84,7 @@ const REPLAY_COOLDOWN_MS = 60_000;
 // The signature token's cookie, and the origin it is read for. Not a credential: goofish mints this
 // for anonymous visitors and the page's own bundle signs with it. It is read in exactly one place,
 // `replayToken`, and an invariant test pins that.
-const REPLAY_TOKEN_NAME = '_m_h5_tk', REPLAY_TOKEN_URL = 'https://h5api.m.goofish.com';
+const REPLAY_TOKEN_NAME = '_m_h5_tk', REPLAY_TOKEN_URL = H5API_ORIGIN;
 // Failures that race the page's own navigation rather than being real failures, so they get one more
 // try. A dead target is not on this list: that needs a relaunch, not a retry.
 const TRANSIENT = ['execution context', 'cannot find context', 'while navigating'];
@@ -116,6 +114,13 @@ export type ReplayVerdict = { ok: boolean; ret: string; data: any; ms: number; w
 /** Which page can sign which API. They are not interchangeable, and that is measured: see
  *  `replaySurface`. */
 type ReplayKind = 'search' | 'detail';
+/** The in-page bound per API, in seconds because that is what `evaluate` takes. Same numbers as the
+ *  budget gate in `replay.ts`. */
+const REPLAY_ATTEMPT_S: Record<ReplayKind, number> = { search: REPLAY_ATTEMPT_MS.search / 1000, detail: REPLAY_ATTEMPT_MS.detail / 1000 };
+/** What the one reload-and-retry must still leave on the call's clock: a second attempt, the reload's
+ *  own hydration window, and the typed route's reserve. Below this the retry is skipped and the token
+ *  failure is reported as it stands, rather than spending the reserve to make the attempt twice. */
+const replayRetryBudgetMs = (kind: ReplayKind): number => replayMinBudgetMs(kind) + REPLAY_RETRY_MS;
 
 /** Collects mtop responses from a page. A reply is delivered by one route only: to the `take`s
  * already waiting for its API, or else into the bounded per-API queue. A queued reply is removed by
@@ -482,15 +487,23 @@ export class Session {
     });
   }
 
-  /** The page that never navigates: everything the mtop-only tools need, and nothing else. */
-  async ensureReady(): Promise<Page> {
+  /** The page that never navigates: everything the mtop-only tools need, and nothing else.
+   *
+   *  `budgetMs` bounds the two mtop waits (not the reload's own navigation, which the call deadline
+   *  already clamps). The replay passes what the call can spare beyond its attempt and reserve, so a
+   *  dead shell makes the fast path stand down inside the call's clock instead of consuming it. */
+  async ensureReady(budgetMs = Number.POSITIVE_INFINITY): Promise<Page> {
+    const until = Date.now() + budgetMs;
+    const left = (want: number): number => Math.max(0, Math.min(want, until - Date.now()));
     const page = await this.revive(this.apiPage);
-    if (await waitForMtop(page, 2500)) return page;
+    if (await waitForMtop(page, left(2500))) return page;
+    // A surface budget already spent is a reload the call cannot afford; stand down before paying it.
+    if (until - Date.now() <= 0) throw new BrowserError("the call's remaining budget cannot cover reloading goofish's mtop page");
     // a reload usually fixes a shell that never finished booting. It moves the page, so it runs
     // under the same lock -- otherwise two mtop tools that both found a dead shell would reload the
     // page out from under each other.
     await this.move(async () => { await reloadFresh(page); });
-    if (!(await waitForMtop(page, (MTOP_TIMEOUT_S * 1000) / 4))) {
+    if (!(await waitForMtop(page, left((MTOP_TIMEOUT_S * 1000) / 4)))) {
       throw new BrowserError("goofish's mtop client is not available on the current page after a reload. The site is probably serving an empty shell; wait a little and retry.");
     }
     return page;
@@ -563,9 +576,10 @@ export class Session {
 
   /** Which page signs which API. Search is signed by a homepage bundle and detail by an item page's
    *  (see `replayReady`); an API this server does not replay goes to the homepage page, which is the
-   *  general-purpose one. */
-  private async replaySurface(kind: ReplayKind): Promise<Page> {
-    return kind === 'detail' ? this.ensureReady() : this.replayReady();
+   *  general-purpose one. `budgetMs` is what the call can spare for preparing the surface, and only
+   *  the detail surface takes it: `ensureReady` is the one preparation that can reload and wait. */
+  private async replaySurface(kind: ReplayKind, budgetMs?: number): Promise<Page> {
+    return kind === 'detail' ? this.ensureReady(budgetMs) : this.replayReady();
   }
 
   /** goofish's signature token from the browser's own cookie jar: `<32 hex>_<server epoch ms>`, and
@@ -577,15 +591,21 @@ export class Session {
     const jar = await this.context.cookies(REPLAY_TOKEN_URL).catch(() => []);
     return String(jar.find((c) => c.name === REPLAY_TOKEN_NAME)?.value ?? '').split('_')[0];
   }
-  /** Poll the jar for that token, bounded. Not every page mints one at load: the item page mints it
-   *  on its first h5api call, which is often a moment after `ensureReady` returns. Waiting is cheaper
-   *  than the reload this used to trigger; empty means it really did not appear. */
+  /** Poll the jar for that token, bounded by its own window *and* the call's deadline. Not every
+   *  page mints one at load: the item page mints it on its first h5api call, which is often a moment
+   *  after `ensureReady` returns. Waiting is cheaper than the reload this used to trigger; empty
+   *  means it really did not appear (or the call ran out of clock first). */
   private async waitForToken(timeoutMs: number): Promise<string> {
     const until = Date.now() + timeoutMs;
     for (;;) {
       const token = await this.replayToken().catch(() => '');
       if (token || Date.now() >= until) return token;
-      await new Promise((r) => setTimeout(r, 250));
+      // The one wait in the replay path that used to run on a private clock. `remainingMs` throws
+      // when the call's deadline is gone; an empty token is the non-throwing way to say so here,
+      // because the caller still has to fall back rather than raise.
+      let pause: number;
+      try { pause = Math.min(250, remainingMs(250)); } catch { return ''; }
+      await new Promise((r) => setTimeout(r, pause));
     }
   }
 
@@ -612,6 +632,11 @@ export class Session {
    * Bounded twice over: `evaluate`'s own timeout, and the call deadline through `remainingMs`. One
    * in-page fetch at a time, because the spike never measured concurrent fetches against goofish's
    * per-IP limit and the detail fan-out would otherwise issue two or four at once on one page.
+   *
+   * Budget-aware before it starts, not only while it runs. A replay may begin only when the call can
+   * still pay for a full attempt *and* leave `REPLAY_RESERVE_MS` for the typed route, because the
+   * typed route is the promise: a 20s attempt begun with a second left is exactly how a search that
+   * used to answer came back "Call deadline reached" under a hostile site.
    */
   async replay(api: string, data: Record<string, any>, opts: { spmCnt?: string; spmPre?: string } = {}): Promise<ReplayVerdict> {
     const began = Date.now();
@@ -620,9 +645,16 @@ export class Session {
     if (!replayEnabled()) return verdict(false, '', null, 'the replay fast path is off (XIANYU_REPLAY=0)');
     const pausedUntil = this.replayPaused.get(kind) ?? 0;
     if (Date.now() < pausedUntil) return verdict(false, '', null, `the ${kind} replay is paused for ${Math.ceil((pausedUntil - Date.now()) / 1000)}s more after a failed attempt; the typed route is answering instead`);
+    const minBudget = replayMinBudgetMs(kind), left = remainingBudgetMs();
+    if (left < minBudget) return verdict(false, '', null, `the call has ${Math.max(0, Math.round(left / 1000))}s left, less than the ${Math.round(minBudget / 1000)}s a ${kind} replay needs (${Math.round(REPLAY_ATTEMPT_MS[kind] / 1000)}s attempt + ${Math.round(REPLAY_RESERVE_MS / 1000)}s reserve for the typed route); the typed route answers instead`);
     const run = this.replayChain.then(async () => {
       try { return await this.replayAttempt(kind, api, data, opts, verdict); }
-      catch (e) { return this.replayFailed(kind, verdict, `the ${kind} replay attempt failed: ${String((e as Error)?.message ?? e).slice(0, 200)}`); }
+      catch (e) {
+        const why = `the ${kind} replay attempt failed: ${String((e as Error)?.message ?? e).slice(0, 200)}`;
+        // A throw with the attempt's budget already gone is the call ending, not goofish refusing:
+        // pausing the surface for a minute would make the next call pay for this one's deadline.
+        return remainingBudgetMs() < minBudget ? verdict(false, '', null, why) : this.replayFailed(kind, verdict, why);
+      }
     });
     this.replayChain = run.then(() => {}, () => {});
     return run;
@@ -636,27 +668,52 @@ export class Session {
     this.replayPaused.set(kind, Date.now() + REPLAY_COOLDOWN_MS);
     return verdict(false, ret, null, why);
   }
+  /** A failure that is not the site's answer: the call's own clock, or a surface this call could not
+   *  afford to prepare. It must not pause the surface -- the next call may well have the budget this
+   *  one lacked -- so it is `verdict` without the cooldown. */
+  private replayMiss(verdict: (ok: boolean, ret: string, data: any, why?: string) => ReplayVerdict, why: string, ret = ''): ReplayVerdict {
+    return verdict(false, ret, null, why);
+  }
 
-  /** One replay: read the token, sign, fetch from the page, parse, validate. Split out of `replay` so
-   *  the queueing, the kill switch and the cooldown are not repeated in the retry path. */
+  /** One replay: prepare the surface, read the token, sign, fetch from the page, parse, validate.
+   *  Split out of `replay` so the queueing, the kill switch and the cooldown are not repeated in the
+   *  retry path. Every step beyond the entry gate is preceded by "can the call still afford this and
+   *  keep the typed route's reserve?", because the surface and the token wait both spend real time. */
   private async replayAttempt(kind: ReplayKind, api: string, data: Record<string, any>, opts: { spmCnt?: string; spmPre?: string }, verdict: (ok: boolean, ret: string, data: any, why?: string) => ReplayVerdict): Promise<ReplayVerdict> {
+    const reserve = REPLAY_RESERVE_MS, left = (): number => remainingBudgetMs();
     let page: Page;
-    try { page = await this.replaySurface(kind); }
-    catch (e) { return this.replayFailed(kind, verdict, `no page could issue the ${kind} replay: ${String((e as Error)?.message ?? e).slice(0, 200)}`); }
+    try {
+      // `ensureReady` is the one surface that may reload the page and wait a full mtop window for it.
+      // Give it only what this call can spare beyond its own attempt and the typed route's reserve, so
+      // a dead shell makes the fast path stand down instead of consuming the call.
+      const surfaceBudget = left() - replayMinBudgetMs(kind);
+      if (kind === 'detail' && surfaceBudget <= 0) return this.replayMiss(verdict, `the call had no budget left to prepare the item page for a detail replay; the page route gets the rest`);
+      page = await this.replaySurface(kind, kind === 'detail' ? surfaceBudget : undefined);
+    } catch (e) {
+      const why = `no page could issue the ${kind} replay: ${String((e as Error)?.message ?? e).slice(0, 200)}`;
+      return left() < replayMinBudgetMs(kind) ? this.replayMiss(verdict, why) : this.replayFailed(kind, verdict, why);
+    }
+    if (left() <= reserve) return this.replayMiss(verdict, `the call had ${Math.max(0, Math.round(left() / 1000))}s left after preparing the ${kind} page, less than the ${Math.round(reserve / 1000)}s the typed route needs; no fetch was issued`);
     for (let attempt = 0; attempt < 2; attempt++) {
-      const token = await this.waitForToken(REPLAY_TOKEN_WAIT_MS);
+      // The token wait is capped by what is left beyond the reserve, not just by its own five seconds.
+      const token = await this.waitForToken(Math.min(REPLAY_TOKEN_WAIT_MS, Math.max(0, left() - reserve - 1000)));
       if (!token) {
         // No token is the normal state of a page that has just loaded: one reload mints one, and a
-        // page that never mints one is a page this route cannot use.
-        if (!attempt && (await this.rehydrate(page, kind))) continue;
+        // page that never mints one is a page this route cannot use. The reload is only worth
+        // starting when the call can still pay for a second full attempt plus the reserve after it.
+        if (!attempt && left() >= replayRetryBudgetMs(kind) && (await this.rehydrate(page, kind))) continue;
+        if (!attempt && left() < replayRetryBudgetMs(kind)) return this.replayMiss(verdict, `no ${REPLAY_TOKEN_NAME} signature token on the ${kind} page and the call has ${Math.max(0, Math.round(left() / 1000))}s left, less than the one reload-and-retry needs; the call could not be signed`);
         return this.replayFailed(kind, verdict, `no ${REPLAY_TOKEN_NAME} signature token on the ${kind} page, so the call could not be signed`);
       }
       const dataJson = JSON.stringify(data);
       const t = Date.now();
       const url = replayUrl(api, { t, sign: replaySign(token, t, dataJson), spmCnt: opts.spmCnt, spmPre: opts.spmPre });
+      // Bound the in-page fetch by what is left after the reserve, not just by the API's own bound.
+      const fetchBudget = left() - reserve;
+      if (fetchBudget < 1000) return this.replayMiss(verdict, `the call had under a second left for the ${kind} fetch after signing; the typed route gets the rest`);
       let reply: { status: number; text: string } | null = null;
       try {
-        reply = await evaluate(page, REPLAY_JS, { url, body: `data=${encodeURIComponent(dataJson)}` }, `${kind} replay`, kind === 'detail' ? REPLAY_DETAIL_TIMEOUT_S : REPLAY_SEARCH_TIMEOUT_S);
+        reply = await evaluate(page, REPLAY_JS, { url, body: `data=${encodeURIComponent(dataJson)}` }, `${kind} replay`, Math.min(REPLAY_ATTEMPT_S[kind], fetchBudget / 1000));
       } catch (e) {
         return this.replayFailed(kind, verdict, `the ${kind} replay did not answer: ${String((e as Error)?.message ?? e).slice(0, 160)}`);
       }
@@ -665,7 +722,10 @@ export class Session {
       catch { return this.replayFailed(kind, verdict, `the ${kind} replay answered HTTP ${reply?.status ?? 0} with something that is not JSON: ${String(reply?.text ?? '').slice(0, 120)}`); }
       const check = validateReplayReply(parsed, kind);
       if (check.ok) return verdict(true, check.ret, check.data);
-      if (!attempt && replayTokenFailure(check.ret) && (await this.rehydrate(page, kind))) continue;
+      if (!attempt && replayTokenFailure(check.ret)) {
+        if (left() < replayRetryBudgetMs(kind)) return this.replayMiss(verdict, `goofish says the ${kind} token is stale (${check.ret}) and the call has ${Math.max(0, Math.round(left() / 1000))}s left, less than the one reload-and-retry needs; the typed route gets the rest`, check.ret);
+        if (await this.rehydrate(page, kind)) continue;
+      }
       return this.replayFailed(kind, verdict, check.why || `goofish refused the ${kind} replay: ${check.ret}`, check.ret);
     }
     return this.replayFailed(kind, verdict, `the ${kind} replay did not answer after one reload and retry`);

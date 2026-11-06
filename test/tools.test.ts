@@ -17,6 +17,7 @@ import { FEED_NORMALIZE_JS, ITEM_SCRAPE_JS, MTOP_READY_JS, PAGER_CLICK_JS, PAGER
 import { budget, fanoutSize, ITEM_FIELDS, resetCardCache, TOOLS } from '../src/tools.ts';
 import { getItem, getSearchPage, putSearchPage, reset as resetCaches } from '../src/cache.ts';
 import { DETAIL_API } from '../src/replay.ts';
+import { withDeadline } from '../src/runtime.ts';
 import { z } from 'zod';
 import { executeTool, resetCooldown } from '../src/response.ts';
 
@@ -998,6 +999,61 @@ test('item_view falls back to the item page when the detail replay fails, and sa
   assert.equal(failed.ok, false);
   assert.match(failed.ret, /FAIL_SYS_TOKEN_EXPIRED/);
   assert.match(String(failed.why), /reload/);
+});
+
+test('the replay is not started when the call has no budget to leave the typed route', async () => {
+  // 2s is far below one attempt plus the typed search's reserve. The gate has to be at the call site
+  // as well as inside `Session.replay`, because a fake session bypasses the real method -- and the
+  // promise is that the typed route answers.
+  resetCooldown();
+  const c = searchCase('thinkpad x220', [['联想Thinkpad X220 笔记本 甲', '1001', '300', '北京', '1']]);
+  let replayCalls = 0;
+  const s = use(makeSession({ cards: [c.rows], mtop: c.mtop, replay: async () => { replayCalls++; throw new Error('the budget gate let a replay start'); } }));
+  const out = await executeTool(TOOLS.find((t) => t.name === 'search_items')!, { query: 'thinkpad x220', limit: 10, timeout_s: 2 });
+  assert.equal(replayCalls, 0, 'a 2s call cannot afford an attempt plus the typed reserve');
+  assert.equal(out.ok, true);
+  assert.equal(out.data.via, 'searchbox', 'the typed route answered');
+  assert.equal(s.search.value, 'thinkpad x220', 'and it is the route that typed');
+});
+
+test('item_view does not start a detail replay when the call cannot afford it', async () => {
+  let replayCalls = 0;
+  use(makeSession({
+    item: [UNRENDERED],
+    mtop: { [DETAIL_API]: [ok({ itemDO: { itemId: '856961429564', title: '联想Thinkpad X220 笔记本电脑', soldPrice: '329' }, sellerDO: {} })] },
+    replay: async () => { replayCalls++; return { ok: true, ret: 'SUCCESS::调用成功', data: {}, ms: 1 }; },
+  }));
+  const out = await withDeadline(2, () => run('item_view')({ item_id: '856961429564' }));
+  assert.equal(replayCalls, 0, 'the page route keeps the rest of the call');
+  assert.equal(out.source, 'item_detail_api', 'the page\'s own reply answered');
+  const skipped = out.attempt_log.find((e: any) => e.via === 'detail_replay');
+  assert.ok(skipped, 'the skipped fast path is named in the envelope');
+  assert.match(String(skipped.why), /not attempted|left/i);
+});
+
+test('a later replay page failing after page 1 answered still publishes page 1 when the typed route hits the deadline', async (t) => {
+  // The regression: page 1's replay validated, page 2 failed, `replaySearch` returned null without
+  // recording a partial, and the typed attempt then ran out of clock over an empty envelope. The
+  // mocked clock advances inside page 2's replay, which is exactly what a 20s hung page plus the
+  // typed route did to the call. The validated page must survive as `partial`.
+  resetCooldown();
+  t.mock.timers.enable({ apis: ['Date'] });
+  const fetched: number[] = [];
+  const s = use(makeSession({ replay: async (api: string, data: any) => {
+    fetched.push(Number(data.pageNumber));
+    if (Number(data.pageNumber) === 1) return replayAnswer(data);
+    t.mock.timers.setTime(Date.now() + 60_000);
+    return { ok: false, ret: 'FAIL_SYS_INTERNAL_ERROR::系统繁忙', why: 'the second page did not answer', ms: 9 };
+  } }));
+  const out = await executeTool(TOOLS.find((x) => x.name === 'search_items')!, { query: 'thinkpad x220', pages: 2, limit: 60, topup_pages: 0, timeout_s: 45 });
+  assert.deepEqual(fetched, [1, 2], 'page 1 answered and page 2 is the one that failed');
+  assert.equal(out.status, 'partial', 'the validated page is published as partial, not lost to the deadline');
+  assert.equal(out.data.via, 'search_replay');
+  assert.equal(out.data.stop_reason, 'timeout');
+  assert.equal(out.count, 30);
+  assert.deepEqual(out.data.items.map((i: any) => i.item_id).sort(), Array.from({ length: 30 }, (_, i) => String(1000 + i)).sort());
+  assert.equal(s.opened.length, 1, 'the typed route really ran, and the deadline is what ended it');
+  resetCooldown();
 });
 
 /** Three real search cards, one of them priced 面议: `searchCase` builds the mtop reply and the rows
