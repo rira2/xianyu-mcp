@@ -8,7 +8,7 @@ import { getItem, getSearchPage, itemKey, itemTtl, missed, notCached, observatio
 import type { CacheVerdict } from './cache.ts';
 import { DETAIL_POOL_MAX, type DomSurface } from './browser.ts';
 import { ensureGoofishUrl, evaluate, exclusive, getSession, HOME, reloadFresh, settle } from './browser.ts';
-import { filterRows, matchesGroups, queryDiagnostics, readCursor, saveCursor, termGroups, type Filters } from './search-policy.ts';
+import { compact, filterRows, matchesGroups, queryDiagnostics, readCursor, saveCursor, termGroups, type Filters } from './search-policy.ts';
 import { checkpoint, recordPartial, remainingMs } from './runtime.ts';
 import { failureDetails } from './response.ts';
 import { detailListing, enrichListing, FEED_NORMALIZE_JS, ITEM_SCRAPE_JS, PAGER_CLICK_JS, PAGER_STATE_JS, queryTerms, RAIL_MARKERS, SCROLL_TO_JS, SCRAPE_CARDS_JS, searchListings, SEARCH_INPUT_JS, SEARCH_MARK, SEARCH_STATE_JS, sellerListings, sellerProfileOf } from './extract.ts';
@@ -581,6 +581,20 @@ const searchItems = async (args: SearchArgs): Promise<Data> => {
       const minHits = Math.max(1, Math.ceil(cards * MIN_MATCH_FRACTION)), accepted = Math.max(hits, tokenHits);
       const declined = !payload.rendered || Boolean(payload.rail) || Boolean(payload.says_no_results) || Boolean(payload.blocked) || accepted < minHits;
       log.push({ attempt: attemptNo, via, rendered: Boolean(payload.rendered), scraped_cards: cards, query_hits: hits, token_hits: tokenHits, accepted_hits: accepted, min_query_hits: minHits, rail: payload.rail || '', says_no_results: Boolean(payload.says_no_results), blocked: Boolean(payload.blocked) });
+      // Same relaxed rule as finishSearch: keep the best term-matching titles rather than refusing a
+      // page that plainly contains the product because the query was wordy.
+      if (declined && !payload.rail && !payload.says_no_results && !payload.blocked && Array.isArray(payload.items) && payload.items.length) {
+        const relaxed = payload.items.map((i: any) => { const text = compact(i.title); return { i, hits: termGroups(q, expand_synonyms).filter(g => g.some(t => text.includes(compact(t)))).length }; })
+          .filter((x: any) => x.hits >= Math.max(2, Math.ceil(termGroups(q, expand_synonyms).length * 0.6)));
+        if (relaxed.length) {
+          relaxed.sort((a: any, b: any) => b.hits - a.hits);
+          const partial = dedupe(relaxed.map((x: any) => x.i));
+          const partialFiltered = filterRows(withTyped(partial), filters);
+          const partialItems = rankItems(partialFiltered.items, cap);
+          for (const it of partialItems) rememberCard(it);
+          return { query: q, source: 'search_page_dom', via, account_required: false, attempts: attemptNo, attempt_log: log, cache: notCached('this page of results', searchTtl()), query_hits: hits, token_hits: partial.length, matched_by: 'partial_terms', partial_relevance: true, min_query_hits: minHits, scraped_cards: cards, non_matching_count: Math.max(0, cards - partial.length), count: partialItems.length, items: partialItems, freshness: { oldest_observed_at: new Date().toISOString(), oldest_observation_age_s: 0, cached: false, price_last_changed_at: null }, empty_reason: !partialItems.length ? 'filtered_out' : null, filters: partialFiltered.filters, diagnostics: { ...diagnostics, ...queryDiagnostics(q, payload.items, expand_synonyms) }, partial: false, next_cursor: null, effective_limit: cap, effective_max_items: searchCap(), requested_limit: limit };
+        }
+      }
       if (!declined) {
         // Only the matches, so `count` and every item agree with each other and with the query.
         const valid = filterRows(withTyped(dedupe(payload.items.filter((i: any) => matchesGroups(i.title, termGroups(q, expand_synonyms))))), filters);
@@ -677,7 +691,23 @@ const finishSearch = async (payloads: any[], q: string, cap: number, normalize: 
   // Fewer than a fifth of the results really matching is what a declined search looks like from
   // the API side too, so the same refusal applies; a short page of real matches still passes on the
   // floor of one.
-  if (matches.length < minHits) return { accepted: false, diagnostics, items: [] };
+  // Relaxed fallback (XIANYU_RELAX_MATCH, default on): goofish's own search is fuzzy -- "E5 2680V4"
+  // returns a page of E5 parts of which two are the CPU -- and refusing the whole page throws away
+  // the exact titles a shopper asked for. When the strict rule fails, keep the titles that match the
+  // most query terms (at least 60% of them, never fewer than two) and say so in `matched_by`.
+  if (matches.length < minHits) {
+    const relaxed = all.map((i: any) => { const text = compact(i.title); return { i, hits: groups.filter(g => g.some(t => text.includes(compact(t)))).length }; })
+      .filter((x: any) => x.hits >= Math.max(2, Math.ceil(groups.length * 0.6)));
+    if (relaxed.length) {
+      relaxed.sort((a: any, b: any) => b.hits - a.hits);
+      const partial = relaxed.map((x: any) => x.i);
+      const partialFiltered = filterRows(partial, filters);
+      const partialItems = rankItems(partialFiltered.items, cap);
+      for (const it of partialItems) rememberCard(it);
+      return { accepted: true, remaining_items: partialFiltered.items.slice(cap), diagnostics, filters: partialFiltered.filters, empty_reason: !partialItems.length ? 'filtered_out' : null, query_hits: phrases.length, token_hits: partial.length, min_query_hits: minHits, scraped_cards: scanned, pages_fetched: payloads.length, matched_by: 'partial_terms', partial_relevance: true, non_matching_count: Math.max(0, scanned - partial.length), count: partialItems.length, items: partialItems };
+    }
+    return { accepted: false, diagnostics, items: [] };
+  }
   const filtered = filterRows(matches, filters);
   const items = rankItems(filtered.items, cap);
   for (const it of items) rememberCard(it);
