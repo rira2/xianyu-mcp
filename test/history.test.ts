@@ -62,6 +62,32 @@ test('annotateSearchData marks every item, filters new_only, and reports known/n
   assert.equal(filtered.history.price_drops.length, 1, 'a drop on a suppressed known listing is still reported');
   // the price statistics describe what this answer returns, not the set before filtering
   assert.deepEqual([filtered.price_stats.count, filtered.price_stats.min], [1, 500]);
+  assert.equal('empty_reason' in filtered, false, 'an answer that still holds a listing is not empty');
+});
+
+test('an answer emptied by new_only says filtered_out rather than reading as an empty result set', () => {
+  observeListing({ item_id: 'a', typed: { price_amount: 1000 }, title: 'known' });
+  const data = { query: 'x', count: 1, items: [{ item_id: 'a', price_amount: 900, title: 'known' }] };
+  const filtered = annotateSearchData(data, { new_only: true });
+  assert.deepEqual([filtered.count, filtered.items.length, filtered.price_stats], [0, 0, null]);
+  assert.equal(filtered.empty_reason, 'filtered_out', 'the filter emptied it, not goofish');
+  // A first-ever scan is all new, so the same data keeps its card and stays non-empty.
+  assert.equal('empty_reason' in annotateSearchData({ query: 'x', count: 1, items: [{ item_id: 'b', price_amount: 100 }] }, { new_only: true }), false);
+});
+
+test('a card with no item_id is left unmarked and is not counted as known', () => {
+  // Without an id there is nothing to remember it by: calling it "not new" would be a claim about a
+  // listing this process cannot recognise, so it keeps neither mark and counts in neither total.
+  const data = { count: 2, items: [{ item_id: 'a', price_amount: 100 }, { title: 'no id', price_amount: 50 }] };
+  const out = annotateSearchData(data, {});
+  assert.equal(out.items[0].is_new, true);
+  assert.equal('is_new' in out.items[1], false, 'an unidentifiable card is not marked as known');
+  assert.deepEqual([out.history.new_count, out.history.known_count], [1, 0]);
+  // `new_only` keeps only what it can prove is new, so the unmarkable card is not returned either.
+  reset();
+  const filtered = annotateSearchData(data, { new_only: true });
+  assert.deepEqual(filtered.items.map((i: any) => i.item_id), ['a']);
+  assert.deepEqual([filtered.count, filtered.price_stats.count], [1, 1]);
 });
 
 test('annotateBatchData marks each query\'s items, filters new_only, and totals new and known listings', () => {
@@ -85,10 +111,36 @@ test('annotateBatchData marks each query\'s items, filters new_only, and totals 
   const filtered = annotateBatchData(batch(), { new_only: true });
   assert.deepEqual(filtered.queries.map((q: any) => q.items.length), [0, 1]);
   assert.equal(filtered.queries[0].status, 'empty', 'a row with nothing new left says so');
+  assert.equal(filtered.queries[0].empty_reason, 'filtered_out', 'and names the filter as the cause');
+  assert.equal('empty_reason' in filtered.queries[1], false, 'a row that still holds a new listing is not empty');
   // The totals count what the call now returns; history.known_count names what was suppressed.
   assert.deepEqual([filtered.totals.listings, filtered.totals.new_listings, filtered.totals.known_listings], [1, 1, 0]);
   assert.deepEqual([filtered.totals.ok, filtered.totals.empty], [1, 1]);
   assert.equal(filtered.history.known_count, 1);
+});
+
+test('annotateBatchData recomputes a compact row\'s price_stats from the new cards it keeps', () => {
+  // A compact card keeps the price flat (`price_amount`), and `priceStats` reads only
+  // `typed.price_amount` -- so a batch row that publishes the shaped cards has to restate them in
+  // the shape the statistics understand, exactly as the search annotator does.
+  observeListing({ item_id: 'known', typed: { price_amount: 300 } });
+  const batch = () => ({
+    queries: [{
+      index: 0, query: 'q1', ok: true, status: 'success', count: 3,
+      price_stats: { count: 3, min: 100, median: 200 },
+      items: [{ item_id: 'known', price_amount: 300 }, { item_id: 'new1', price_amount: 100 }, { item_id: 'new2', price_amount: 200 }],
+    }],
+    totals: { requested: 1, ok: 1, empty: 0, failed: 0, skipped: 0, partial: 0, listings: 3, unique_listings: 3, duplicates: 0, ms: 5 },
+  });
+
+  const filtered = annotateBatchData(batch(), { new_only: true });
+  assert.deepEqual(filtered.queries[0].items.map((i: any) => i.item_id), ['new1', 'new2']);
+  assert.equal('typed' in filtered.queries[0].items[0], false, 'the cards really are the compact shape');
+  assert.deepEqual([filtered.queries[0].price_stats.count, filtered.queries[0].price_stats.min, filtered.queries[0].price_stats.median], [2, 100, 150]);
+  assert.deepEqual([filtered.queries[0].count, filtered.queries[0].status], [2, 'success']);
+  // An unpriced card must still be left out of the figures rather than counted as cheap.
+  const unpriced = annotateBatchData({ queries: [{ index: 0, ok: true, status: 'success', count: 2, price_stats: null, items: [{ item_id: 'u1', price_amount: 40 }, { item_id: 'u2' }] }], totals: {} }, { new_only: true });
+  assert.deepEqual([unpriced.queries[0].price_stats.count, unpriced.queries[0].price_stats.min], [1, 40]);
 });
 
 test('XIANYU_HISTORY=0 disables the store and leaves annotate* untouched', () => {

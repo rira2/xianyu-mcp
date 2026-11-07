@@ -15,9 +15,11 @@
  *
  * `XIANYU_HISTORY=0` is the kill switch and is read per call, so it needs no restart. When it is
  * off, `annotate*` returns its input untouched: no `is_new`, no `history` block, and `new_only` has
- * no store to filter against (the README says so).
+ * no store to filter against. The tool boundary is what tells the caller that a requested `new_only`
+ * did not run -- `disabledHistory()` is the marker it publishes -- because the annotators' job is to
+ * describe what they observed, and they observed nothing.
  */
-import { priceStats } from './output.ts';
+import { priceStats, type PriceStats } from './output.ts';
 
 type Entry = { first_seen: number; price: number | null };
 /** One observation's answer. `first_seen_age_s` is 0 for a listing this process had never seen. */
@@ -41,7 +43,8 @@ const priceOf = (item: any): number | null => {
 };
 
 /** Record one sighting and say how it compares to the last one. A card with no `item_id` cannot be
- *  linked to anything, so it is reported as not-new and never stored. */
+ *  linked to anything, so it is reported as not-new here and never stored -- the annotators then
+ *  leave it unmarked rather than publishing that neutral answer as a fact about the listing. */
 export const observeListing = (item: any): Observation => {
   const neutral: Observation = { is_new: false, first_seen_age_s: 0, price_drop_amount: null, previous_price: null };
   const id = item?.item_id;
@@ -77,6 +80,12 @@ const dropOf = (item: any, observed: Observation): Drop | null => {
     drop_percent: from > 0 ? round1((observed.price_drop_amount / from) * 100) : null,
   };
 };
+/** Whether a card can be remembered at all. Without an `item_id` there is nothing to key a sighting
+ *  on, so such a card is left unmarked rather than labelled `is_new: false`: "not new" would be a
+ *  claim about a listing this process cannot recognise twice. It counts in neither `known_count` nor
+ *  `new_count` for the same reason. */
+const identified = (item: any): boolean => item?.item_id !== undefined && item?.item_id !== null && String(item.item_id) !== '';
+
 /** The `history` block an annotated answer publishes. `price_drops` is capped and ordered by the
  *  largest absolute drop, because that is the one a deal scan wants first. */
 const summary = (observed: { item: any; observation: Observation }[]): Record<string, any> => {
@@ -84,17 +93,28 @@ const summary = (observed: { item: any; observation: Observation }[]): Record<st
     .filter((drop): drop is Drop => drop !== null)
     .sort((a, b) => b.drop_amount - a.drop_amount || a.item_id.localeCompare(b.item_id))
     .slice(0, MAX_DROPS);
+  // Only cards that can be recognised twice are counted; an id-less card is neither known nor new.
+  const counted = observed.filter(({ item }) => identified(item));
   return {
     tracked: listings.size,
-    known_count: observed.filter(({ observation }) => !observation.is_new).length,
-    new_count: observed.filter(({ observation }) => observation.is_new).length,
+    known_count: counted.filter(({ observation }) => !observation.is_new).length,
+    new_count: counted.filter(({ observation }) => observation.is_new).length,
     price_drops: drops,
   };
 };
 
 /** Only the two marks a card publishes. `price_drop_amount`/`previous_price` are per-observation
- *  diagnostics that feed `history.price_drops`; they do not belong on every returned card. */
-const mark = (item: any, observation: Observation): Record<string, any> => ({ ...item, is_new: observation.is_new, first_seen_age_s: observation.first_seen_age_s });
+ *  diagnostics that feed `history.price_drops`; they do not belong on every returned card. A card
+ *  with no `item_id` (see `identified`) keeps neither mark. */
+const mark = (item: any, observation: Observation): Record<string, any> =>
+  identified(item) ? { ...item, is_new: observation.is_new, first_seen_age_s: observation.first_seen_age_s } : { ...item };
+
+/** The statistics over these cards. `priceStats` reads only `typed.price_amount`, while a shaped
+ *  card (a compact one, and every card a batch row publishes) keeps the same number flat -- so one
+ *  restatement, shared by both annotators, rather than two answers that could disagree about the
+ *  same listings. An unreadable price stays absent and is left out of every figure. */
+const statsOf = (items: any[]): PriceStats | null =>
+  priceStats((Array.isArray(items) ? items : []).map((item: any) => ({ typed: { price_amount: priceOf(item) } })));
 
 /** Annotate every card in an answer with `is_new`/`first_seen_age_s`. With `new_only`, keep only the
  *  listings this process had not seen before, so `count`, `price_stats` and `history.known_count`
@@ -109,9 +129,10 @@ export const annotateSearchData = (data: Record<string, any>, opts: { new_only?:
   if (items) out.items = kept;
   if (opts.new_only && items) {
     out.count = kept.length;
-    // `priceStats` reads the typed block; a compact card keeps the same number flat, so restate it
-    // in the shape the statistics understand rather than publishing figures over a filtered-out set.
-    out.price_stats = priceStats(kept.map((item: any) => ({ typed: { price_amount: priceOf(item) } })));
+    out.price_stats = statsOf(kept);
+    // An answer the filter emptied is not an empty result set: say which one happened, so a caller
+    // does not read `count: 0` as "goofish has nothing" when this process has already seen it all.
+    if (items.length && !kept.length) out.empty_reason = 'filtered_out';
   }
   out.history = summary(observed);
   return out;
@@ -145,7 +166,11 @@ export const annotateBatchData = (data: Record<string, any>, opts: { new_only?: 
       // `success`/`empty` are derived from the item count, so they have to move with it; a refusal
       // and a skipped query stay refusals.
       if (row.status === 'success' || row.status === 'empty') out.status = kept.length ? 'success' : 'empty';
-      if ('price_stats' in row) out.price_stats = priceStats(kept);
+      // The same shared restatement the search annotator uses: a batch row publishes compact cards,
+      // whose price is flat, and `priceStats` reads only the typed block.
+      if ('price_stats' in row) out.price_stats = statsOf(kept);
+      // A row the filter emptied says so, the way the search envelope does.
+      if (rows.length && !kept.length) out.empty_reason = 'filtered_out';
     }
     return out;
   });
@@ -169,6 +194,18 @@ export const annotateBatchData = (data: Record<string, any>, opts: { new_only?: 
   out.history = summary(observed);
   return out;
 };
+
+/**
+ * What a tool publishes in place of a `history` block when `new_only` was asked for with the store
+ * switched off: the filter did not run, the answer is the whole fetched set, and the note says it in
+ * words so a caller cannot mistake an unfiltered scan for a scan with nothing new. The annotators
+ * stay no-ops; naming a requested-but-unapplied filter is the boundary's job.
+ */
+export const disabledHistory = (): Record<string, any> => ({
+  enabled: false,
+  applied: false,
+  note: 'XIANYU_HISTORY=0: new_only was not applied; every fetched listing is returned',
+});
 
 /** What `capabilities` reports, so history is visible before a scan has relied on it. */
 export const stats = (): { enabled: boolean; tracked: number; capacity: number; note: string } => ({

@@ -279,7 +279,7 @@ const realSession = (opts: Parameters<typeof drivenPage>[0] = {}) => {
 // cleared between tests the same way the env budget is: a test that seeded one would otherwise have
 // the next item_view or search_items answered from it -- and, worse, would stop exercising the
 // refusal paths, since a cached listing never reaches them.
-test.afterEach(() => { setSession(null); resetCardCache(); resetCaches(); resetHistory(); for (const g of ['document', 'location', 'window']) delete (globalThis as any)[g]; for (const k of ['SEARCH', 'ITEM_VIEW', 'RECOMMENDATIONS']) delete process.env[`XIANYU_${k}_BUDGET_S`]; delete process.env.XIANYU_SEARCH_MAX_ITEMS; delete process.env.XIANYU_DETAIL_FANOUT; delete process.env.XIANYU_REPLAY; delete process.env.XIANYU_RELAX_MATCH; });
+test.afterEach(() => { setSession(null); resetCardCache(); resetCaches(); resetHistory(); for (const g of ['document', 'location', 'window']) delete (globalThis as any)[g]; for (const k of ['SEARCH', 'ITEM_VIEW', 'RECOMMENDATIONS']) delete process.env[`XIANYU_${k}_BUDGET_S`]; delete process.env.XIANYU_SEARCH_MAX_ITEMS; delete process.env.XIANYU_DETAIL_FANOUT; delete process.env.XIANYU_REPLAY; delete process.env.XIANYU_RELAX_MATCH; delete process.env.XIANYU_HISTORY; });
 
 const cards = (ids: string[]) => ({ ok: true, ret: 'SUCCESS::调用成功', data: { cardList: ids.map((id) => ({ cardData: { itemId: id, title: `t${id}`, soldPrice: '5' } })) } });
 const listed = (ids: string[]) => ids.map((id) => ({ item_id: id, title: `t${id}`, price: '5', city: '杭州', seller: 'a', want_count: '1', image_urls: [], url: `https://www.goofish.com/item?id=${id}` }));
@@ -1177,6 +1177,7 @@ test('search_items remembers what a scan already saw, filters new_only, and repo
   assert.equal(filtered.count, 0, 'the envelope count follows the filtered items');
   assert.deepEqual([filtered.data.count, filtered.data.items.length], [0, 0]);
   assert.deepEqual([filtered.data.history.known_count, filtered.data.history.new_count], [2, 0]);
+  assert.equal(filtered.data.empty_reason, 'filtered_out', 'the answer was emptied by the filter, not by goofish');
   assert.equal(filtered.data.filters.applied.new_only, undefined, 'new_only is a novelty control, not a search filter');
 
   resetCaches();
@@ -1215,8 +1216,80 @@ test('search_batch marks novelty per query, filters new_only, and keeps its tota
   scan();
   const filtered = await batch({ new_only: true });
   assert.deepEqual([filtered.data.queries[0].count, filtered.data.queries[0].status], [0, 'empty']);
+  assert.equal(filtered.data.queries[0].empty_reason, 'filtered_out', 'the row was emptied by the filter');
   assert.deepEqual([filtered.data.totals.listings, filtered.data.totals.new_listings], [0, 0]);
   assert.equal(filtered.data.history.known_count, 2, 'the suppressed known listings are still counted');
+});
+
+test('a compact batch row under new_only publishes price_stats over the new cards it keeps', async () => {
+  // A batch shapes its cards at `compact` (the default), which drops the `typed` block and keeps the
+  // price flat. The row's price_stats must still describe the cards the row returns -- the bug was a
+  // per-row `null` beside two priced listings.
+  const scan = (rows: string[][]) => {
+    const c = searchCase('thinkpad x220', rows);
+    const s = use(makeSession({ cards: [c.rows], mtop: c.mtop }));
+    s.runRealNormalizer = true;
+  };
+  const batch = (args: any = {}) => executeTool(TOOLS.find((t) => t.name === 'search_batch')!, {
+    queries: [{ query: 'thinkpad x220', limit: 10 }], timeout_s: 30, ...args,
+  });
+
+  // The first pass teaches the store one of the three listings.
+  scan([['联想Thinkpad X220 笔记本 乙', '1002', '300', '上海', '2']]);
+  assert.equal((await batch()).data.totals.new_listings, 1);
+
+  resetCaches();
+  scan([
+    ['联想Thinkpad X220 笔记本 丙', '1001', '100', '北京', '1'],
+    ['联想Thinkpad X220 笔记本 乙', '1002', '300', '上海', '2'],
+    ['联想Thinkpad X220 笔记本 甲', '1003', '200', '广州', '1'],
+  ]);
+  const filtered = await batch({ new_only: true });
+  const row = filtered.data.queries[0];
+  assert.deepEqual(row.items.map((i: any) => i.item_id), ['1001', '1003']);
+  assert.equal('typed' in row.items[0], false, 'the row really is the compact shape a batch publishes');
+  assert.deepEqual([row.price_stats.count, row.price_stats.min, row.price_stats.median], [2, 100, 150]);
+  assert.deepEqual([row.count, row.status], [2, 'success']);
+});
+
+test('XIANYU_HISTORY=0 turns novelty off and says new_only was not applied', async () => {
+  process.env.XIANYU_HISTORY = '0';
+  const c = searchCase('thinkpad x220', [
+    ['联想Thinkpad X220 笔记本 甲', '1001', '300', '北京', '1'],
+    ['联想Thinkpad X220 笔记本 乙', '1002', '100', '上海', '2'],
+  ]);
+  const s = use(makeSession({ cards: [c.rows], mtop: c.mtop }));
+  s.runRealNormalizer = true;
+  const out = await executeTool(TOOLS.find((t) => t.name === 'search_items')!, { query: 'thinkpad x220', new_only: true });
+  assert.equal(out.ok, true);
+  assert.equal(out.count, 2, 'the whole fetched set is returned: there is no store to filter against');
+  assert.ok(out.data.items.every((i: any) => !('is_new' in i)), 'and nothing is marked against memory that is off');
+  assert.deepEqual(out.data.history, {
+    enabled: false, applied: false,
+    note: 'XIANYU_HISTORY=0: new_only was not applied; every fetched listing is returned',
+  });
+});
+
+test('XIANYU_HISTORY=0 leaves a batch unfiltered and says new_only was not applied', async () => {
+  process.env.XIANYU_HISTORY = '0';
+  const c = searchCase('thinkpad x220', [
+    ['联想Thinkpad X220 笔记本 甲', '1001', '300', '北京', '1'],
+    ['联想Thinkpad X220 笔记本 乙', '1002', '100', '上海', '2'],
+  ]);
+  const s = use(makeSession({ cards: [c.rows], mtop: c.mtop }));
+  s.runRealNormalizer = true;
+  const out = await executeTool(TOOLS.find((t) => t.name === 'search_batch')!, {
+    queries: [{ query: 'thinkpad x220', limit: 10 }], timeout_s: 30, new_only: true,
+  });
+  assert.equal(out.count, 2, 'every fetched listing survives the requested filter');
+  const row = out.data.queries[0];
+  assert.deepEqual([row.count, row.status], [2, 'success']);
+  assert.ok(row.items.every((i: any) => !('is_new' in i)));
+  assert.equal('new_listings' in out.data.totals, false, 'no novelty totals without a store');
+  assert.deepEqual(out.data.history, {
+    enabled: false, applied: false,
+    note: 'XIANYU_HISTORY=0: new_only was not applied; every fetched listing is returned',
+  });
 });
 
 test('search_items refuses a search reply that is really the recommendation rail', async () => {
@@ -1262,6 +1335,40 @@ test('a partial-term result set is accepted with matched_by partial_terms, unles
   session();
   await assert.rejects(run('search_items')({ query: 'E5 2680 v4', attempts: 1 }), (e: any) => e instanceof SearchUnavailableError
     && /irrelevant_api_results/.test(e.message));
+});
+
+// The fuzzy page a typed search gets back: two exact CPUs, twelve E5 parts carrying two of the
+// three terms, and sixteen unrelated cards. The fraction is 2 of 30, so the strict rule declines --
+// and the relaxed rule keeps the fourteen titles that really are E5 2680 parts.
+const domFuzzyPage = () => ({
+  rendered: true, cards_scanned: 30, rail: '', says_no_results: false, text_preview: '至强 E5 2680', query_hits: 2, token_hits: 2,
+  items: [
+    { item_id: '2001', title: '至强 E5 2680 v4 处理器 甲', price: '100', condition: '', brand: '', city: '北京', url: 'u2001', matches_query: true },
+    { item_id: '2002', title: '至强 E5 2680 v4 处理器 乙', price: '110', condition: '', brand: '', city: '北京', url: 'u2002', matches_query: true },
+    ...Array.from({ length: 12 }, (_, i) => ({ item_id: String(2100 + i), title: `至强 E5 2680 v3 处理器 ${i}`, price: '90', condition: '', brand: '', city: '北京', url: `u${2100 + i}`, matches_query: false })),
+    ...Array.from({ length: 16 }, (_, i) => ({ item_id: String(2200 + i), title: `木瓜丝 广西特产 ${i}`, price: '9', condition: '', brand: '', city: '南宁', url: `u${2200 + i}`, matches_query: false })),
+  ],
+});
+
+test('the DOM fallback keeps partial-term titles when XIANYU_RELAX_MATCH is on', async () => {
+  resetCaches();
+  use(makeSession({ scrape: [domFuzzyPage()] }));
+  const out = await run('search_items')({ query: 'E5 2680 v4', limit: 30, attempts: 1 });
+  assert.equal(out.source, 'search_page_dom', 'the API never answered, so the typed route did');
+  assert.equal(out.matched_by, 'partial_terms');
+  assert.equal(out.partial_relevance, true);
+  assert.equal(out.query_hits, 2, 'the exact phrase really was in two titles');
+  assert.equal(out.count, 14, 'the two CPUs plus the twelve closest parts');
+  assert.deepEqual(out.items.map((i: any) => i.item_id), ['2001', '2002', ...Array.from({ length: 12 }, (_, i) => String(2100 + i))]);
+  assert.ok(out.items.every((i: any) => /E5 2680/.test(i.title)), 'nothing from the unrelated rail was kept');
+});
+
+test('XIANYU_RELAX_MATCH=0 refuses the same DOM fallback page instead of relaxing it', async () => {
+  process.env.XIANYU_RELAX_MATCH = '0';
+  resetCaches();
+  use(makeSession({ scrape: [domFuzzyPage()] }));
+  await assert.rejects(run('search_items')({ query: 'E5 2680 v4', limit: 30, attempts: 1 }), (e: any) => e instanceof SearchUnavailableError
+    && e.details?.reason === 'unavailable' && /"min_query_hits":6/.test(e.message) && /"scraped_cards":30/.test(e.message));
 });
 
 test('the mtop-only tools do not queue behind a search on the shared page', async () => {
