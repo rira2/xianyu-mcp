@@ -605,6 +605,7 @@ export const searchListings = (data: any): any[] => {
     // The seller is here and was being thrown away: the search card's `userNick` does not exist, the
     // name is `exContent.userNickName`, so search results came back with an empty seller.
     const seller = asText(ex.userNickName) || asText(dp.userNick);
+    const tags = tagContents(ex.fishTags), labelStats = sellerLabelStats(ex.userFishShopLabel);
     cards.push({
       detailParams: { ...dp, ...(itemId ? { itemId } : {}), ...(image ? { picUrl: image } : {}), ...(soldPrice ? { soldPrice } : {}), ...(seller ? { userNick: seller } : {}) },
       attributeMap: { wantNum: asText(ex.want) || asText(args.wantNum), cCatId: args.cCatId, categoryId: args.catId },
@@ -614,6 +615,15 @@ export const searchListings = (data: any): any[] => {
       _ex: {
         seller_avatar: asText(ex.userAvatarUrl).replace(/^http:\/\//, 'https://'),
         seller_shop: Boolean(ex.userFishShopLabel) || asText(args.userIsUseFishShopCard) === 'true',
+        // The seller's trust signals the card already prints: id (to group listings by seller),
+        // review count and positive rate from the shop label, credit from the tag strip, and whether
+        // the seller hid their profile. All of it is free -- it is in the reply we already hold.
+        seller_id: asText(args.seller_id),
+        seller_reviews: labelStats.reviews,
+        seller_positive_rate: labelStats.positive_rate,
+        seller_credit: sellerCreditOf(tags),
+        seller_identity: asText(ex.userIdentityShow),
+        seller_hidden: Boolean(ex.hideUserInfo) || asText(args.HideUserInfo) === 'true',
         is_video: Boolean(ex.showVideoIcon || dp.isVideo === 'true' || ex.isVideo === true),
         is_auction: Boolean(ex.isAuction),
         publish_time: asText(args.publishTime),
@@ -626,12 +636,30 @@ export const searchListings = (data: any): any[] => {
         // fishTags.r1..r4 is the strip under the title: free shipping, a price drop, seller credit.
         // Reading the `content` of each tag is the only way to get it, and it is genuinely useful for
         // triage -- "卖家信用极好" and "18天内降价" change how a listing reads.
-        tags: tagContents(ex.fishTags),
+        tags,
         page: asText(args.page),
       },
     });
   }
   return cards;
+};
+
+/** The seller statistics printed on a search card's shop label: "663条评价" and "好评率73%". */
+const sellerLabelStats = (shopLabel: any): { reviews: string; positive_rate: string } => {
+  let reviews = '', positive_rate = '';
+  for (const t of shopLabel?.tagList ?? []) {
+    const c = asText(t?.data?.content);
+    const rev = c.match(/^(\d+)\s*条评价$/), pos = c.match(/^好评率\s*(\d+(?:\.\d+)?)\s*%$/);
+    if (rev && !reviews) reviews = rev[1];
+    if (pos && !positive_rate) positive_rate = pos[1];
+  }
+  return { reviews, positive_rate };
+};
+
+/** "卖家信用极好" -> "极好"; the tag strip is a card's only seller-credit signal. */
+const sellerCreditOf = (tags: string[]): string => {
+  for (const t of tags) { const m = t.match(/^卖家信用(.+)$/); if (m) return m[1].trim(); }
+  return '';
 };
 
 /** The text of every tag in a card's `fishTags` block, de-duplicated in document order. */
@@ -735,6 +763,12 @@ export const FEED_NORMALIZE_JS = (spec: { rows: any[] }): any[] => {
       tags: Array.isArray(ex.tags) ? ex.tags : [],
       seller_avatar: pick(ex.seller_avatar),
       seller_shop: Boolean(ex.seller_shop),
+      seller_id: pick(ex.seller_id),
+      seller_reviews: pick(ex.seller_reviews),
+      seller_positive_rate: pick(ex.seller_positive_rate),
+      seller_credit: pick(ex.seller_credit),
+      seller_identity: pick(ex.seller_identity),
+      seller_hidden: Boolean(ex.seller_hidden),
       publish_time: pick(ex.publish_time),
       // The three the typed block reads, through the same fallback chain as everything else, and empty
       // when the card carries none of them -- the normal case for a homepage feed card, published as a

@@ -63,6 +63,16 @@ test('compactItem carries tags and publish_time only when the card has them', ()
   assert.deepEqual(Object.keys(bare).sort(), ['city', 'item_id', 'price', 'price_amount', 'rank', 'seller', 'title', 'url', 'want_count']);
 });
 
+test('compactItem carries the seller trust signals only when the card has them', () => {
+  const withSeller = compactItem(card({ seller_id: 'SID==', seller_reviews: '663', seller_positive_rate: '73', seller_credit: '极好', seller_identity: '实名认证' }));
+  assert.deepEqual(
+    [withSeller.seller_id, withSeller.seller_reviews, withSeller.seller_positive_rate, withSeller.seller_credit, withSeller.seller_identity],
+    ['SID==', 663, 73, '极好', '实名认证']);
+  const bare = compactItem(card());
+  for (const k of ['seller_id', 'seller_reviews', 'seller_positive_rate', 'seller_credit', 'seller_identity', 'seller_hidden']) assert.equal(k in bare, false, k);
+  assert.equal(compactItem(card({ seller_hidden: true })).seller_hidden, true);
+});
+
 test('compactItem publishes a price amount only when the typed block has one', () => {
   // An unreadable price is null in the typed block, and a null here would read as "free" rather than
   // "unknown" -- the same distinction `typed.price_amount` exists to keep.

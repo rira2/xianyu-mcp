@@ -8,7 +8,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { detailListing, enrichListing, FEED_NORMALIZE_JS, hasAllTerms, isoOrNull, ITEM_SCRAPE_JS, listingTyped, missingPaths, MTOP_CALL_JS, MTOP_READY_JS, numberOrNull, queryTerms, RAIL_MARKERS, SCRAPE_CARDS_JS, sellerListings, sellerProfileOf } from '../src/extract.ts';
+import { detailListing, enrichListing, FEED_NORMALIZE_JS, searchListings, hasAllTerms, isoOrNull, ITEM_SCRAPE_JS, listingTyped, missingPaths, MTOP_CALL_JS, MTOP_READY_JS, numberOrNull, queryTerms, RAIL_MARKERS, SCRAPE_CARDS_JS, sellerListings, sellerProfileOf } from '../src/extract.ts';
 import { ITEM_FIELDS, SELLER_ITEM_PAGE_FIELDS, SELLER_PROFILE_FIELDS } from '../src/tools.ts';
 
 const g = globalThis as any;
@@ -20,6 +20,27 @@ const setDoc = (text: string, sel: Record<string, any[]> = {}, location: string 
 // These tests replace globals the page scripts read, so they put every one back: without this the
 // file only passed in the order it happens to be written.
 test.afterEach(() => { for (const k of ['document', 'location', 'window']) delete g[k]; g.setTimeout = realSetTimeout; });
+
+test('searchListings carries the seller trust signals a card already prints', () => {
+  const payload = { resultList: [{ data: { item: { main: {
+    clickParam: { args: { item_id: '42', price: '329', seller_id: 'SID==', publishTime: '1784640276000', userIsUseFishShopCard: 'false', HideUserInfo: 'false' } },
+    exContent: {
+      detailParams: { itemId: '42', title: 't', soldPrice: '329' }, userNickName: '卖家', userAvatarUrl: 'http://img/x.jpg',
+      userFishShopLabel: { tagList: [{ data: { content: '663条评价' } }, { data: { content: '好评率73%' } }] },
+      fishTags: { r4: { tagList: [{ data: { content: '卖家信用极好' } }] } },
+      userIdentityShow: '实名认证', hideUserInfo: false,
+    },
+  } } }, style: 'card', type: 'item' }] };
+  const cards = searchListings(payload);
+  assert.equal(cards.length, 1);
+  const ex = cards[0]._ex;
+  assert.deepEqual([ex.seller_id, ex.seller_reviews, ex.seller_positive_rate, ex.seller_credit, ex.seller_identity, ex.seller_hidden], ['SID==', '663', '73', '极好', '实名认证', false]);
+  const row = FEED_NORMALIZE_JS({ rows: cards })[0];
+  assert.deepEqual([row.seller_id, row.seller_reviews, row.seller_positive_rate, row.seller_credit, row.seller_identity, row.seller_hidden], ['SID==', '663', '73', '极好', '实名认证', false]);
+  // Signals the card did not print stay empty rather than being invented.
+  const bare = searchListings({ resultList: [{ data: { item: { main: { clickParam: { args: { item_id: '43', price: '1' } }, exContent: { detailParams: { itemId: '43' }, userNickName: 'x' } } } } }] })[0];
+  assert.deepEqual([bare._ex.seller_id, bare._ex.seller_reviews, bare._ex.seller_positive_rate, bare._ex.seller_credit], ['', '', '', '']);
+});
 
 test('the mtop wrapper reports "not ready" instead of throwing, and keeps goofish\'s own ret code', async () => {
   g.setTimeout = ((fn: any) => setImmediate(fn)) as any;   // the readiness poll's 150ms x 60 would otherwise cost 9s

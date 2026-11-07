@@ -1128,7 +1128,7 @@ test('search_items compact returns the deal fields, drops the evidence trail and
   assert.equal(out.attempts, 1, 'the attempt count survives without the log');
   assert.equal('sample_titles' in out.diagnostics, false);
   assert.deepEqual(out.items.map((i: any) => i.item_id), ['1001', '1002', '1003']);
-  assert.deepEqual(Object.keys(out.items[0]).sort(), ['city', 'first_seen_age_s', 'is_new', 'item_id', 'price', 'price_amount', 'publish_time', 'rank', 'seller', 'title', 'url', 'want_count']);
+  assert.deepEqual(Object.keys(out.items[0]).sort(), ['city', 'first_seen_age_s', 'is_new', 'item_id', 'price', 'price_amount', 'publish_time', 'rank', 'seller', 'seller_id', 'title', 'url', 'want_count']);
   assert.equal(out.items[0].price_amount, 300, 'the typed price rides along as a number');
   assert.equal(out.items[0].is_new, true, 'and novelty rides along without un-compacting the card');
   assert.equal('typed' in out.items[0], false, 'and the block it came from does not');

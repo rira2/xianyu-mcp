@@ -25,6 +25,14 @@ const priceAmountOf = (item: any): number | null => {
   return typeof amount === 'number' && Number.isFinite(amount) ? amount : null;
 };
 
+/** A finite number from a flat string field, or null -- an absent or unreadable value is unknown,
+ *  never zero. */
+const numOrNull = (value: unknown): number | null => {
+  if (value === null || value === undefined || String(value).trim() === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+};
+
 /** The published moment of a listing, in epoch milliseconds, or null. goofish stamps this field in
  *  milliseconds; a card that carries none is unknown rather than old. */
 const timestampOf = (item: any): number | null => {
@@ -50,11 +58,20 @@ const round2 = (value: number): number => Math.round(value * 100) / 100;
  * because their absence is the common case, and an empty `tags` array would spend bytes saying nothing.
  */
 export const compactItem = (item: any): any => {
-  const amount = priceAmountOf(item);
+  const amount = priceAmountOf(item), positiveRate = numOrNull(item?.seller_positive_rate), reviews = numOrNull(item?.seller_reviews);
   return {
     item_id: item?.item_id, rank: item?.rank, title: item?.title, price: item?.price,
     ...(amount === null ? {} : { price_amount: amount }),
     city: item?.city, want_count: item?.want_count, seller: item?.seller, url: item?.url,
+    // The seller's trust signals, when the card printed them: reviews/positive rate, credit label,
+    // the seller id (group listings by seller across queries), and a hidden-profile flag. Absent when
+    // the site did not send them -- the same rule as price_amount.
+    ...(item?.seller_id ? { seller_id: item.seller_id } : {}),
+    ...(positiveRate === null ? {} : { seller_positive_rate: positiveRate }),
+    ...(reviews === null ? {} : { seller_reviews: reviews }),
+    ...(item?.seller_credit ? { seller_credit: item.seller_credit } : {}),
+    ...(item?.seller_identity ? { seller_identity: item.seller_identity } : {}),
+    ...(item?.seller_hidden ? { seller_hidden: true } : {}),
     ...(Array.isArray(item?.tags) && item.tags.length ? { tags: item.tags } : {}),
     ...(item?.publish_time ? { publish_time: item.publish_time } : {}),
   };

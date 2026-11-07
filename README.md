@@ -212,7 +212,12 @@ never guessed into a price. Range/negotiable/unknown prices fail a numeric price
 
 `compact: true` keeps only the deal fields a scan needs — `item_id`, `rank`, `title`, `price`,
 `price_amount`, `city`, `want_count`, `seller` and `url`, plus `tags` and `publish_time` when the card
-carries them — and drops `attempt_log` (the attempt count stays in `attempts`) and
+carries them — and the seller's trust signals when the card prints them: `seller_id` (stable id, so
+listings can be grouped by seller across queries), `seller_reviews` and `seller_positive_rate` (from
+the card's "663条评价" / "好评率73%" label), `seller_credit` (e.g. `"极好"` from "卖家信用极好"),
+`seller_identity` (identity label, when shown) and `seller_hidden: true` when the seller hid their
+profile. Absent signals are omitted, never invented; `seller_positive_rate: 0` beside `seller_reviews: 0` is the site's own label for a seller with no reviews yet, not a computed zero. It drops `attempt_log` (the attempt count stays
+in `attempts`) and
 `diagnostics.sample_titles`. `count`, `next_cursor`, `freshness` and the rest of `diagnostics` are
 passed through, and `compact: true` says so in the envelope. It is the same answer in a fraction of
 the bytes; the default (`false`) envelope is unchanged. Compaction happens at the tool boundary, after
@@ -290,7 +295,7 @@ actually holds.
 
 The defaults are the batch's own, and they are not `search_items`':
 
-- `compact: true` — the deal fields only; a scan reads price, city and title.
+- `compact: true` — the deal fields plus the card's seller trust signals; a scan reads price, city, title, seller rating and seller id.
 - Per query `pages: 1`, `limit: 60`, `detail: 0` and **`topup_pages: 0`**. A single search tops up by
   up to two pages when the pages asked for come back short; a scan asks for the pages it will read
   and pays for no others, because the second page of sixty is bought for a price comparison rather

@@ -123,6 +123,14 @@ The Python implementation this is a port of is not in this history at all: it li
   typed route in 13.9-121.3s when it did not. Every command line and raw number is in
   `docs/benchmark-2026-11-07.md`.
 
+- **Seller trust signals on every card and in `compact`.** Search cards already print the seller's
+  review count, positive rate, credit label, identity label, seller id and a hidden-profile flag; the
+  server now carries all of them into the flat item and `compact: true` keeps the ones the card has
+  (`seller_id`, `seller_reviews`, `seller_positive_rate`, `seller_credit`, `seller_identity`,
+  `seller_hidden`), omitting absent ones instead of inventing them. `typed.seller_stats` now carries
+  the positive rate a card knows. Costs ~80–120 bytes per compact listing; the full seller
+  statistics (tenure, items sold, reply rate, zhima) still require `item_view`/`detail`.
+
 ## [0.2.1] — 2026-10-08
 
 ### Added
