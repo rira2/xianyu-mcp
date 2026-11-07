@@ -154,7 +154,10 @@ test('a batch answer pays the slim build block by default, and include_meta buys
   assert.deepEqual(Object.keys(slim.build).sort(), ['commit', 'version']);
   const full = await executeTool(run, { queries: [{ query: 'alpha' }], include_meta: true });
   assert.match(full.build.runtime_fingerprint, /^[a-f0-9]{64}$/);
-  const saved = Buffer.byteLength(JSON.stringify(full)) - Buffer.byteLength(JSON.stringify(slim));
+  // `elapsed_ms` is wall-clock and varies by a digit between two calls; strip it before comparing
+  // payload sizes, or this test is flaky by exactly one byte under a loaded suite.
+  const stable = (envelope: any) => { const copy = { ...envelope }; delete copy.elapsed_ms; return copy; };
+  const saved = Buffer.byteLength(JSON.stringify(stable(full))) - Buffer.byteLength(JSON.stringify(stable(slim)));
   // The full block is 460-760B depending on whether the deploy verdict has anything to say; the
   // property is that the meta block is the whole difference, not a particular number of bytes.
   const metaDelta = Buffer.byteLength(JSON.stringify(full.build)) - Buffer.byteLength(JSON.stringify(slim.build));
