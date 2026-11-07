@@ -30,7 +30,10 @@ let cooldownUntil = 0, throttleEvents = 0;
 export const resetCooldown = () => { cooldownUntil = throttleEvents = 0; };
 export const cooldown = () => ({ retry_after_s: Math.max(0, Math.ceil((cooldownUntil - Date.now()) / 1000)),
   scope: 'this_server_process', note: 'Goofish may throttle a shared public IP. This process cannot measure other clients on that IP.' });
-const observeThrottle = (reason: string) => {
+/** Arm the process cooldown from a throttle the site itself named. Exported because `search_batch`
+ *  sees one per row, below this envelope: its `stop_reason` is the batch's `cooldown`, so the site's
+ *  own word (`rate_limited` / `risk_control`) would otherwise never reach the process. */
+export const observeThrottle = (reason: string) => {
   if (!['rate_limited', 'risk_control'].includes(reason)) return;
   if (cooldown().retry_after_s) return;
   throttleEvents++;

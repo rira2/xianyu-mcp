@@ -19,7 +19,7 @@ import { getItem, getSearchPage, putSearchPage, reset as resetCaches } from '../
 import { DETAIL_API } from '../src/replay.ts';
 import { withDeadline } from '../src/runtime.ts';
 import { z } from 'zod';
-import { executeTool, resetCooldown } from '../src/response.ts';
+import { cooldown, executeTool, resetCooldown } from '../src/response.ts';
 
 const run = (name: string) => {
   const t = TOOLS.find((x) => x.name === name);
@@ -2330,6 +2330,70 @@ test('search_batch publishes its query-list bounds and refuses what falls outsid
   assert.equal(typo.ok, false);
   assert.match(typo.message ?? '', /page/);
   assert.equal(typo.count, 0);
+});
+
+test('search_batch stops before the call deadline instead of letting it cut the answer off', async () => {
+  resetCaches(); resetCooldown();
+  use(makeSession());
+  const out = await executeTool(TOOLS.find((t) => t.name === 'search_batch')!, {
+    queries: [{ query: 'thinkpad x220' }, { query: 'x220 battery' }],
+    // The published minimum, and still below one query's 10s floor: no query can fit, so the batch
+    // must stop itself and answer partial with named skips. Before the fix this path let the
+    // envelope's own deadline fire mid-call and turned the whole answer into "Call deadline reached".
+    timeout_s: 5,
+  });
+  assert.equal(out.ok, true, 'the call answered');
+  assert.equal(out.status, 'partial');
+  assert.equal(out.count, 0);
+  assert.equal(out.error_type, null);
+  const data = out.data!;
+  assert.equal(data.partial, true);
+  assert.equal(data.stop_reason, 'timeout');
+  assert.equal(data.totals.skipped, 2);
+  for (const row of data.queries) {
+    assert.equal(row.skipped, true);
+    assert.equal(row.status, 'skipped');
+    assert.equal(row.stop_reason, 'timeout');
+    assert.equal(row.retry_after_s, 0);
+    assert.match(row.message, /time budget/);
+  }
+  assert.doesNotMatch(JSON.stringify(out), /Call deadline reached/, 'the batch stopped itself; the deadline did not cut it off');
+});
+
+test('search_batch stops on a throttled query and arms the process cooldown', async () => {
+  resetCaches(); resetCooldown();
+  const q = 'Xeon E5-2680 v4';
+  const one = searchReply(q, [['至强 E5-2680v4', '1', '500', '北京', '1']]);
+  const s = use(makeSession({ mtop: { 'mtop.taobao.idlemtopsearch.pc.search': [ok(one), refused('RGV587')] } }));
+  s.runRealNormalizer = true;
+  // Every reply this batch reads has to come through the tap: a second query would need another one.
+  let takes = 0;
+  const take = s.domTap.take;
+  s.domTap.take = (api: string, timeoutMs?: number) => { takes++; return take(api, timeoutMs); };
+  try {
+    const out = await executeTool(TOOLS.find((t) => t.name === 'search_batch')!, {
+      queries: [{ query: q, pages: 2, limit: 10 }, { query: 'thinkpad x220' }],
+      attempts: 1,
+      timeout_s: 60,
+    });
+    assert.equal(out.ok, true, 'the call itself answered');
+    assert.equal(out.status, 'partial');
+    const data = out.data!;
+    assert.equal(data.queries[0].ok, true);
+    assert.equal(data.queries[0].status, 'partial', 'the walk that lost page 2 kept page 1');
+    assert.equal(data.queries[0].stop_reason, 'rate_limited', 'the row names Goofish\'s own reason');
+    assert.equal(data.queries[1].skipped, true, 'the query after the throttle was never asked');
+    assert.equal(data.queries[1].status, 'skipped');
+    assert.equal(data.queries[1].stop_reason, 'cooldown');
+    assert.equal(data.queries[1].retry_after_s, 60);
+    assert.equal(data.stop_reason, 'cooldown');
+    assert.equal(data.throttle_reason, 'rate_limited', 'and the envelope keeps the site\'s own word for it');
+    assert.equal(data.retry_after_s, 60);
+    assert.equal(data.partial, true);
+    assert.deepEqual(data.failed_queries, [1], 'the skipped query is the only one that did not answer');
+    assert.equal(takes, 2, 'page 1 and the refused page 2 were the only search replies read: the second query never ran');
+    assert.ok(cooldown().retry_after_s > 0, 'the process cooldown is armed so the next call is refused');
+  } finally { resetCooldown(); resetCaches(); }
 });
 
 test('topup_pages: 0 walks exactly the pages asked for; without it the walk still tops up', async () => {

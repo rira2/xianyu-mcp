@@ -63,12 +63,19 @@ The Python implementation this is a port of is not in this history at all: it li
 - Add `search_batch`: one call runs 1-20 searches in order and answers once, with per-query
   isolation. A query that fails is a row (`ok: false` with `error_type`, `message`, `retryable`,
   `retry_after_s` and, when the tool can name it, `reason`), never a failed call, and the queries
-  after it still run. A query the call never reached -- the whole-call deadline, or this process's
-  throttle cooldown -- says `skipped: true`, so `ok: false` is never ambiguous between "goofish
-  refused this" and "this was never asked". `data.totals` counts requested/ok/empty/partial/failed,
-  listings, unique listings across queries and duplicates; `failed_queries` names the indexes that
-  failed; `stop_reason` is `timeout` or `cooldown` when the call stopped early, and `partial` is true
-  whenever a query failed or the call stopped early. The defaults are the bulk scan's own:
+  after it still run; cards that query had already validated stay in its `items`. A query the call
+  never reached -- the whole-call deadline, a throttle an earlier query reported, or this process's
+  throttle cooldown -- says `skipped: true` with `stop_reason`/`reason` and a published `error_type`,
+  so `ok: false` is never ambiguous between "goofish refused this" and "this was never asked". A
+  query that reports Goofish's throttle (`rate_limited`/`risk_control`) stops the list with
+  `stop_reason: cooldown`, `throttle_reason` naming the site's own word, and the process cooldown
+  armed. A query is only started when at least 10s of the call's budget remain, so a list near its
+  deadline answers partial with the rest skipped instead of being cut off mid-search.
+  `data.totals` counts requested/ok (success only)/empty/partial/failed/skipped, listings, unique
+  listings across queries and duplicates; `failed_queries` names the indexes that did not answer,
+  failed or skipped; `stop_reason` is `timeout` or `cooldown` when the call stopped early, and
+  `partial` is true whenever a query failed or the call stopped early. The defaults are the bulk
+  scan's own:
   `compact: true`, and per query one page of 60, `detail: 0` and `topup_pages: 0`; `timeout_s: 180`
   bounds the whole list while `per_query_timeout_s: 60` (clipped to what is left) bounds one query.
   Measured against the built server: six two-page queries answered 6/6 in 25.4s and 156KB (263

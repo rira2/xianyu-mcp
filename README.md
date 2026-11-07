@@ -248,18 +248,30 @@ about whether a failure ended the scan. `search_batch` puts that in one call:
 
 It runs 1–20 queries **in order on the same page**, and answers once. Every query reports its own
 `ok`, `status`, `count`, `ms` and the route that answered (`source`, `via`, `pages_fetched`, plus
-`stop_reason` when one applies), with its `items` and `price_stats` shaped exactly as `search_items`
-shapes them. **A failed query does not fail the call**: the queries after it still run, and its row
-carries `error_type`, `message`, `retryable`, `retry_after_s` and, when the tool can name it,
-`reason`. A query the call never reached — the deadline, or this process's throttle cooldown — is
-`skipped: true` with `status: "skipped"`, so `ok: false` always says whether Goofish refused that
-query or never saw it.
+`stop_reason` and `retry_after_s` when one applies), with its `items` and `price_stats` shaped exactly
+as `search_items` shapes them. **A failed query does not fail the call**: the queries after it still
+run, and its row carries `error_type`, `message`, `retryable`, `retry_after_s` and, when the tool can
+name it, `reason`; the cards that query had already validated are still in its `items`. A query the
+call never reached — the deadline, a throttle, or this process's cooldown — is `skipped: true` with
+`status: "skipped"`, `stop_reason` and `reason` naming `timeout` or `cooldown`, and `error_type`
+`XianyuError` (a published type: a batch row never invents an error class). So `ok: false` always
+says whether Goofish refused that query or never saw it.
 
-`totals` counts `requested`, `ok`, `empty`, `partial`, `failed`, `listings`, `unique_listings` and
-`duplicates` across the list; `failed_queries` names the indexes that failed; `stop_reason` is
-`timeout` or `cooldown` when the call stopped early; and `partial` is true whenever a query failed or
-the call stopped early. `count` is every listing returned, duplicates included — `unique_listings` is
-what a merged scan actually holds.
+Goofish's throttle stops the list instead of spending the same patience on the queries after it. A
+query row that reports `rate_limited` or `risk_control` — the site refused it, or its walk stopped
+early — latches `stop_reason: "cooldown"`, carries that row's `retry_after_s` onto the remaining
+skipped rows, names the site's own word in `data.throttle_reason`, and arms the process cooldown, so
+the next call is refused rather than retried into the same wall. A call whose only answered query was
+throttled is `partial`, never a success.
+
+`totals` counts `requested`, `ok` (success only), `empty`, `partial`, `failed` (queries that answered
+with an error), `skipped` (queries the call never reached), `listings`, `unique_listings` and
+`duplicates` across the list — so `ok + empty + partial + failed + skipped === requested`.
+`failed_queries` names the indexes that did not answer, failed or skipped; `stop_reason` is `timeout`
+or `cooldown` when the call stopped early; `throttle_reason` is the site's own word when a throttle
+stopped it, `null` otherwise; and `partial` is true whenever a query failed or the call stopped early.
+`count` is every listing returned, duplicates included — `unique_listings` is what a merged scan
+actually holds.
 
 The defaults are the batch's own, and they are not `search_items`':
 
@@ -270,7 +282,10 @@ The defaults are the batch's own, and they are not `search_items`':
   than for a complete inventory. Pass `topup_pages` on a query to get the single-search behaviour
   back.
 - `timeout_s: 180` bounds the **whole** list, `per_query_timeout_s: 60` bounds one query and is
-  clipped to whatever is left of the call, and `attempts: 2` is the per-query retry count.
+  clipped to whatever is left of the call, and `attempts: 2` is the per-query retry count. A query is
+  only started when at least 10s of the call's budget remain (its own floor), so a list that nears
+  its deadline answers `partial` with the remaining queries `skipped: true` instead of being cut off
+  mid-search; a `timeout_s` under 10 therefore runs nothing and says so.
 
 Measured against the built server, one `search_batch` of six two-page queries answered 6/6 in **25.4s**
 and 156KB (263 listings, 262 unique, one duplicate), every page from the signed replay — the first

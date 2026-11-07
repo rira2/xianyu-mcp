@@ -39,7 +39,7 @@ test('runs its queries in order and answers once, compactly', async () => {
   assert.deepEqual(out.failed_queries, []);
   assert.equal(out.count, 6);
   assert.ok(Number.isFinite(out.totals.ms) && out.totals.ms >= 0);
-  assert.deepEqual({ ...out.totals, ms: 0 }, { requested: 3, ok: 3, empty: 0, failed: 0, partial: 0, listings: 6, unique_listings: 6, duplicates: 0, ms: 0 });
+  assert.deepEqual({ ...out.totals, ms: 0 }, { requested: 3, ok: 3, empty: 0, failed: 0, skipped: 0, partial: 0, listings: 6, unique_listings: 6, duplicates: 0, ms: 0 });
   for (const entry of out.queries) {
     assert.equal(entry.ok, true);
     assert.equal(entry.status, 'success');
@@ -65,7 +65,7 @@ test('a query that throws is a row, not the end of the call', async () => {
   const asked: string[] = [];
   const out = await runBatch({ queries: [{ query: 'alpha' }, { query: 'beta' }, { query: 'gamma' }] }, async (args) => {
     asked.push(args.query);
-    if (args.query === 'beta') throw Object.assign(new Error('boom'), { details: { reason: 'rate_limited', retryable: true, retry_after_s: 60 } });
+    if (args.query === 'beta') throw Object.assign(new Error('boom'), { details: { reason: 'unavailable', retryable: true, retry_after_s: 5 } });
     return answer([`${args.query}-1`, `${args.query}-2`]);
   }, opts());
   assert.deepEqual(asked, ['alpha', 'beta', 'gamma'], 'the failure did not stop the queries after it');
@@ -73,73 +73,154 @@ test('a query that throws is a row, not the end of the call', async () => {
   assert.equal(failed.ok, false);
   assert.equal(failed.status, 'error');
   assert.equal(failed.index, 1);
-  assert.equal(failed.reason, 'rate_limited');
+  assert.equal(failed.reason, 'unavailable');
   assert.equal(failed.retryable, true);
-  assert.equal(failed.retry_after_s, 60);
+  assert.equal(failed.retry_after_s, 5);
   assert.equal(failed.error_type, 'Error');
   assert.match(failed.message, /boom/);
   assert.deepEqual(failed.items, [], 'a failed query still gets the row shape');
   assert.equal(failed.price_stats, null);
   assert.deepEqual(out.failed_queries, [1]);
   assert.equal(out.partial, true);
-  assert.equal(out.retry_after_s, 60);
+  assert.equal(out.retry_after_s, 5);
   assert.equal(out.count, 4, 'the two queries that answered are still counted');
   assert.equal(out.queries[0].items.length, 2);
   assert.equal(out.queries[2].items.length, 2);
   assert.equal(out.totals.failed, 1);
 });
 
-test('the call deadline stops the batch and marks what it never reached', async () => {
+test('the call stops before starting a query that cannot fit, and names what it never reached', async () => {
   const asked: string[] = [];
   const out = await runBatch({ queries: [{ query: 'alpha' }, { query: 'beta' }, { query: 'gamma' }] }, async (args) => {
     asked.push(args.query);
     await new Promise((resolve) => setTimeout(resolve, 600));
     return answer([`${args.query}-1`]);
-  }, opts({ deadline: Date.now() + 1000 }));
-  assert.equal(asked.length, 2, 'the third query was never started, so the first two fit inside the 1s budget');
-  assert.deepEqual(asked, ['alpha', 'beta']);
+  }, opts({ deadline: Date.now() + 10_500 }));
+  assert.deepEqual(asked, ['alpha'], 'one query fits in 10.5s; after it, 9.9s is less than the next query\'s 10s floor');
   assert.equal(out.stop_reason, 'timeout');
   assert.equal(out.partial, true);
-  const skipped = out.queries[2];
-  assert.equal(skipped.skipped, true);
-  assert.equal(skipped.ok, false);
-  assert.equal(skipped.status, 'skipped');
-  assert.equal(skipped.error_type, 'TimeoutError', 'the row names the deadline it was skipped for');
-  assert.match(skipped.message, /time budget|deadline/);
-  assert.equal(skipped.reason, 'timeout');
-  assert.equal(skipped.retry_after_s, 0);
-  assert.equal(skipped.ms, 0);
-  assert.deepEqual(skipped.items, []);
-  assert.deepEqual(out.failed_queries, [2]);
-  assert.equal(out.count, 2);
+  for (const skipped of out.queries.slice(1)) {
+    assert.equal(skipped.skipped, true);
+    assert.equal(skipped.ok, false);
+    assert.equal(skipped.status, 'skipped');
+    assert.equal(skipped.stop_reason, 'timeout', 'the row names the deadline it was skipped for');
+    assert.equal(skipped.reason, 'timeout');
+    assert.equal(skipped.error_type, 'XianyuError', 'a published error type: batch rows never invent one');
+    assert.match(skipped.message, /time budget/);
+    assert.equal(skipped.retry_after_s, 0);
+    assert.equal(skipped.ms, 0);
+    assert.deepEqual(skipped.items, []);
+  }
+  assert.deepEqual(out.failed_queries, [1, 2]);
+  assert.equal(out.totals.skipped, 2);
+  assert.equal(out.count, 1);
 });
 
-test('a process cooldown mid-batch stops it instead of spending the site on queries it expects refused', async () => {
+test('a deadline that has already passed skips the whole list instead of throwing', async () => {
+  let asked = 0;
+  const out = await runBatch({ queries: [{ query: 'alpha' }, { query: 'beta' }] }, async () => { asked++; return answer(['1']); }, opts({ deadline: Date.now() - 1 }));
+  assert.equal(asked, 0, 'nothing is started on a call that is already over');
+  assert.equal(out.stop_reason, 'timeout');
+  assert.equal(out.partial, true);
+  assert.deepEqual(out.queries.map((q: any) => q.status), ['skipped', 'skipped']);
+  assert.deepEqual(out.failed_queries, [0, 1]);
+  assert.equal(out.totals.skipped, 2);
+  assert.equal(out.count, 0);
+});
+
+test('a row that reports a throttle stops the batch and latches the wait it must observe', async () => {
   const asked: string[] = [];
-  let wait = 0;
   const out = await runBatch({ queries: [{ query: 'alpha' }, { query: 'beta' }, { query: 'gamma' }] }, async (args) => {
     asked.push(args.query);
-    wait = 60;   // the throttle this answer reports is what a process cooldown is set from
     throw Object.assign(new Error('throttled'), { details: { reason: 'rate_limited', retryable: true, retry_after_s: 60 } });
-  }, opts({ cooldown: () => ({ retry_after_s: wait }) }));
-  assert.deepEqual(asked, ['alpha'], 'goofish was asked exactly once');
-  assert.equal(out.stop_reason, 'cooldown');
-  assert.equal(out.partial, true);
-  assert.equal(out.retry_after_s, 60);
-  assert.deepEqual(out.failed_queries, [0, 1, 2], 'the query that was asked failed on goofish\'s own reason, and the two after it were skipped');
-  assert.equal(out.queries[0].reason, 'rate_limited', 'the query that was asked carries the site\'s own reason');
+  }, opts());
+  assert.deepEqual(asked, ['alpha'], 'the first query reported the throttle, so the other two were never asked');
   assert.equal(out.queries[0].status, 'error');
+  assert.equal(out.queries[0].reason, 'rate_limited', 'the query that was asked carries the site\'s own reason');
+  assert.equal(out.stop_reason, 'cooldown');
+  assert.equal(out.throttle_reason, 'rate_limited', 'the envelope keeps goofish\'s own word for it');
+  assert.equal(out.retry_after_s, 60);
+  assert.equal(out.partial, true);
+  assert.deepEqual(out.failed_queries, [0, 1, 2], 'the query that was asked failed on goofish\'s own reason, and the two after it were skipped');
   for (const skipped of out.queries.slice(1)) {
     assert.equal(skipped.skipped, true);
     assert.equal(skipped.status, 'skipped');
-    assert.equal(skipped.error_type, 'CooldownError');
+    assert.equal(skipped.stop_reason, 'cooldown');
     assert.equal(skipped.reason, 'cooldown');
+    assert.equal(skipped.error_type, 'XianyuError');
     assert.equal(skipped.retry_after_s, 60, 'the wait it must observe travels with the row');
-    assert.match(skipped.message, /60s|cooldown/);
+    assert.match(skipped.message, /throttle|retry in 60s/);
     assert.equal(skipped.ok, false);
     assert.equal(skipped.ms, 0);
     assert.deepEqual(skipped.items, []);
   }
+  assert.equal(out.totals.failed, 1, 'the query that was asked failed on the site\'s own reason');
+  assert.equal(out.totals.skipped, 2, 'and the two after it were never reached, counted apart');
+});
+
+test('an answered query cut short by a throttle also stops the batch, and a throttled-only batch is partial', async () => {
+  const asked: string[] = [];
+  const out = await runBatch({ queries: [{ query: 'alpha' }, { query: 'beta' }] }, async (args) => {
+    asked.push(args.query);
+    return answer([`${args.query}-1`], { partial: true, stop_reason: 'risk_control', retry_after_s: 120 });
+  }, opts());
+  assert.deepEqual(asked, ['alpha']);
+  assert.equal(out.queries[0].ok, true);
+  assert.equal(out.queries[0].status, 'partial');
+  assert.equal(out.queries[0].stop_reason, 'risk_control');
+  assert.equal(out.queries[0].retry_after_s, 120, 'the partial search\'s own wait is published on its row');
+  assert.equal(out.queries[1].skipped, true);
+  assert.equal(out.queries[1].stop_reason, 'cooldown');
+  assert.equal(out.queries[1].retry_after_s, 120, 'and latched, not replaced by the 60s fallback');
+  assert.equal(out.throttle_reason, 'risk_control');
+  assert.equal(out.stop_reason, 'cooldown');
+  assert.equal(out.partial, true, 'a batch whose only answered query was throttled is partial, never a success');
+  assert.equal(out.count, 1);
+  assert.equal(out.totals.skipped, 1);
+});
+
+test('a refusal without explicit details is classified the way the tool envelope classifies it', async () => {
+  const asked: string[] = [];
+  const out = await runBatch({ queries: [{ query: 'alpha' }, { query: 'beta' }] }, async (args) => {
+    asked.push(args.query);
+    throw new Error('RGV587_ERROR::SM::哎哟喂,被挤爆啦,请稍后重试!');
+  }, opts());
+  assert.deepEqual(asked, ['alpha'], 'the message alone names the throttle, so the batch stops');
+  assert.equal(out.queries[0].reason, 'rate_limited');
+  assert.equal(out.queries[0].retry_after_s, 60);
+  assert.equal(out.stop_reason, 'cooldown');
+  assert.equal(out.throttle_reason, 'rate_limited');
+});
+
+test('a cooldown active before the first query skips the list and says so', async () => {
+  let asked = 0;
+  const out = await runBatch({ queries: [{ query: 'alpha' }, { query: 'beta' }] }, async () => { asked++; return answer(['1']); }, opts({ cooldown: () => ({ retry_after_s: 60 }) }));
+  assert.equal(asked, 0);
+  assert.equal(out.stop_reason, 'cooldown');
+  assert.equal(out.throttle_reason, null, 'a process cooldown is not a row the site throttled');
+  assert.equal(out.retry_after_s, 60);
+  assert.equal(out.partial, true);
+  for (const row of out.queries) {
+    assert.equal(row.skipped, true);
+    assert.equal(row.status, 'skipped');
+    assert.equal(row.stop_reason, 'cooldown');
+    assert.equal(row.retry_after_s, 60);
+    assert.match(row.message, /cooldown/);
+  }
+});
+
+test('a failed query keeps the cards the search had already validated', async () => {
+  const out = await runBatch({ queries: [{ query: 'alpha' }] }, async () => {
+    throw Object.assign(new Error('the call deadline reached the search'), { details: { reason: 'timeout', retryable: true, retry_after_s: 0 }, partial: { query: 'alpha', items: [listing('1'), listing('2')], count: 2 } });
+  }, opts());
+  const row = out.queries[0];
+  assert.equal(row.ok, false, 'the query still failed');
+  assert.equal(row.status, 'error');
+  assert.equal(row.count, 2, 'but the listings it had already validated are not thrown away');
+  assert.deepEqual(row.items.map((i: any) => i.item_id), ['1', '2']);
+  assert.equal(row.price_stats.count, 2);
+  assert.equal(out.count, 2);
+  assert.equal(out.totals.listings, 2, 'and they count as listings the caller paid for');
 });
 
 test('the totals count listings, unique listings and the overlap between queries', async () => {
