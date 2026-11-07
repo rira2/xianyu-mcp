@@ -272,7 +272,9 @@ const resolveSeller = async ({ user_id, item_id }: SellerArgs): Promise<{ user_i
  *  already reduced it to a listing. */
 const sellerStanding = (listing: any | null): Data => {
   const s = listing ?? {};
-  return { city: asText(s.seller_city), tenure_years: asText(s.seller_tenure_years), items_sold: asText(s.seller_items_sold), items_listed: asText(s.seller_items_listed), positive_rate: asText(s.seller_positive_rate), reply_rate_24h: asText(s.seller_reply_rate_24h), last_active: asText(s.seller_last_active) };
+  // `reply_rate_24h` is a number or null on the listing, with the site's own words beside it when it
+  // printed a floor ("低于50"); publishing the floor is the honest answer, not a blank.
+  return { city: asText(s.seller_city), tenure_years: asText(s.seller_tenure_years), items_sold: asText(s.seller_items_sold), items_listed: asText(s.seller_items_listed), positive_rate: asText(s.seller_positive_rate), reply_rate_24h: asText(s.seller_reply_rate_24h) || asText(s.seller_reply_rate_24h_raw), last_active: asText(s.seller_last_active) };
 };
 
 /**
@@ -946,16 +948,12 @@ const fanoutBlock = (width: number, batches: number, fanned: number, fellBack: s
 });
 
 /**
- * Detail reads: one full page load per listing, warm median 13.4s (n=8, 8/8). Four pages at once took
- * a batch from 66.3s to 27.1s -- 2.4x -- while each listing's own latency went 11.4s to 20.5s, and on
- * a throttled IP the same fan-out answered 0/4 where the serial walk got 2/4. Leased from the pool. */
-/**
- * Fold a detail read into the card it belongs to. The card wins on nothing except the two things the
+ * Fold a detail read into the card it belongs to. The card wins on nothing except the one thing the
  * detail read cannot answer: its `attributes` map is the tag-derived `{brand, capacity}` subset, and
  * the detail's `品牌/成色/已用年限` block must extend it rather than erase it. Everything else is the
  * detail read's answer -- it is fresher, reviewed by the same query guard, and richer.
  */
-const mergeDetail = (card: any, listing: any, read: { cache: CacheVerdict; listing: any }): any => {
+const mergeDetail = (card: any, listing: any, read: { cache: CacheVerdict }): any => {
   const cardAttributes = card?.attributes && typeof card.attributes === 'object' && !Array.isArray(card.attributes) ? card.attributes : null;
   const detailAttributes = listing?.attributes && typeof listing.attributes === 'object' && !Array.isArray(listing.attributes) ? listing.attributes : null;
   Object.assign(card, listing, { detail_source: listing.source, detailed: true, cached: read.cache.hit, cache_age_s: read.cache.age_s });
@@ -963,6 +961,10 @@ const mergeDetail = (card: any, listing: any, read: { cache: CacheVerdict; listi
   return card;
 };
 
+/**
+ * Detail reads: one full page load per listing, warm median 13.4s (n=8, 8/8). Four pages at once took
+ * a batch from 66.3s to 27.1s -- 2.4x -- while each listing's own latency went 11.4s to 20.5s, and on
+ * a throttled IP the same fan-out answered 0/4 where the serial walk got 2/4. Leased from the pool. */
 const enrichDetails = async (session: any, ranked: any[], want: number, deadline: number, all: any[]): Promise<{ items: any[]; report: any }> => {
   const targets = ranked.slice(0, want).filter((i: any) => i?.item_id);
   if (!targets.length) return { items: all, report: { requested: 0, ok: 0, per_listing: [] } };

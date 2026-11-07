@@ -2082,6 +2082,18 @@ test('seller_profile given an item_id reads the listing\'s own detail reply, and
   assert.match(out.note, /detail record/);
 });
 
+test('seller_profile keeps a reply-rate floor in the site\'s own words', async () => {
+  // The detail record can print "低于50" instead of a number. The listing's numeric field is then null,
+  // with the raw words beside it, and the seller profile must still publish what the site said rather
+  // than a blank that reads as "no reply rate on file".
+  use(makeSession({ item: [UNRENDERED], mtop: { 'mtop.taobao.idle.pc.detail': [ok({
+    itemDO: { itemId: '42', title: '男士羊毛呢大衣', soldPrice: '1999' },
+    sellerDO: { sellerId: '2214350705775', nick: '汴梁资深化镁', replyRatio24h: '低于50' },
+  })] } }, { head: { ok: true, ret: 'SUCCESS::调用成功', data: HEAD } }));
+  const out = await run('seller_profile')({ item_id: '42' });
+  assert.equal(out.reply_rate_24h, '低于50');
+});
+
 test('seller_profile refuses the two ways it cannot answer, and never one seller\'s standing as another\'s', async () => {
   use(makeSession({}, { head: { ok: false, ret: 'FAIL_BIZ_USER_NOT_FOUND::没有这个用户', data: null } }));
   await assert.rejects(run('seller_profile')({ user_id: '1' }), (e: any) => e instanceof DetailUnavailableError && /FAIL_BIZ_USER_NOT_FOUND/.test(e.message));
