@@ -2890,7 +2890,6 @@ test('deadline_s is an alias for timeout_s, and giving both is refused rather th
   const named = await executeTool(search, { query: 'P100', deadline_s: 1 });
   assert.equal(named.ok, false); assert.equal(named.diagnostics.reason, 'timeout');
   const namedBoth = await executeTool(search, { query: 'P100', timeout_s: 1, deadline_s: 1 });
-  console.log('DEBUGBOTH', JSON.stringify(namedBoth).slice(0, 500));
   assert.equal(namedBoth.ok, false); assert.equal(namedBoth.diagnostics.reason, 'invalid_arguments');
   assert.match(namedBoth.message ?? '', /not both/);
   release(); await held; await exclusive(async () => {});

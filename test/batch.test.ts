@@ -155,7 +155,11 @@ test('a batch answer pays the slim build block by default, and include_meta buys
   const full = await executeTool(run, { queries: [{ query: 'alpha' }], include_meta: true });
   assert.match(full.build.runtime_fingerprint, /^[a-f0-9]{64}$/);
   const saved = Buffer.byteLength(JSON.stringify(full)) - Buffer.byteLength(JSON.stringify(slim));
-  assert.ok(saved >= 600, `the slim default saved ${saved}B, not the ~700B of the full build block`);
+  // The full block is 460-760B depending on whether the deploy verdict has anything to say; the
+  // property is that the meta block is the whole difference, not a particular number of bytes.
+  const metaDelta = Buffer.byteLength(JSON.stringify(full.build)) - Buffer.byteLength(JSON.stringify(slim.build));
+  assert.ok(metaDelta >= 400, `the slim default saved ${metaDelta}B of meta, which is not a real block`);
+  assert.equal(saved, metaDelta, 'the build block is the only payload difference between the two calls');
   assert.equal(slim.count, full.count, 'the metashape changed, not the answer');
 });
 
