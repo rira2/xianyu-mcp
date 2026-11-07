@@ -38,7 +38,7 @@ test('no credential access anywhere in the tree', () => {
   // credential scan below has to be able to see them. `src/cache.ts` is in it for the same reason one
   // layer down: a module that holds what this server has read off goofish is exactly the module the
   // scans must cover, and a scan that quietly does not cover it is worse than no scan.
-  assert.deepEqual(sources.map((p) => p.replace(`${ROOT}/`, '')).sort(), ['src/batch.ts', 'src/browser.ts', 'src/build-info.ts', 'src/build.ts', 'src/cache.ts', 'src/display.ts', 'src/errors.ts', 'src/extract.ts', 'src/index.ts', 'src/output.ts', 'src/replay.ts', 'src/response.ts', 'src/runtime.ts', 'src/search-policy.ts', 'src/tools.ts', 'test/batch.test.ts', 'test/browser-tap.test.ts', 'test/build-info.test.ts', 'test/cache.test.ts', 'test/check-deploy.test.ts', 'test/extract.test.ts', 'test/invariants.test.ts', 'test/output.test.ts', 'test/replay.test.ts', 'test/response.test.ts', 'test/search-policy.test.ts', 'test/serve.test.ts', 'test/tools.test.ts']);
+  assert.deepEqual(sources.map((p) => p.replace(`${ROOT}/`, '')).sort(), ['src/batch.ts', 'src/browser.ts', 'src/build-info.ts', 'src/build.ts', 'src/cache.ts', 'src/display.ts', 'src/errors.ts', 'src/extract.ts', 'src/history.ts', 'src/index.ts', 'src/output.ts', 'src/replay.ts', 'src/response.ts', 'src/runtime.ts', 'src/search-policy.ts', 'src/tools.ts', 'test/batch.test.ts', 'test/browser-tap.test.ts', 'test/build-info.test.ts', 'test/cache.test.ts', 'test/check-deploy.test.ts', 'test/extract.test.ts', 'test/history.test.ts', 'test/invariants.test.ts', 'test/output.test.ts', 'test/replay.test.ts', 'test/response.test.ts', 'test/search-policy.test.ts', 'test/serve.test.ts', 'test/tools.test.ts']);
   const forbidden = [
     'storageState', 'launchPersistentContext', 'userDataDir',
     'cookie2', 'sgcookie', 'x5sec', 'addCookies', 'localStorage', 'sessionStorage',
@@ -174,7 +174,7 @@ test('the detail fan-out is reachable only from inside the lock its caller alrea
   // published answer from inside the same tool.
   const search = toolsSrc.match(/const searchItems = async[\s\S]*?\n};/)?.[0] ?? '';
   assert.equal((search.match(/publishSearch\(/g) ?? []).length, 4, 'all four are inside search_items');
-  assert.match(toolsSrc, /run: locked\(shaped\(searchItems\)\)/, 'and the tool that reaches it holds the shared lock, with the output shaping inside it');
+  assert.match(toolsSrc, /run: locked\(novel\(shaped\(searchItems\)\)\)/, 'and the tool that reaches it holds the shared lock, with the output shaping inside it');
   // The fallback is not a silent one: the fan-out either ran or says why it did not, and both are in
   // the envelope rather than in a comment above this function.
   assert.match(fanout, /fellBack/, 'the answer-rate check is in the loop, not beside it');
@@ -199,11 +199,12 @@ test('the entry point does not serialise the tools: the lock belongs to the four
   assert.equal(/exclusive/.test(entry), false, 'index.ts must not take the lock; tools.ts owns it. Re-wrapping all eleven re-serialises the fast tools behind every slow one.');
   // ...and the lock really is on the four page-reading tools, so the promise is kept rather than deleted.
   const toolsSrc = readFileSync(join(ROOT, 'src', 'tools.ts'), 'utf8');
-  // `search_items` is registered as `locked(shaped(searchItems))`: the shaping wrapper rewrites the
-  // answer the search already built and still runs inside the one lock, so the promise is unchanged.
+  // `search_items` is registered as `locked(novel(shaped(searchItems)))`: the shaping wrapper rewrites
+  // the answer the search already built and the novelty wrapper marks it against this process's
+  // history, both inside the one lock, so the promise is unchanged.
   // `search_batch` is one lock around the whole list, because every query in it walks the same page.
   const lockSite: Record<string, string> = {
-    searchItems: 'run: locked\\(shaped\\(searchItems\\)\\)', itemView: 'run: locked\\(itemView\\)', recommendations: 'run: locked\\(recommendations\\)',
+    searchItems: 'run: locked\\(novel\\(shaped\\(searchItems\\)\\)\\)', itemView: 'run: locked\\(itemView\\)', recommendations: 'run: locked\\(recommendations\\)',
     searchBatch: 'run: locked\\(searchBatch\\)',
   };
   for (const [name, registration] of Object.entries(lockSite)) {
@@ -245,11 +246,11 @@ test('the published argument names and defaults are exactly these', () => {
     browse_feed: { page_number: 1, pages: 1, limit: 60 },
     search_count: { query: '<required>' },
     search_suggest: { query: '<required>', limit: 20 },
-    search_items: { query: '<required>', limit: 120, attempts: 4, pages: 1, topup_pages: 2, detail: 0, timeout_s: '<optional>', expand_synonyms: true, min_price: '<optional>', max_price: '<optional>', city: '<optional>', province: '<optional>', exclude_keywords: '<optional>', form_factor: '<optional>', bare_card_only: '<optional>', cursor: '<optional>', compact: false, sort: 'relevance' },
+    search_items: { query: '<required>', limit: 120, attempts: 4, pages: 1, topup_pages: 2, detail: 0, timeout_s: '<optional>', expand_synonyms: true, min_price: '<optional>', max_price: '<optional>', city: '<optional>', province: '<optional>', exclude_keywords: '<optional>', form_factor: '<optional>', bare_card_only: '<optional>', cursor: '<optional>', compact: false, sort: 'relevance', new_only: false },
     // A bulk scan is the one place the depth default is 0: the pages a query asks for are what it
     // pays for, and the top-up exists for a single search's completeness rather than a scan's speed.
     // `queries` publishes as one required array argument even though each element has its own shape.
-    search_batch: { queries: '<required>', compact: true, sort: 'relevance', timeout_s: 180, attempts: 2, per_query_timeout_s: 60 },
+    search_batch: { queries: '<required>', compact: true, sort: 'relevance', timeout_s: 180, attempts: 2, per_query_timeout_s: 60, new_only: false },
     related_items: { item_id: '<optional>', limit: 30, page: 1 },
     item_view: { item_id: '<required>' },
     recommendations: { limit: 30, url: '<optional>' },

@@ -4,7 +4,7 @@
  * one `node dist/index.js` process, the spec's calls in order, and no retries. A query that fails is
  * a measured row; a fault of the harness or of the protocol exits 2.
  *
- * Usage: node scripts/bench-scan.mjs <spec.json> [--out DIR] [--tool search_items|search_batch] [--timeout S]
+ * Usage: node scripts/bench-scan.mjs <spec.json> [--out DIR] [--tool search_items|search_batch] [--timeout S] [--repeat N]
  */
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -14,7 +14,7 @@ import { formatTable, parseSpec, summarize } from './bench-lib.mjs';
 
 const ROOT = resolve(import.meta.dirname, '..');
 const ENTRY = join(ROOT, 'dist', 'index.js');
-const USAGE = 'usage: node scripts/bench-scan.mjs <spec.json> [--out DIR] [--tool search_items|search_batch] [--timeout S]';
+const USAGE = 'usage: node scripts/bench-scan.mjs <spec.json> [--out DIR] [--tool search_items|search_batch] [--timeout S] [--repeat N]';
 const TOOLS = ['search_items', 'search_batch'];
 
 const fail = (message) => {
@@ -26,7 +26,7 @@ let cli;
 try {
   cli = parseArgs({
     allowPositionals: true,
-    options: { out: { type: 'string' }, tool: { type: 'string' }, timeout: { type: 'string' } },
+    options: { out: { type: 'string' }, tool: { type: 'string' }, timeout: { type: 'string' }, repeat: { type: 'string' } },
   });
 } catch (error) {
   fail(`${error.message}\n${USAGE}`);
@@ -36,6 +36,12 @@ const tool = cli.values.tool ?? 'search_items';
 if (!TOOLS.includes(tool)) fail(`unknown --tool ${tool}\n${USAGE}`);
 const timeout = cli.values.timeout === undefined ? 180 : Number(cli.values.timeout);
 if (!Number.isInteger(timeout) || timeout < 1) fail(`--timeout must be a positive integer\n${USAGE}`);
+// `--repeat` re-runs the spec against the SAME server process, which is the only way to observe
+// process-local history: a second `search_batch` pass is mostly known listings. Bounded because each
+// pass is a live call against a shared site.
+const repeat = cli.values.repeat === undefined ? 1 : Number(cli.values.repeat);
+if (!Number.isInteger(repeat) || repeat < 1 || repeat > 5) fail(`--repeat must be an integer from 1 to 5\n${USAGE}`);
+if (repeat > 1 && tool !== 'search_batch') fail(`--repeat needs --tool search_batch (history is annotated per batch row)\n${USAGE}`);
 let outDir = null;
 if (cli.values.out !== undefined) {
   if (!cli.values.out.trim()) fail(`--out needs a directory\n${USAGE}`);
@@ -180,33 +186,46 @@ try {
 
   const rows = [];
   if (tool === 'search_batch') {
-    process.stderr.write(`bench: ${tool}, ${spec.length} queries, timeout ${timeout}s\n`);
-    const started = Date.now();
-    const result = await send('tools/call', {
-      name: tool,
-      arguments: { queries: spec.map(queryArgs), ...(compact ? { compact: true } : {}), timeout_s: timeout },
-    }, (timeout + 30) * 1000);
-    const wall = Date.now() - started;
-    const text = resultText(result, tool);
-    // One envelope answers every query, so it is kept once under a name that cannot collide with a
-    // spec slug; the per-query slices are what the rows measure.
-    writeRaw('batch.json', text);
-    const envelope = parseEnvelope(text, tool);
-    if (envelope.ok !== true) throw new Error(`${tool} returned ${statusOf(envelope.status, false)}: ${envelope.message ?? 'no message'}`);
-    const answered = envelope.data?.queries;
-    if (!Array.isArray(answered)) throw new Error(`${tool} returned no data.queries array`);
-    process.stderr.write(`bench: ${tool} answered ${answered.length}/${spec.length} queries in ${(wall / 1000).toFixed(1)}s\n`);
-    for (const [position, entry] of answered.entries()) {
-      const index = Number.isInteger(entry?.index) && entry.index >= 0 && entry.index < spec.length ? entry.index : position;
-      const ok = entry?.ok === true;
-      rows.push({
-        slug: spec[index]?.slug ?? `query-${index + 1}`,
-        ok,
-        status: statusOf(entry?.status, ok),
-        count: countOf(entry?.count),
-        ms: Number.isFinite(entry?.ms) ? entry.ms : 0,
-        bytes: Buffer.byteLength(JSON.stringify(entry), 'utf8'),
+    // One envelope answers every query. `--repeat` re-runs the same list against this same server
+    // process: the first pass pays for goofish, and the second answers mostly from process-local
+    // history, so `totals.new_listings` on that pass is the novelty measurement the history store
+    // exists for. Only the first pass feeds the table; the later passes are printed and saved.
+    const repeatPass = async (pass) => {
+      process.stderr.write(`bench: ${tool} pass ${pass}/${repeat}, ${spec.length} queries, timeout ${timeout}s\n`);
+      const started = Date.now();
+      const result = await send('tools/call', {
+        name: tool,
+        arguments: { queries: spec.map(queryArgs), ...(compact ? { compact: true } : {}), timeout_s: timeout },
+      }, (timeout + 30) * 1000);
+      const wall = Date.now() - started;
+      const text = resultText(result, tool);
+      writeRaw(pass === 1 ? 'batch.json' : `batch-pass${pass}.json`, text);
+      const envelope = parseEnvelope(text, tool);
+      if (envelope.ok !== true) throw new Error(`${tool} returned ${statusOf(envelope.status, false)}: ${envelope.message ?? 'no message'}`);
+      const answered = envelope.data?.queries;
+      if (!Array.isArray(answered)) throw new Error(`${tool} returned no data.queries array`);
+      process.stderr.write(`bench: ${tool} pass ${pass} answered ${answered.length}/${spec.length} queries in ${(wall / 1000).toFixed(1)}s\n`);
+      const totals = envelope.data?.totals ?? {}, history = envelope.data?.history ?? {};
+      process.stderr.write(`bench: pass ${pass}: totals.new_listings=${totals.new_listings ?? 'absent'} totals.known_listings=${totals.known_listings ?? 'absent'} history.tracked=${history.tracked ?? 'absent'}\n`);
+      const passRows = answered.map((entry, position) => {
+        const index = Number.isInteger(entry?.index) && entry.index >= 0 && entry.index < spec.length ? entry.index : position;
+        const ok = entry?.ok === true;
+        return {
+          slug: spec[index]?.slug ?? `query-${index + 1}`,
+          ok,
+          status: statusOf(entry?.status, ok),
+          count: countOf(entry?.count),
+          ms: Number.isFinite(entry?.ms) ? entry.ms : 0,
+          bytes: Buffer.byteLength(JSON.stringify(entry), 'utf8'),
+        };
       });
+      return { pass, wall, rows: passRows, totals, history };
+    };
+    const passes = [];
+    for (let pass = 1; pass <= repeat; pass++) passes.push(await repeatPass(pass));
+    rows.push(...passes[0].rows);
+    if (passes.length > 1 && outDir) {
+      writeFileSync(join(outDir, 'repeat.json'), `${JSON.stringify(passes.map(({ pass, wall, totals, history }) => ({ pass, wall_ms: wall, totals, history })), null, 2)}\n`);
     }
   } else {
     for (const [index, entry] of spec.entries()) {

@@ -295,6 +295,60 @@ not a promise: on a later run Goofish refused it with `RGV587_ERROR` and the sam
 scan that cares about its wall clock should read `via` on each row. `npm run bench` runs the same thing
 from a spec file; see [Development](#development).
 
+## Repeated scans
+
+A deal scan is usually run again: the same keywords a minute, an hour or a day later, asking what is
+new and what got cheaper. The server remembers both questions in memory, per process, so the second
+pass is cheap and the answer is comparable to the first.
+
+Every card `search_items` and `search_batch` return carries two more fields:
+
+- `is_new` — true the first time **this server process** has seen that `item_id`; false afterwards.
+- `first_seen_age_s` — seconds since the first sighting, or `0` on the sighting that made it new.
+
+They are annotations about this process, never claims about Goofish: a restart forgets everything,
+so the first scan after a restart is all new. Within one batch a duplicate id across two queries is
+observed in query order — new in the query that saw it first, known in the ones after.
+
+`data.history` summarises the answer:
+
+```json
+{
+  "tracked": 263,
+  "known_count": 12,
+  "new_count": 251,
+  "price_drops": [
+    { "item_id": "809806779491", "title": "Tesla P100 16G 裸卡", "from": 1500, "to": 1200, "drop_amount": 300, "drop_percent": 20 }
+  ]
+}
+```
+
+`tracked` is how many ids the store holds (20,000 max, least-recently-seen evicted first).
+`new_count` and `known_count` count the listings this answer saw. `price_drops` lists the listings
+whose price is now **below the last price this process read**, largest absolute drop first, capped at
+50 entries. A price that rose, an unknown price, and a first-ever scan are never drops; an observation
+with no readable price leaves the last readable one in place.
+
+`new_only: true` (default `false`, so nothing changes unless asked) keeps only the new listings and
+updates `count`, `price_stats` and `history.known_count` to match what is returned. On `search_batch`
+it filters each query's `items`; a row that had listings and now has none reports `status: "empty"`,
+and the item-derived `totals` (`listings`, `unique_listings`, `duplicates`, `ok`, `empty`) count what
+the call returns. Every batch also gains `totals.new_listings` and `totals.known_listings`
+(duplicates across queries counted as returned listings, exactly like `totals.listings`). A price drop
+on a known listing is still reported when `new_only` suppresses that listing.
+
+```json
+{ "queries": [{ "query": "Tesla P100 16G", "limit": 60 }], "new_only": true, "compact": true }
+```
+
+The store is a `Map` of item id to `{ first_seen, last_price }` — two numbers and a key, bounded at
+20,000 entries — and `capabilities` reports it under `history` (`enabled`, `tracked`, `capacity`,
+`note`) without touching Goofish, including on `probe: false`. `XIANYU_HISTORY=0` turns it off: no
+`is_new`, no `history` block, and `new_only` has nothing to filter against, so it returns the
+unfiltered listings. History is memory in the server process, not a database: it does not survive a
+restart, and it cannot tell you that a listing is new *to Goofish* — only that this process had not
+seen it.
+
 ## The two seller tools
 
 `seller_profile` and `seller_items` answer the two questions about a seller that nothing else here can:

@@ -37,6 +37,10 @@ export type BatchQuery = {
 export type BatchArgs = {
   queries: BatchQuery[]; compact?: boolean; sort?: 'relevance' | 'price_asc' | 'price_desc' | 'newest';
   timeout_s?: number; attempts?: number; per_query_timeout_s?: number;
+  /** The tool's novelty filter. `runBatch` never reads it: history is process state and the rows'
+   *  items are already shaped, so `tools.ts` annotates the finished envelope (`annotateBatchData`)
+   *  rather than teaching this orchestration module about memory it does not own. */
+  new_only?: boolean;
 };
 /** What `runBatch` calls per query. `tools.ts` passes `searchItems` itself. */
 export type SearchOne = (args: any) => Promise<Record<string, any>>;

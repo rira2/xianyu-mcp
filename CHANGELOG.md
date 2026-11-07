@@ -87,6 +87,14 @@ The Python implementation this is a port of is not in this history at all: it li
   caller comparing a few pages stops paying for the ones it did not ask for. The default behaviour --
   up to two extra pages while the kept set is short of `limit` -- is unchanged, and a batch query
   defaults to 0.
+- Add a process-local listing history: every `search_items` and `search_batch` card gains `is_new`
+  and `first_seen_age_s`, and every answer carries `history` with `tracked`, `known_count`,
+  `new_count` and `price_drops` (up to 50, largest first) against the last price this process read.
+  `new_only` (default false) on either tool keeps only the listings this process had not seen; a
+  batch reports `totals.new_listings`/`known_listings`, and under `new_only` its item-derived totals
+  and row statuses follow what is returned. The store is a 20,000-entry least-recently-seen map,
+  `capabilities` publishes it (including on `probe: false`), and `XIANYU_HISTORY=0` turns it off --
+  it is memory in the server process, so a restart forgets it and a first-ever scan is all new.
 
 ## [0.2.1] — 2026-10-08
 

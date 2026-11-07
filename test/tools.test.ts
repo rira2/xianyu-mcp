@@ -16,6 +16,7 @@ import { BrowserError, DetailUnavailableError, GatedError, NavigationError, Pars
 import { FEED_NORMALIZE_JS, ITEM_SCRAPE_JS, MTOP_READY_JS, PAGER_CLICK_JS, PAGER_STATE_JS, SCRAPE_CARDS_JS, SEARCH_INPUT_JS, SEARCH_STATE_JS } from '../src/extract.ts';
 import { budget, fanoutSize, ITEM_FIELDS, resetCardCache, TOOLS } from '../src/tools.ts';
 import { getItem, getSearchPage, putSearchPage, reset as resetCaches } from '../src/cache.ts';
+import { reset as resetHistory } from '../src/history.ts';
 import { DETAIL_API } from '../src/replay.ts';
 import { withDeadline } from '../src/runtime.ts';
 import { z } from 'zod';
@@ -278,7 +279,7 @@ const realSession = (opts: Parameters<typeof drivenPage>[0] = {}) => {
 // cleared between tests the same way the env budget is: a test that seeded one would otherwise have
 // the next item_view or search_items answered from it -- and, worse, would stop exercising the
 // refusal paths, since a cached listing never reaches them.
-test.afterEach(() => { setSession(null); resetCardCache(); resetCaches(); for (const g of ['document', 'location', 'window']) delete (globalThis as any)[g]; for (const k of ['SEARCH', 'ITEM_VIEW', 'RECOMMENDATIONS']) delete process.env[`XIANYU_${k}_BUDGET_S`]; delete process.env.XIANYU_SEARCH_MAX_ITEMS; delete process.env.XIANYU_DETAIL_FANOUT; delete process.env.XIANYU_REPLAY; });
+test.afterEach(() => { setSession(null); resetCardCache(); resetCaches(); resetHistory(); for (const g of ['document', 'location', 'window']) delete (globalThis as any)[g]; for (const k of ['SEARCH', 'ITEM_VIEW', 'RECOMMENDATIONS']) delete process.env[`XIANYU_${k}_BUDGET_S`]; delete process.env.XIANYU_SEARCH_MAX_ITEMS; delete process.env.XIANYU_DETAIL_FANOUT; delete process.env.XIANYU_REPLAY; });
 
 const cards = (ids: string[]) => ({ ok: true, ret: 'SUCCESS::调用成功', data: { cardList: ids.map((id) => ({ cardData: { itemId: id, title: `t${id}`, soldPrice: '5' } })) } });
 const listed = (ids: string[]) => ids.map((id) => ({ item_id: id, title: `t${id}`, price: '5', city: '杭州', seller: 'a', want_count: '1', image_urls: [], url: `https://www.goofish.com/item?id=${id}` }));
@@ -1096,8 +1097,9 @@ test('search_items compact returns the deal fields, drops the evidence trail and
   assert.equal(out.attempts, 1, 'the attempt count survives without the log');
   assert.equal('sample_titles' in out.diagnostics, false);
   assert.deepEqual(out.items.map((i: any) => i.item_id), ['1001', '1002', '1003']);
-  assert.deepEqual(Object.keys(out.items[0]).sort(), ['city', 'item_id', 'price', 'price_amount', 'publish_time', 'rank', 'seller', 'title', 'url', 'want_count']);
+  assert.deepEqual(Object.keys(out.items[0]).sort(), ['city', 'first_seen_age_s', 'is_new', 'item_id', 'price', 'price_amount', 'publish_time', 'rank', 'seller', 'title', 'url', 'want_count']);
   assert.equal(out.items[0].price_amount, 300, 'the typed price rides along as a number');
+  assert.equal(out.items[0].is_new, true, 'and novelty rides along without un-compacting the card');
   assert.equal('typed' in out.items[0], false, 'and the block it came from does not');
   assert.equal(out.price_stats.count, 2);
 });
@@ -1136,6 +1138,85 @@ test('compact and sort run after `detail`, so the reported prices are the deepen
   assert.equal(out.price_stats.max, 123);
   assert.equal('description' in out.items[0], false, 'and the detail block itself is not what a compact caller pays for');
   assert.equal('typed' in out.items[0], false);
+});
+
+test('search_items remembers what a scan already saw, filters new_only, and reports a lower price', async () => {
+  // Two passes of the same scan in one process, then a third pass with one listing repriced down.
+  // The history store is module state, so the caches are cleared between passes (daily scans see a
+  // fresh site) and the history is not (that is the whole point of the second pass).
+  const listings = (firstPrice = '300') => [
+    ['联想Thinkpad X220 笔记本 甲', '1001', firstPrice, '北京', '1'],
+    ['联想Thinkpad X220 笔记本 乙', '1002', '100', '上海', '2'],
+  ];
+  const scan = (rows: string[][]) => {
+    const c = searchCase('thinkpad x220', rows);
+    const s = use(makeSession({ cards: [c.rows], mtop: c.mtop }));
+    s.runRealNormalizer = true;
+    return c;
+  };
+  const search = (args: any = {}) => executeTool(TOOLS.find((t) => t.name === 'search_items')!, { query: 'thinkpad x220', ...args });
+
+  scan(listings());
+  const first = await search();
+  assert.deepEqual(first.data.items.map((i: any) => [i.item_id, i.is_new]), [['1001', true], ['1002', true]]);
+  assert.deepEqual(first.data.items.map((i: any) => i.first_seen_age_s), [0, 0]);
+  assert.deepEqual([first.data.history.tracked, first.data.history.new_count, first.data.history.known_count], [2, 2, 0]);
+  assert.equal(first.data.history.price_drops.length, 0, 'a first-ever scan must not report every listing as a drop');
+
+  resetCaches();
+  scan(listings());
+  const second = await search();
+  assert.deepEqual(second.data.items.map((i: any) => i.is_new), [false, false]);
+  assert.ok(second.data.items.every((i: any) => i.first_seen_age_s >= 0));
+  assert.deepEqual([second.data.history.tracked, second.data.history.known_count], [2, 2]);
+
+  resetCaches();
+  scan(listings());
+  const filtered = await search({ new_only: true });
+  assert.equal(filtered.ok, true);
+  assert.equal(filtered.count, 0, 'the envelope count follows the filtered items');
+  assert.deepEqual([filtered.data.count, filtered.data.items.length], [0, 0]);
+  assert.deepEqual([filtered.data.history.known_count, filtered.data.history.new_count], [2, 0]);
+  assert.equal(filtered.data.filters.applied.new_only, undefined, 'new_only is a novelty control, not a search filter');
+
+  resetCaches();
+  scan(listings('250'));
+  const dropped = await search();
+  assert.deepEqual(dropped.data.history.price_drops.map((d: any) => [d.item_id, d.from, d.to, d.drop_amount]), [['1001', 300, 250, 50]]);
+  assert.deepEqual(dropped.data.history.price_drops[0].drop_percent, 16.7);
+});
+
+test('search_batch marks novelty per query, filters new_only, and keeps its totals consistent', async () => {
+  const scan = () => {
+    const c = searchCase('thinkpad x220', [
+      ['联想Thinkpad X220 笔记本 甲', '1001', '300', '北京', '1'],
+      ['联想Thinkpad X220 笔记本 乙', '1002', '100', '上海', '2'],
+    ]);
+    const s = use(makeSession({ cards: [c.rows], mtop: c.mtop }));
+    s.runRealNormalizer = true;
+    return c;
+  };
+  const batch = (args: any = {}) => executeTool(TOOLS.find((t) => t.name === 'search_batch')!, {
+    queries: [{ query: 'thinkpad x220', limit: 10 }], timeout_s: 30, ...args,
+  });
+
+  scan();
+  const first = await batch();
+  assert.deepEqual([first.data.totals.new_listings, first.data.totals.known_listings], [2, 0]);
+  assert.deepEqual(first.data.queries[0].items.map((i: any) => i.is_new), [true, true]);
+
+  resetCaches();
+  scan();
+  const second = await batch();
+  assert.deepEqual([second.data.totals.new_listings, second.data.totals.known_listings], [0, 2]);
+  assert.equal(second.data.history.known_count, 2);
+
+  resetCaches();
+  scan();
+  const filtered = await batch({ new_only: true });
+  assert.deepEqual([filtered.data.queries[0].count, filtered.data.queries[0].status], [0, 'empty']);
+  assert.deepEqual([filtered.data.totals.listings, filtered.data.totals.new_listings], [0, 0]);
+  assert.equal(filtered.data.history.known_count, 2, 'the suppressed known listings are still counted');
 });
 
 test('search_items refuses a search reply that is really the recommendation rail', async () => {
