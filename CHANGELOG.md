@@ -17,6 +17,41 @@ The Python implementation this is a port of is not in this history at all: it li
 
 ## [0.3.0] — Unreleased
 
+- **Renamed fields (breaking, deliberate).** The search card's `"好评率73%"` label is the site's recent
+  card metric, not the seller's lifetime rate — the same seller answered 99% on the detail API — so the
+  card's figure is now `seller_card_good_rate` (with `seller_card_reviews` for `"663条评价"`), and
+  `seller_positive_rate` now exists only as the detail-derived lifetime rate, with numeric
+  `seller_good_rate` beside it. `seller_reviews` is gone; `seller_card_reviews` replaces it. Each name
+  now covers exactly one metric, and cards no longer fill `typed.seller_stats` with the card label.
+- Want counts come from the tag strip when the numeric field is the site's placeholder. Search cards
+  send `clickParam.args.wantNum: "0"` and an empty `exContent.want`, while the real count is the
+  `"13人想要"` tag; a zero or empty field now falls back to `"N人想要"` / `"N万人想要"` (and, for
+  homepage cards, `hotPoint`), and a card that states neither publishes `""` rather than `0`.
+  `want_count_num` carries the numeric twin of the site's string.
+- Compact cards keep the facts a detail read paid for: `quantity`, `item_status` plus an
+  `item_status_token` (only for labels the site printed), the exact `shipping_fee`, every
+  detail-derived seller number, and the tag facts. `title` is truncated to the new `title_max_len`
+  argument (`search_items` and `search_batch`; default 120 characters, `0` keeps the whole title, other
+  values are held to 40-500) with `title_len` reporting the original length; full cards and all
+  matching/filtering reads keep the raw title, because a search card's title really does carry the
+  seller's description spam.
+- Shipping evidence on cards: `free_shipping` is derived from `包邮` / `不包邮` / `邮费另算` / `到付`
+  in the tag strip or the title, and `shipping_source` says which (`tag` / `title`). A detail read
+  overwrites both with the exact `transportFee` and `shipping_source: "detail"`. A card that stated
+  neither publishes no verdict instead of `free_shipping: false`.
+- The tag strip is split into `condition`, `badges`, `price_drop` (`{percent}` or `{when}`) and
+  `attributes` (`brand`, `capacity`), while raw `tags` is kept. The split is an ordered, conservative
+  heuristic: a tag no rule recognises stays in `tags` alone. A detail read's `品牌/成色/…` block
+  extends a card's tag-derived `attributes` instead of erasing them.
+- `item_view` publishes top-level numeric `price_amount` and `seller_good_rate`, and `seller_user_id`
+  (numeric) rather than overwriting the card's opaque `seller_id` meaning; `seller_reply_rate_24h` is a
+  number or null, with `seller_reply_rate_24h_raw` carrying the site's words when it printed a floor
+  such as `"低于50"`.
+- A failed search now says why nothing was returned: `diagnostics.empty_reason` is `rejected` when
+  Goofish refused the page, `page_unavailable` when nothing was inspected, or `no_relevant_results`
+  when titles were read and none matched, and `diagnostics.titles_inspected` counts the titles that
+  were actually read. `empty_reason: "no_inventory"` stays reserved for a count endpoint that measured
+  zero for a query that did answer; a refusal is never published as an inventory fact.
 - Add a stable response schema, MCP error flags, structured diagnostics, retry hints, call deadlines
   including queue time, and build fingerprints on every tool response.
 - Add price/location/title exclusions and conservative PCIe/SXM/bare-card filters to search. Normalize

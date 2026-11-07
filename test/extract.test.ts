@@ -34,12 +34,124 @@ test('searchListings carries the seller trust signals a card already prints', ()
   const cards = searchListings(payload);
   assert.equal(cards.length, 1);
   const ex = cards[0]._ex;
-  assert.deepEqual([ex.seller_id, ex.seller_reviews, ex.seller_positive_rate, ex.seller_credit, ex.seller_identity, ex.seller_hidden], ['SID==', '663', '73', '极好', '实名认证', false]);
+  // The card's "好评率73%" is the site's recent label, NOT the seller's lifetime rate (the same seller
+  // answered 99% on the detail API). It is published under a name that says which metric it is.
+  assert.deepEqual([ex.seller_id, ex.seller_card_reviews, ex.seller_card_good_rate, ex.seller_credit, ex.seller_identity, ex.seller_hidden], ['SID==', '663', '73', '极好', '实名认证', false]);
   const row = FEED_NORMALIZE_JS({ rows: cards })[0];
-  assert.deepEqual([row.seller_id, row.seller_reviews, row.seller_positive_rate, row.seller_credit, row.seller_identity, row.seller_hidden], ['SID==', '663', '73', '极好', '实名认证', false]);
+  assert.deepEqual([row.seller_id, row.seller_card_reviews, row.seller_card_good_rate, row.seller_credit, row.seller_identity, row.seller_hidden], ['SID==', '663', '73', '极好', '实名认证', false]);
+  // The lifetime-rate names belong to the detail route; a card must not fill them with its own label.
+  assert.equal('seller_positive_rate' in row, false);
+  assert.equal('seller_reviews' in row, false);
+  assert.equal(enrichListing(row).typed.seller_stats, null, 'the typed seller stats are the profile\'s, and a card has none');
   // Signals the card did not print stay empty rather than being invented.
   const bare = searchListings({ resultList: [{ data: { item: { main: { clickParam: { args: { item_id: '43', price: '1' } }, exContent: { detailParams: { itemId: '43' }, userNickName: 'x' } } } } }] })[0];
-  assert.deepEqual([bare._ex.seller_id, bare._ex.seller_reviews, bare._ex.seller_positive_rate, bare._ex.seller_credit], ['', '', '', '']);
+  assert.deepEqual([bare._ex.seller_id, bare._ex.seller_card_reviews, bare._ex.seller_card_good_rate, bare._ex.seller_credit], ['', '', '', '']);
+});
+
+test('the card good-rate and the lifetime good-rate never share a name', () => {
+  // Verified against the same seller: the card's shop label said 73% over 663 reviews while the
+  // detail record said 99% after 2071 sales. Publishing the card figure as `seller_positive_rate`
+  // made a buyer compare two different metrics without knowing it.
+  const detail = detailListing({
+    itemDO: { itemId: '1083923766396', title: 't', soldPrice: '88' },
+    sellerDO: { nick: 'x', sellerId: '2200778316916', newGoodRatioRate: '99%', replyRatio24h: '低于50', userRegDay: 730, hasSoldNumInteger: 2071, zhimaAuth: true },
+  }, '1083923766396');
+  assert.ok(detail);
+  assert.equal(detail.seller_good_rate, 99, 'the lifetime rate as a number');
+  assert.equal(detail.seller_positive_rate, '99', 'the legacy name still works, as the lifetime rate');
+  assert.equal(detail.seller_reply_rate_24h, null, '"低于50" is not a number');
+  assert.equal(detail.seller_reply_rate_24h_raw, '低于50', 'the site\'s own words survive beside the null');
+  assert.equal(detail.seller_user_id, 2200778316916, 'the numeric seller id is what the seller tools take');
+  assert.equal('seller_id' in detail, false, 'the opaque card id must not be overwritten by a numeric one under the same name');
+  // A reply rate the site really stated is a number, and the raw field is not published twice.
+  const numeric = detailListing({ itemDO: { itemId: '2' }, sellerDO: { replyRatio24h: '97%', newGoodRatioRate: '80%' } }, '2');
+  assert.equal(numeric.seller_reply_rate_24h, 97);
+  assert.equal('seller_reply_rate_24h_raw' in numeric, false);
+  // Absent is absent: neither metric is invented from the other, and no rate becomes a zero.
+  const bare = detailListing({ itemDO: { itemId: '3' }, sellerDO: {} }, '3');
+  assert.equal(bare.seller_good_rate, null);
+  assert.equal(bare.seller_reply_rate_24h, null);
+  assert.equal(bare.seller_user_id, null);
+});
+
+test('a card\'s want count comes from the tag strip when the numeric field is a placeholder', () => {
+  // Verified on item 1083923766396: `clickParam.args.wantNum` and `exContent.want` both carry the
+  // placeholder "0"/empty, and the only real count is the "13人想要" tag. Publishing that zero as the
+  // want count made every card look unwanted.
+  const card = (wantNum: string, want: string, tags: string[]): any => searchListings({ resultList: [{ data: { item: { main: {
+    clickParam: { args: { item_id: '1083923766396', price: '88', wantNum } },
+    exContent: {
+      detailParams: { itemId: '1083923766396', title: 'x' },
+      ...(want ? { want } : {}),
+      ...(tags.length ? { fishTags: { r2: { tagList: tags.map((c) => ({ data: { content: c } })) } } } : {}),
+    },
+  } } } }] })[0];
+  const want = (c: any) => FEED_NORMALIZE_JS({ rows: [c] })[0].want_count;
+  assert.equal(want(card('0', '', ['13人想要', '验货宝'])), '13');
+  // "1.2万人想要" is a displayed magnitude, not a literal 1.2.
+  assert.equal(want(card('0', '', ['1.2万人想要'])), '12000');
+  assert.equal(want(card('', '', ['3人想要'])), '3');
+  // A real number wins over the prose it prints beside.
+  assert.equal(want(card('7', '', ['13人想要'])), '7');
+  assert.equal(want(card('', '9', [])), '9', 'exContent.want is read through the same rule');
+  // Nothing stated is nothing -- not a placeholder zero.
+  assert.equal(want(card('0', '', [])), '');
+  assert.equal(want(card('', '', [])), '');
+  // ... and the typed block must not turn that absence into a zero either.
+  assert.equal(enrichListing(FEED_NORMALIZE_JS({ rows: [card('0', '', [])] })[0]).typed.want_count, null);
+});
+
+test('the tag strip is split into condition, badges, price drop and attributes -- and nothing invented', () => {
+  // A search card's strip mixes five kinds of statement in one array. Each is published under the name
+  // that says what it is, while the raw `tags` array is kept for compatibility.
+  const row = enrichListing(FEED_NORMALIZE_JS({ rows: [{
+    detailParams: { itemId: '1083923766396', title: '联想 Thinkpad X220 笔记本', soldPrice: '329' },
+    attributeMap: { wantNum: '0' },
+    _ex: { tags: ['验货宝', '包邮', '累计降价12%', '13人想要', '轻微磕碰划痕', 'Lenovo/联想', '8GB', '卖家信用极好'] },
+  }] })[0]);
+  assert.deepEqual(row.badges, ['验货宝', '卖家信用极好']);
+  assert.deepEqual(row.price_drop, { percent: 12 });
+  assert.equal(row.condition, '轻微磕碰划痕');
+  assert.deepEqual(row.attributes, { brand: 'Lenovo/联想', capacity: '8GB' });
+  assert.deepEqual(row.tags, ['验货宝', '包邮', '累计降价12%', '13人想要', '轻微磕碰划痕', 'Lenovo/联想', '8GB', '卖家信用极好'], 'the raw strip is kept');
+  // The typed block reads the condition the card really stated, whichever field carried it.
+  assert.equal(row.typed.condition, '轻微磕碰划痕');
+  // A stated flat condition beats the tag's, and the tag does not get a second life as a badge.
+  assert.equal(enrichListing({ tags: ['几乎全新'], condition: '明显使用痕迹' }).condition, '明显使用痕迹');
+  // Both price-drop wordings, published as the statement they make rather than a guessed percentage.
+  assert.deepEqual(enrichListing({ tags: ['11小时前降价'] }).price_drop, { when: '11小时前' });
+  assert.deepEqual(enrichListing({ tags: ['22天内降价'] }).price_drop, { when: '22天内' });
+  // Nothing coercible: a tag the rules do not recognise is left in `tags` rather than filed under a
+  // bucket that would be a guess.
+  const unknown = enrichListing({ tags: ['满199减20'] });
+  for (const k of ['badges', 'price_drop', 'attributes', 'condition']) assert.equal(k in unknown, false, k);
+  const empty = enrichListing({ tags: [] });
+  for (const k of ['badges', 'price_drop', 'attributes']) assert.equal(k in empty, false, k);
+});
+
+test('shipping evidence on a card comes from its tags or title, with its source, never from nothing', () => {
+  const card = (tags: string[], title: string) => enrichListing({ item_id: 'x', title, tags });
+  assert.deepEqual([card(['包邮'], 't').free_shipping, card(['包邮'], 't').shipping_source], [true, 'tag']);
+  for (const tag of ['不包邮', '邮费另算', '到付']) {
+    assert.deepEqual([card([tag], 't').free_shipping, card([tag], 't').shipping_source], [false, 'tag'], tag);
+  }
+  // The title is evidence too, and says so: "不包邮" must not be read as "包邮" just because it ends in it.
+  assert.deepEqual([card([], '显卡 包邮').free_shipping, card([], '显卡 包邮').shipping_source], [true, 'title']);
+  assert.equal(card([], '显卡 不包邮').free_shipping, false);
+  // A tag strip is the more structured source, so it wins over the title when the two disagree.
+  assert.equal(card(['包邮'], '显卡 到付').free_shipping, true);
+  // No evidence at all is absent, not false: a listing whose shipping nobody stated is not a paid one.
+  const none = card([], '显卡');
+  assert.equal('free_shipping' in none, false);
+  assert.equal('shipping_source' in none, false);
+  // The detail route already knows the exact fee; its answer is not re-derived from a tag.
+  const detail = enrichListing({ item_id: 'x', title: 't', tags: ['包邮'], shipping_fee: '20', free_shipping: false, shipping_source: 'detail' });
+  assert.deepEqual([detail.free_shipping, detail.shipping_source], [false, 'detail']);
+  // ... and the detail normaliser is where that exact fee becomes a boolean.
+  const paid = detailListing({ itemDO: { itemId: '42', transportFee: '20' }, sellerDO: {} }, '42');
+  assert.deepEqual([paid.shipping_fee, paid.free_shipping, paid.shipping_source], ['20', false, 'detail']);
+  const free = detailListing({ itemDO: { itemId: '42', transportFee: '0.00' }, sellerDO: {} }, '42');
+  assert.deepEqual([free.shipping_fee, free.free_shipping, free.shipping_source], ['0.00', true, 'detail']);
 });
 
 test('the mtop wrapper reports "not ready" instead of throwing, and keeps goofish\'s own ret code', async () => {
@@ -134,9 +246,9 @@ test('the typed block reads a listing as types, and `missing` names every value 
   // else is a null in the block and a name in the list -- never inferred from a sibling, because the
   // one thing this server will not do is publish a field it did not read.
   const card = enrichListing(FEED_NORMALIZE_JS({ rows: [{ cardData: { detailParams: { itemId: '111', title: 'A', soldPrice: '12.5', userNick: 'sellerA' }, attributeMap: { wantNum: 0, city: '杭州' } } }] })[0]);
-  assert.deepEqual(card.typed, { price_amount: 12.5, original_price_amount: null, image_count: null, want_count: 0, view_count: null, collect_count: null, condition: null,
+  assert.deepEqual(card.typed, { price_amount: 12.5, original_price_amount: null, image_count: null, want_count: null, view_count: null, collect_count: null, condition: null,
     published_at: null, updated_at: null, location: { province: null, city: '杭州' }, shipping: null, seller_stats: null });
-  assert.deepEqual(card.missing, ['original_price_amount', 'image_count', 'view_count', 'collect_count', 'condition', 'published_at', 'updated_at', 'location.province', 'shipping', 'seller_stats']);
+  assert.deepEqual(card.missing, ['original_price_amount', 'image_count', 'want_count', 'view_count', 'collect_count', 'condition', 'published_at', 'updated_at', 'location.province', 'shipping', 'seller_stats']);
   assert.ok(card.missing.includes('location.province') && !card.missing.includes('location.city'),
     'the city was read, so only the province is absent -- the list is per-leaf, not per-object');
 
@@ -150,7 +262,7 @@ test('the typed block reads a listing as types, and `missing` names every value 
   // The strings are untouched. This is the whole reason the block sits beside them rather than
   // replacing them: a field that changes type under an existing caller is a breaking change.
   assert.equal(card.price, '12.5');
-  assert.equal(card.want_count, '0');
+  assert.equal(card.want_count, '', 'wantNum 0 is the placeholder, not a count');
   assert.equal(card.city, '杭州');
   assert.deepEqual(Object.keys(card).filter((k) => k === 'typed' || k === 'missing'), ['typed', 'missing']);
   // and the block never invents a province out of a city, which is the tempting one

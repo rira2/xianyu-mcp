@@ -51,28 +51,91 @@ const percentile = (sorted: number[], q: number): number => {
 };
 const round2 = (value: number): number => Math.round(value * 100) / 100;
 
+/** The title length a compact card defaults to, and the range a caller may ask for. */
+export const DEFAULT_TITLE_MAX_LEN = 120;
+export const TITLE_MAX_LEN_FLOOR = 40;
+export const TITLE_MAX_LEN_CEILING = 500;
+
+/** Clamp a requested title length: 0 keeps the whole title, anything else is held to 40..500. */
+export const titleMaxLenOf = (value: unknown): number => {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(TITLE_MAX_LEN_CEILING, Math.max(TITLE_MAX_LEN_FLOOR, Math.trunc(n)));
+};
+
 /**
  * One listing as a deal scan keeps it: what it is, what it costs, where it is, how wanted it is, who
  * sells it and how to open it. `price_amount` rides along only when the typed block has one, so an
- * unreadable price stays absent rather than becoming a zero. `tags` and `publish_time` are optional
- * because their absence is the common case, and an empty `tags` array would spend bytes saying nothing.
+ * unreadable price stays absent rather than becoming a zero. The same rule governs every optional
+ * block: a field absent from the site stays absent here rather than arriving as a zero or a false.
+ *
+ * Two things are shaping rather than data. `title` is truncated to `titleMaxLen` (default 120, 0 for
+ * the whole thing) because a search card's title genuinely carries the seller's description/SEO spam
+ * -- measured at 300+ characters -- while `title_len` preserves the original length so nothing
+ * silently reads as a short title. And the numeric twins (`price_amount`, `want_count_num`, the seller
+ * rates) exist because a compact card has no `typed` block to read numbers from; the raw strings stay
+ * beside them.
+ *
+ * Seller rates are published under names that say which metric they are: `seller_card_good_rate` /
+ * `seller_card_reviews` came off the card's shop label, and `seller_good_rate` / `seller_positive_rate`
+ * are the lifetime figures a detail read carries. They are different numbers for the same seller and
+ * must never share a name.
  */
-export const compactItem = (item: any): any => {
-  const amount = priceAmountOf(item), positiveRate = numOrNull(item?.seller_positive_rate), reviews = numOrNull(item?.seller_reviews);
+export const compactItem = (item: any, opts: { titleMaxLen?: number } = {}): any => {
+  const amount = priceAmountOf(item);
+  const title = typeof item?.title === 'string' ? item.title : String(item?.title ?? '');
+  const titleChars = Array.from(title);
+  const titleMax = opts.titleMaxLen === undefined ? DEFAULT_TITLE_MAX_LEN : titleMaxLenOf(opts.titleMaxLen);
+  const cardGood = numOrNull(item?.seller_card_good_rate), cardReviews = numOrNull(item?.seller_card_reviews);
+  const goodRate = numOrNull(item?.seller_good_rate), lifetime = numOrNull(item?.seller_positive_rate);
+  const reply = numOrNull(item?.seller_reply_rate_24h), replyRaw = typeof item?.seller_reply_rate_24h_raw === 'string' ? item.seller_reply_rate_24h_raw : '';
+  const sold = numOrNull(item?.seller_items_sold), tenure = numOrNull(item?.seller_tenure_years);
+  const user = numOrNull(item?.seller_user_id);
+  const quantity = numOrNull(item?.quantity), fee = numOrNull(item?.shipping_fee), wants = numOrNull(item?.want_count);
   return {
-    item_id: item?.item_id, rank: item?.rank, title: item?.title, price: item?.price,
+    item_id: item?.item_id, rank: item?.rank,
+    title: titleMax === 0 ? title : titleChars.slice(0, titleMax).join(''), title_len: titleChars.length,
+    price: item?.price,
     ...(amount === null ? {} : { price_amount: amount }),
-    city: item?.city, want_count: item?.want_count, seller: item?.seller, url: item?.url,
-    // The seller's trust signals, when the card printed them: reviews/positive rate, credit label,
-    // the seller id (group listings by seller across queries), and a hidden-profile flag. Absent when
-    // the site did not send them -- the same rule as price_amount.
+    city: item?.city, want_count: item?.want_count,
+    ...(wants === null ? {} : { want_count_num: wants }),
+    seller: item?.seller, url: item?.url,
+    // Card-derived trust signals: the opaque seller id (group listings by seller across queries), the
+    // site's recent good-rate label, the shop label, and profile flags. Absent when not sent.
     ...(item?.seller_id ? { seller_id: item.seller_id } : {}),
-    ...(positiveRate === null ? {} : { seller_positive_rate: positiveRate }),
-    ...(reviews === null ? {} : { seller_reviews: reviews }),
+    ...(cardGood === null ? {} : { seller_card_good_rate: cardGood }),
+    ...(cardReviews === null ? {} : { seller_card_reviews: cardReviews }),
     ...(item?.seller_credit ? { seller_credit: item.seller_credit } : {}),
     ...(item?.seller_identity ? { seller_identity: item.seller_identity } : {}),
+    ...(item?.seller_shop ? { seller_shop: true } : {}),
     ...(item?.seller_hidden ? { seller_hidden: true } : {}),
+    // Detail-derived: the lifetime rate (`seller_positive_rate` is the legacy name for it), the reply
+    // rate (null when the site printed a floor, with the raw words beside it), the numeric seller id
+    // and the standing counts. `seller_card_*` above is never filled from these.
+    ...(goodRate === null ? {} : { seller_good_rate: goodRate }),
+    ...(lifetime === null ? {} : { seller_positive_rate: lifetime }),
+    ...(reply !== null ? { seller_reply_rate_24h: reply } : replyRaw ? { seller_reply_rate_24h: null } : {}),
+    ...(replyRaw ? { seller_reply_rate_24h_raw: replyRaw } : {}),
+    ...(user === null ? {} : { seller_user_id: user }),
+    ...(sold === null ? {} : { seller_items_sold: sold }),
+    ...(tenure === null ? {} : { seller_tenure_years: tenure }),
+    ...(item?.seller_zhima_verified === true ? { seller_zhima_verified: true } : {}),
+    // Detail-only listing facts: the search payload never carries them, so a card that was not
+    // deepened omits both rather than reporting a quantity of zero.
+    ...(quantity === null ? {} : { quantity }),
+    ...(item?.item_status ? { item_status: String(item.item_status) } : {}),
+    ...(item?.item_status_token ? { item_status_token: item.item_status_token } : {}),
+    // Shipping: the evidence a card can support (tag/title, with `shipping_source` saying which) and
+    // the exact fee when the detail read had one.
+    ...(typeof item?.free_shipping === 'boolean' ? { free_shipping: item.free_shipping } : {}),
+    ...(item?.shipping_source ? { shipping_source: item.shipping_source } : {}),
+    ...(fee === null ? {} : { shipping_fee: fee }),
+    // The tag strip, kept raw for compatibility, and the facts it was split into.
     ...(Array.isArray(item?.tags) && item.tags.length ? { tags: item.tags } : {}),
+    ...(item?.condition ? { condition: item.condition } : {}),
+    ...(Array.isArray(item?.badges) && item.badges.length ? { badges: item.badges } : {}),
+    ...(item?.price_drop ? { price_drop: item.price_drop } : {}),
+    ...(item?.attributes && Object.keys(item.attributes).length ? { attributes: item.attributes } : {}),
     ...(item?.publish_time ? { publish_time: item.publish_time } : {}),
   };
 };
@@ -122,7 +185,7 @@ export const sortItems = (items: any[], sort: SortMode): any[] => {
  * sampled titles inside `diagnostics` -- and says so with `compact: true`. Everything else, including
  * `count`, `next_cursor` and `freshness`, is passed through untouched.
  */
-export const shapeSearchData = (data: Record<string, any>, opts: { compact?: boolean; sort?: SortMode }): Record<string, any> => {
+export const shapeSearchData = (data: Record<string, any>, opts: { compact?: boolean; sort?: SortMode; titleMaxLen?: number }): Record<string, any> => {
   const out: Record<string, any> = { ...data };
   const items = Array.isArray(data.items) ? data.items : [];
   const sort = opts.sort ?? 'relevance';
@@ -130,7 +193,7 @@ export const shapeSearchData = (data: Record<string, any>, opts: { compact?: boo
   if (sort !== 'relevance' && Array.isArray(data.items)) out.items = sortItems(items, sort);
   if (!opts.compact) return out;
   out.compact = true;
-  if (Array.isArray(out.items)) out.items = out.items.map(compactItem);
+  if (Array.isArray(out.items)) out.items = out.items.map((item) => compactItem(item, { titleMaxLen: opts.titleMaxLen }));
   delete out.attempt_log;
   if (out.diagnostics && typeof out.diagnostics === 'object' && !Array.isArray(out.diagnostics)) {
     const diagnostics = { ...out.diagnostics };

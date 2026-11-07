@@ -38,6 +38,8 @@ export type BatchQuery = {
 };
 export type BatchArgs = {
   queries: BatchQuery[]; compact?: boolean; sort?: 'relevance' | 'price_asc' | 'price_desc' | 'newest';
+  /** How much of each compact card's title to keep (see `output.ts`): 0 for the whole title. */
+  title_max_len?: number;
   timeout_s?: number; attempts?: number; per_query_timeout_s?: number;
   /** The tool's novelty filter. `runBatch` never reads it: history is process state and the rows'
    *  items are already shaped, so `tools.ts` annotates the finished envelope (`annotateBatchData`)
@@ -96,8 +98,8 @@ const skippedRow = (index: number, query: string, cause: SkipCause, wait: number
 };
 
 /** What one answered query publishes: the route and depth it cost, and the listings it kept. */
-const answeredRow = (index: number, query: string, data: Record<string, any>, ms: number, compact: boolean, sort: BatchArgs['sort']): Record<string, any> => {
-  const shaped = shapeSearchData(data, { compact, sort });
+const answeredRow = (index: number, query: string, data: Record<string, any>, ms: number, compact: boolean, sort: BatchArgs['sort'], titleMaxLen?: number): Record<string, any> => {
+  const shaped = shapeSearchData(data, { compact, sort, titleMaxLen });
   const items = Array.isArray(shaped.items) ? shaped.items : [];
   return {
     index, query, ok: true,
@@ -119,14 +121,14 @@ const answeredRow = (index: number, query: string, data: Record<string, any>, ms
  *  failure details stay flat so a caller can act on `retryable` / `retry_after_s` without opening
  *  anything. Cards the failing search had already validated (`e.partial`) are kept: they were paid
  *  for, and the tool envelope keeps them on a deadline too. */
-const failedRow = (index: number, query: string, e: unknown, ms: number, compact: boolean, sort: BatchArgs['sort']): Record<string, any> => {
+const failedRow = (index: number, query: string, e: unknown, ms: number, compact: boolean, sort: BatchArgs['sort'], titleMaxLen?: number): Record<string, any> => {
   const { error_type, message } = describe(e);
   // The same classifier the tool envelope uses, so a refusal that carries no explicit details is
   // named the way the envelope would name it instead of reading as an anonymous error.
   const details = failureDetails(e);
   let partial: any;
   try { partial = (e as any)?.partial; } catch { /* an opaque throw is still a row */ }
-  const kept = partial && Array.isArray(partial.items) ? shapeSearchData(partial, { compact, sort }) : null;
+  const kept = partial && Array.isArray(partial.items) ? shapeSearchData(partial, { compact, sort, titleMaxLen }) : null;
   const items = kept && Array.isArray(kept.items) ? kept.items : [];
   const reason = typeof details.reason === 'string' ? details.reason : undefined;
   return {
@@ -157,7 +159,7 @@ export const runBatch = async (args: BatchArgs, searchOne: SearchOne, opts: { de
   // a script), and "zero queries" would otherwise be a successful empty batch that costs the site
   // nothing and tells the caller nothing.
   if (!asked.length) throw new XianyuError('queries must not be empty: give 1-20 query objects, each with at least a query string');
-  const compact = args.compact ?? true, sort = args.sort ?? 'relevance';
+  const compact = args.compact ?? true, sort = args.sort ?? 'relevance', titleMaxLen = args.title_max_len;
   const attempts = args.attempts ?? BATCH_ATTEMPTS, perQueryS = args.per_query_timeout_s ?? PER_QUERY_TIMEOUT_S;
   const started = Date.now(), rows: Record<string, any>[] = [];
   let stopCause: SkipCause | null = null;
@@ -197,9 +199,9 @@ export const runBatch = async (args: BatchArgs, searchOne: SearchOne, opts: { de
     const at = Date.now();
     let row: Record<string, any>;
     try {
-      row = answeredRow(index, query, await searchOne({ query, pages, limit, detail, topup_pages, attempts, timeout_s, ...filters }), Date.now() - at, compact, sort);
+      row = answeredRow(index, query, await searchOne({ query, pages, limit, detail, topup_pages, attempts, timeout_s, ...filters }), Date.now() - at, compact, sort, titleMaxLen);
     } catch (e) {
-      row = failedRow(index, query, e, Date.now() - at, compact, sort);
+      row = failedRow(index, query, e, Date.now() - at, compact, sort, titleMaxLen);
     }
     rows.push(row);
     // A query that ran into Goofish's throttle is the one signal a batch must not swallow into a row

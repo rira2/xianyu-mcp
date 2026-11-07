@@ -45,8 +45,8 @@ test('compactItem keeps exactly the deal fields and stays under a third of the f
   const full = card();
   const compact = compactItem(full);
   assert.deepEqual(compact, {
-    item_id: '856961429564', rank: 1, title: '联想Thinkpad X220 笔记本电脑 i5 2520M 9成新',
-    price: '329', price_amount: 329, city: '北京', want_count: '5', seller: '卖家',
+    item_id: '856961429564', rank: 1, title: '联想Thinkpad X220 笔记本电脑 i5 2520M 9成新', title_len: Array.from(full.title).length,
+    price: '329', price_amount: 329, city: '北京', want_count: '5', want_count_num: 5, seller: '卖家',
     url: 'https://www.goofish.com/item?id=856961429564', tags: ['包邮', '验货宝'], publish_time: '1784640276000',
   });
   // The four blocks that make a card expensive: the typed view, the price decomposition, the title
@@ -60,17 +60,74 @@ test('compactItem carries tags and publish_time only when the card has them', ()
   assert.deepEqual(compactItem(card()).tags, ['包邮', '验货宝']);
   assert.equal(compactItem(card()).publish_time, '1784640276000');
   const bare = compactItem(card({ tags: [], publish_time: '' }));
-  assert.deepEqual(Object.keys(bare).sort(), ['city', 'item_id', 'price', 'price_amount', 'rank', 'seller', 'title', 'url', 'want_count']);
+  assert.deepEqual(Object.keys(bare).sort(), ['city', 'item_id', 'price', 'price_amount', 'rank', 'seller', 'title', 'title_len', 'url', 'want_count', 'want_count_num']);
 });
 
 test('compactItem carries the seller trust signals only when the card has them', () => {
-  const withSeller = compactItem(card({ seller_id: 'SID==', seller_reviews: '663', seller_positive_rate: '73', seller_credit: '极好', seller_identity: '实名认证' }));
+  // Card-derived: the site's recent label under a name that says so, plus the opaque card seller id.
+  const withCard = compactItem(card({ seller_id: 'SID==', seller_card_reviews: '663', seller_card_good_rate: '73', seller_credit: '极好', seller_identity: '实名认证', seller_shop: true }));
   assert.deepEqual(
-    [withSeller.seller_id, withSeller.seller_reviews, withSeller.seller_positive_rate, withSeller.seller_credit, withSeller.seller_identity],
-    ['SID==', 663, 73, '极好', '实名认证']);
+    [withCard.seller_id, withCard.seller_card_reviews, withCard.seller_card_good_rate, withCard.seller_credit, withCard.seller_identity, withCard.seller_shop],
+    ['SID==', 663, 73, '极好', '实名认证', true]);
+  assert.equal('seller_positive_rate' in withCard, false, 'a card label is never published as the lifetime rate');
+  // Detail-derived: the lifetime rate, the reply floor, the numeric seller id and the standing numbers.
+  const withDetail = compactItem(card({
+    seller_good_rate: 99, seller_positive_rate: '99', seller_reply_rate_24h: null, seller_reply_rate_24h_raw: '低于50',
+    seller_user_id: 2200778316916, seller_items_sold: '2071', seller_tenure_years: '6', seller_zhima_verified: true,
+  }));
+  assert.deepEqual(
+    [withDetail.seller_good_rate, withDetail.seller_positive_rate, withDetail.seller_reply_rate_24h, withDetail.seller_reply_rate_24h_raw, withDetail.seller_user_id, withDetail.seller_items_sold, withDetail.seller_tenure_years, withDetail.seller_zhima_verified],
+    [99, 99, null, '低于50', 2200778316916, 2071, 6, true]);
+  assert.equal('seller_card_good_rate' in withDetail, false, 'and the card label is not a lifetime rate');
   const bare = compactItem(card());
-  for (const k of ['seller_id', 'seller_reviews', 'seller_positive_rate', 'seller_credit', 'seller_identity', 'seller_hidden']) assert.equal(k in bare, false, k);
+  for (const k of ['seller_id', 'seller_card_reviews', 'seller_card_good_rate', 'seller_positive_rate', 'seller_good_rate', 'seller_credit', 'seller_identity', 'seller_hidden', 'seller_shop', 'seller_user_id', 'seller_items_sold', 'seller_tenure_years', 'seller_zhima_verified', 'seller_reply_rate_24h']) assert.equal(k in bare, false, k);
   assert.equal(compactItem(card({ seller_hidden: true })).seller_hidden, true);
+});
+
+test('compactItem carries quantity and item_status when a detail read supplied them', () => {
+  const detailed = compactItem(card({ quantity: '1', item_status: '在线', item_status_token: 'online' }));
+  assert.deepEqual([detailed.quantity, detailed.item_status, detailed.item_status_token], [1, '在线', 'online']);
+  // A card the detail read never reached has neither: the search payload does not carry them.
+  const bare = compactItem(card());
+  for (const k of ['quantity', 'item_status', 'item_status_token']) assert.equal(k in bare, false, k);
+});
+
+test('compactItem carries shipping evidence, and the exact fee when the detail read has one', () => {
+  const tagged = compactItem(card({ free_shipping: false, shipping_source: 'tag' }));
+  assert.deepEqual([tagged.free_shipping, tagged.shipping_source], [false, 'tag']);
+  const detailed = compactItem(card({ free_shipping: false, shipping_source: 'detail', shipping_fee: '20' }));
+  assert.deepEqual([detailed.free_shipping, detailed.shipping_source, detailed.shipping_fee], [false, 'detail', 20]);
+  const unknown = compactItem(card({ free_shipping: null }));
+  for (const k of ['free_shipping', 'shipping_source', 'shipping_fee']) assert.equal(k in unknown, false, k);
+});
+
+test('compactItem carries the tag facts the card stated', () => {
+  const out = compactItem(card({ badges: ['验货宝'], price_drop: { percent: 12 }, attributes: { brand: 'Lenovo/联想', capacity: '8GB' }, condition: '轻微磕碰划痕' }));
+  assert.deepEqual(out.badges, ['验货宝']);
+  assert.deepEqual(out.price_drop, { percent: 12 });
+  assert.deepEqual(out.attributes, { brand: 'Lenovo/联想', capacity: '8GB' });
+  assert.equal(out.condition, '轻微磕碰划痕');
+  // Every one of them stays absent when the card did not state it.
+  const empty = compactItem(card({ tags: [], badges: [], price_drop: null, attributes: {}, condition: '' }));
+  for (const k of ['badges', 'price_drop', 'attributes', 'condition']) assert.equal(k in empty, false, k);
+});
+
+test('compactItem truncates a spam title at 120 characters and says how long it really was', () => {
+  // Search-card titles really do carry the seller's description: 300 characters is not hypothetical.
+  const long = '联想X220'.repeat(43);   // 301 characters
+  const full = card({ title: long });
+  const compact = compactItem(full);
+  assert.equal(compact.title_len, Array.from(long).length);
+  assert.equal(Array.from(compact.title).length, 120);
+  assert.ok(long.startsWith(compact.title), 'the truncation is a prefix, not a rewrite');
+  assert.equal(full.title, long, 'the full card keeps the raw title: matching and filtering read it');
+  // A configured length is honoured between 40 and 500; 0 means the whole title.
+  assert.deepEqual([Array.from(compactItem(card({ title: long }), { titleMaxLen: 40 }).title).length, compactItem(card({ title: long }), { titleMaxLen: 0 }).title],
+    [40, long]);
+  // The floor and the ceiling are real: a 10 is raised to 40, a 900 is capped at 500.
+  const huge = '字'.repeat(900);
+  assert.equal(Array.from(compactItem(card({ title: huge }), { titleMaxLen: 10 }).title).length, 40);
+  assert.equal(Array.from(compactItem(card({ title: huge }), { titleMaxLen: 900 }).title).length, 500);
 });
 
 test('compactItem publishes a price amount only when the typed block has one', () => {
@@ -160,6 +217,15 @@ test('shapeSearchData with no options is additive: the full cards stay and price
   assert.deepEqual(out.attempt_log, input.attempt_log);
   assert.equal(out.items[0].typed.price_amount, 329, 'the full card is what a non-compact caller keeps paying for');
   assert.deepEqual(out.price_stats, priceStats(input.items));
+});
+
+test('shapeSearchData passes title_max_len through to compact cards only', () => {
+  const data = { ...envelope(), items: [card({ title: '字'.repeat(300) })] };
+  const compact = shapeSearchData(data, { compact: true, titleMaxLen: 10 });
+  assert.equal(Array.from(compact.items[0].title).length, 40, 'below the floor is raised to it');
+  assert.equal(compact.items[0].title_len, 300);
+  const full = shapeSearchData(data, { compact: false, titleMaxLen: 10 });
+  assert.equal(full.items[0].title, '字'.repeat(300), 'a full card is never truncated');
 });
 
 test('shapeSearchData sorts before it compacts, so newest still has the timestamp to sort on', () => {

@@ -246,14 +246,14 @@ test('the published argument names and defaults are exactly these', () => {
     browse_feed: { page_number: 1, pages: 1, limit: 60 },
     search_count: { query: '<required>' },
     search_suggest: { query: '<required>', limit: 20 },
-    search_items: { query: '<required>', limit: 120, attempts: 4, pages: 1, topup_pages: 2, detail: 0, timeout_s: '<optional>', expand_synonyms: true, min_price: '<optional>', max_price: '<optional>', city: '<optional>', province: '<optional>', exclude_keywords: '<optional>', form_factor: '<optional>', bare_card_only: '<optional>', cursor: '<optional>', compact: false, sort: 'relevance', new_only: false },
+    search_items: { query: '<required>', limit: 120, attempts: 4, pages: 1, topup_pages: 2, detail: 0, timeout_s: '<optional>', expand_synonyms: true, min_price: '<optional>', max_price: '<optional>', city: '<optional>', province: '<optional>', exclude_keywords: '<optional>', form_factor: '<optional>', bare_card_only: '<optional>', cursor: '<optional>', compact: false, sort: 'relevance', title_max_len: 120, new_only: false },
     // A bulk scan is the one place the depth default is 0: the pages a query asks for are what it
     // pays for, and the top-up exists for a single search's completeness rather than a scan's speed.
     // `queries` publishes as one required array argument even though each element has its own shape.
     // `timeout_s` is optional rather than 180 at parse time so `XIANYU_CALL_TIMEOUT_S` can set the
     // envelope; the 180 default is applied inside `searchBatch` and republished as the tool's
     // `default_timeout_s` (pinned by the search_batch tests).
-    search_batch: { queries: '<required>', compact: true, sort: 'relevance', timeout_s: '<optional>', attempts: 2, per_query_timeout_s: 60, new_only: false },
+    search_batch: { queries: '<required>', compact: true, sort: 'relevance', title_max_len: 120, timeout_s: '<optional>', attempts: 2, per_query_timeout_s: 60, new_only: false },
     related_items: { item_id: '<optional>', limit: 30, page: 1 },
     item_view: { item_id: '<required>' },
     recommendations: { limit: 30, url: '<optional>' },

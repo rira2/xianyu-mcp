@@ -128,11 +128,17 @@ The result appears in both MCP text content and `structuredContent`; failures se
 
 - `success`: a completed response. Listings are in `data.items`.
 - `empty`: confirmed zero returned rows, including cards removed by explicit filters. Inspect
-  `data.empty_reason` and `data.filters`; this does not necessarily mean zero upstream inventory.
+  `data.empty_reason` (`no_inventory` only when the count endpoint measured zero for a query that did
+  answer; `filtered_out` when explicit filters emptied a real set; `no_feed_cards` for the feed) and
+  `data.filters`; this does not necessarily mean zero upstream inventory.
 - `partial`: validated cards survived a later failure or deadline. Inspect `data.stop_reason`,
   `data.next_cursor`, page reports, and retry hints.
 - `error`: no validated result set is available. `data` is null, `count` is 0, and the error and
-  diagnostics identify the failure. **Check status before interpreting count as inventory.**
+  diagnostics identify the failure. A failed search also names why nothing was returned:
+  `diagnostics.empty_reason` is `rejected` when Goofish refused the page, `page_unavailable` when
+  nothing was inspected, or `no_relevant_results` when titles were read and none matched, with
+  `diagnostics.titles_inspected` counting the titles that were actually read. **Check status before
+  interpreting count as inventory.**
 
 `count` counts returned cards or suggestions (0 for non-collection tools); keyword inventory is
 `search_count.data.match_count`. A positive inventory estimate can coexist with an unavailable search.
@@ -151,9 +157,9 @@ their own data.
 | `browse_feed` | `page_number` (1–10000, d1), `pages` (1–25, d1), `limit` (≤500, d60) | `items[]` of `rank, item_id, title, price, original_price, city, seller, want_count, image_count, image_urls, is_video, category_id, url`; `page_reports`, `raw_cards`, `unique_items`, `count`, `source: homepage_feed`. Every item also carries `typed` + `missing`; see [the typed block](#the-typed-block-every-listing-carries) |
 | `search_count` | `query` | `match_count`, `has_matches`, `source: filter_hitnum`. Zero is an answer, not an error, but only when the site said zero: a `hitnum` that is missing, null, a string or carries a thousands separator is a `ParseError`, never `match_count: 0`. |
 | `search_suggest` | `query`, `limit` (d20) | `suggestions[]` of `text, bucket_num`, `total_count`, `count`, `source: search_suggest` |
-| `search_batch` | `queries[]` (1–20; each `query` plus `pages` 1–10 d1, `limit` 1–300 d60, `detail` d0, `topup_pages` d0, and the same filters as `search_items`), `compact` (dtrue), `sort`, `timeout_s` (5–600, d180, bounds the whole list), `attempts` (1–5, d2 per query), `per_query_timeout_s` (10–300, d60), `new_only` (dfalse) | `data.queries[]` of `index, query, ok, status` (`success`/`empty`/`partial`/`error`/`skipped`), `count, ms, source, via, pages_fetched`, `items`, `price_stats`, and on failure `error_type`/`message`/`retryable`/`retry_after_s`/`reason`; `totals` (`requested, ok, empty, partial, failed, skipped, listings, unique_listings, duplicates`, plus `new_listings`/`known_listings`), `failed_queries`, `stop_reason`, `throttle_reason`, `partial`, `history`. One call, one envelope, one failed query does not fail the rest. See [bulk scans](#bulk-scans). |
+| `search_batch` | `queries[]` (1–20; each `query` plus `pages` 1–10 d1, `limit` 1–300 d60, `detail` d0, `topup_pages` d0, and the same filters as `search_items`), `compact` (dtrue), `sort`, `title_max_len` (0 or 40–500, d120), `timeout_s` (5–600, d180, bounds the whole list), `attempts` (1–5, d2 per query), `per_query_timeout_s` (10–300, d60), `new_only` (dfalse) | `data.queries[]` of `index, query, ok, status` (`success`/`empty`/`partial`/`error`/`skipped`), `count, ms, source, via, pages_fetched`, `items`, `price_stats`, and on failure `error_type`/`message`/`retryable`/`retry_after_s`/`reason`; `totals` (`requested, ok, empty, partial, failed, skipped, listings, unique_listings, duplicates`, plus `new_listings`/`known_listings`), `failed_queries`, `stop_reason`, `throttle_reason`, `partial`, `history`. One call, one envelope, one failed query does not fail the rest. See [bulk scans](#bulk-scans). |
 | `seller_profile` | `user_id` **or** `item_id` (exactly one) | `display_name, avatar_url, signature, seller_credit, buyer_credit, level, level_score, praise_ratio, review_count, listings_count, ratings_count, followers, following, verified_real_name, verified_real_person, verified_zhima`, plus `city, tenure_years, items_sold, items_listed, positive_rate, reply_rate_24h, last_active` **only when given an `item_id`**, `profile_url`, `item_id`, `fields_present` / `fields_missing`, and `source`: **`idle_user_page_head`** (given a `user_id`, one mtop call, no page load) or **`item_detail+idle_user_page_head`** (given an `item_id`, one item page load). A seller that does not exist raises `DetailUnavailableError`; a throttle raises `GatedError`. See [seller tools](#the-two-seller-tools). |
-| `seller_items` | `user_id` **or** `item_id` (exactly one), `limit` (d20), `page` (1–50, d1) | `items[]` of `rank, item_id, title, price, category_id, want_count, tags, image_urls, url`, `has_more` (from goofish's own `nextPage` -- walk `page`, do not assume 20), `raw_cards`, `count`, `profile_url`, `source: idle_xyh_item_list`. An empty shop and a page past the end are both `count: 0`, not an error; a payload carrying none of the endpoint's own keys is a `ParseError`. goofish serves at most 50 pages of 20, so walk `has_more` rather than asking for a page number up front. |
+| `seller_items` | `user_id` **or** `item_id` (exactly one), `limit` (d20), `page` (1–50, d1) | `items[]` of `rank, item_id, title, price, category_id, want_count, tags, image_urls, url` (plus the tag facts and shipping evidence it can derive: `condition`, `badges`, `price_drop`, `attributes`, `free_shipping`, `shipping_source`), `has_more` (from goofish's own `nextPage` -- walk `page`, do not assume 20), `raw_cards`, `count`, `profile_url`, `source: idle_xyh_item_list`. An empty shop and a page past the end are both `count: 0`, not an error; a payload carrying none of the endpoint's own keys is a `ParseError`. goofish serves at most 50 pages of 20, so walk `has_more` rather than asking for a page number up front. |
 
 ## Search controls
 
@@ -210,18 +216,72 @@ strings remain compatible; consume `typed.price_amount`, `typed.original_price_a
 approximate (e.g. 1.2万 → 12000), range, negotiable and unknown prices. Prose such as deposits is
 never guessed into a price. Range/negotiable/unknown prices fail a numeric price-band filter.
 
-`compact: true` keeps only the deal fields a scan needs — `item_id`, `rank`, `title`, `price`,
-`price_amount`, `city`, `want_count`, `seller` and `url`, plus `tags` and `publish_time` when the card
-carries them — and the seller's trust signals when the card prints them: `seller_id` (stable id, so
-listings can be grouped by seller across queries), `seller_reviews` and `seller_positive_rate` (from
-the card's "663条评价" / "好评率73%" label), `seller_credit` (e.g. `"极好"` from "卖家信用极好"),
-`seller_identity` (identity label, when shown) and `seller_hidden: true` when the seller hid their
-profile. Absent signals are omitted, never invented; `seller_positive_rate: 0` beside `seller_reviews: 0` is the site's own label for a seller with no reviews yet, not a computed zero. It drops `attempt_log` (the attempt count stays
-in `attempts`) and
-`diagnostics.sample_titles`. `count`, `next_cursor`, `freshness` and the rest of `diagnostics` are
-passed through, and `compact: true` says so in the envelope. It is the same answer in a fraction of
-the bytes; the default (`false`) envelope is unchanged. Compaction happens at the tool boundary, after
-`detail` enrichment and the filter re-checks, so both still read full cards.
+`compact: true` keeps only the deal fields a scan needs — `item_id`, `rank`, `title`, `title_len`,
+`price`, `price_amount`, `city`, `want_count`, `want_count_num`, `seller` and `url` — plus every
+optional fact the card actually carries: `tags`, `publish_time`, the tag facts (`condition`,
+`badges`, `price_drop`, `attributes`), the shipping evidence (`free_shipping`, `shipping_source`,
+`shipping_fee`), and — when a `detail` read reached the card — `quantity`, `item_status`,
+`item_status_token`, `seller_id`, `seller_card_good_rate`, `seller_card_reviews`, `seller_good_rate`,
+`seller_positive_rate`, `seller_reply_rate_24h`, `seller_reply_rate_24h_raw`, `seller_user_id`,
+`seller_tenure_years`, `seller_items_sold`, `seller_zhima_verified`, `seller_credit`,
+`seller_identity`, `seller_shop` and `seller_hidden`. Absent facts are omitted, never invented, and a
+zero is never used for "not reported". `title` is truncated to `title_max_len` (default 120
+characters, `0` keeps the whole title, any other value is held to 40–500) because a search card's
+title genuinely carries the seller's description/SEO spam; `title_len` is the original length, and
+full (non-compact) cards — plus every matching, filtering and detail read — keep the raw title.
+`want_count` stays Goofish's own string (`"13"`), with the numeric `want_count_num` beside it. It
+drops `attempt_log` (the attempt count stays in `attempts`) and `diagnostics.sample_titles`. `count`,
+`next_cursor`, `freshness` and the rest of `diagnostics` are passed through, and `compact: true` says
+so in the envelope. It is the same answer in a fraction of the bytes; the default (`false`) envelope
+is unchanged. Compaction happens at the tool boundary, after `detail` enrichment and the filter
+re-checks, so both still read full cards.
+
+### Where each compact field comes from
+
+A search card and an item detail reply are different records, and this server will not let one answer
+for the other. The table is the contract; the same split is enforced in `compactItem` and in the
+detail merge.
+
+| Compact field | Source | Type / meaning |
+|---|---|---|
+| `item_id`, `rank`, `title`, `price`, `city`, `seller`, `url`, `tags`, `publish_time` | search/feed card | The card's own fields. `title` is raw on a full card and may hold the seller's description. |
+| `price_amount` | card or detail | number; same value as `typed.price_amount`; omitted when no readable price |
+| `want_count` / `want_count_num` | card | `want_count` is the site's string. The numeric `wantNum` field is a placeholder `"0"` on search cards, so the count is read from the `"N人想要"` / `"N万人想要"` tag when the field is empty or zero; both absent when the card states neither. |
+| `condition`, `badges`, `price_drop`, `attributes` | card tag strip | Derived heuristically (see [tag taxonomy](#tag-taxonomy-what-the-strip-says)); `tags` keeps the raw strip. `condition` falls back to the tag only when the flat field is empty. |
+| `free_shipping`, `shipping_source` | card tags/title, or detail | `shipping_source` is `"tag"`, `"title"` or `"detail"`. `包邮` → true; `不包邮`/`邮费另算`/`到付` → false; absent when nothing was stated. The detail API's exact fee overwrites it with `"detail"`. |
+| `shipping_fee` | detail only | number in compact form (legacy raw string on the full card). A search card never carries a fee. |
+| `quantity`, `item_status`, `item_status_token` | detail only | `1` / `"在线"` / `"online"`. Omitted when no `detail` read reached the card. The token maps only labels the site printed (`在线`→`online`, `已下架`→`offline`, `已售出`→`sold`, `交易中`→`reserved`). |
+| `seller_id` (opaque), `seller_card_good_rate`, `seller_card_reviews`, `seller_credit`, `seller_identity`, `seller_shop`, `seller_hidden` | search card | The card's shop label: `"好评率73%"` / `"663条评价"` are the site's **recent card label**, not the seller's lifetime rate. `seller_id` is the opaque card id, usable to group a scan by seller. |
+| `seller_good_rate`, `seller_positive_rate`, `seller_reply_rate_24h`, `seller_reply_rate_24h_raw`, `seller_user_id`, `seller_tenure_years`, `seller_items_sold`, `seller_zhima_verified` | detail | The lifetime profile: `seller_good_rate` is numeric, `seller_positive_rate` is its legacy string twin, and `seller_user_id` is the numeric id `seller_profile` accepts. `seller_reply_rate_24h` is null when the site printed a floor such as `"低于50"`, with the raw words in `seller_reply_rate_24h_raw`. |
+
+> **Renamed in 0.3.0 (two fields, both to stop a lie):** the card's rate moved from
+> `seller_positive_rate` to `seller_card_good_rate`, and its review count from `seller_reviews` to
+> `seller_card_reviews`. `seller_positive_rate` still exists, but now only as the **detail-derived
+> lifetime rate** — one name, one metric. A consumer reading either name can no longer see two
+> different numbers for the same seller.
+
+### Tag taxonomy: what the strip says
+
+A card's tag strip is one array of prose mixing five kinds of statement, and `tags` keeps it exactly as
+sent. The derived fields are a conservative classification — each tag lands in at most one bucket, by
+these ordered rules, and a tag no rule recognises stays in `tags` alone rather than being filed under a
+guess:
+
+- **Want count** — `"N人想要"` / `"N万人想要"` feeds `want_count`; it is not repeated as a badge.
+- **Price drop** — `累计降价12%` → `price_drop: {percent: 12}`; `11小时前降价` /
+  `22天内降价` → `price_drop: {when: "11小时前"}` (the phrase is kept, not converted to a guessed
+  date). No price history is inferred beyond the tag's own words.
+- **Badges** — `验货宝`, `百分百好评`, `卖家信用…`, `买家信用…`, `回复超快`, `严选`, `公益`,
+  `可小刀`.
+- **Condition** — tags that describe wear (`全新`, `几乎全新`, `轻微磕碰划痕`, `明显使用痕迹`,
+  `无第三方维修`, `9成新`, …). A flat `condition` field always wins over the tag.
+- **Attributes** — a brand pair (`Lenovo/联想`, `联想/Lenovo`) as `attributes.brand`, and a storage or
+  memory generation (`8GB`, `512G`, `DDR4`) as `attributes.capacity`. Both are stored verbatim.
+
+`condition`, `badges`, `price_drop` and `attributes` are published on full cards too (every listing
+route that has tags), not only on compact ones. The item detail API's own `品牌/成色/已用年限` block is
+a different, authoritative source: it arrives as `attributes` keyed by property name, and a detail merge
+extends a card's tag-derived attributes rather than erasing them.
 
 `price_stats` is on every `search_items` answer: `count`, `min`, `p10`, `p25`, `median`, `p75`, `p90`,
 `max` and `mean` over `typed.price_amount`, with `currency: "CNY"` — or `null` when no kept listing

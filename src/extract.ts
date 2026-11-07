@@ -252,8 +252,21 @@ export type ListingTyped = {
   shipping: { fee: number | null; free_shipping: boolean | null } | null;
   seller_stats: { tenure_years: number | null; items_sold: number | null; positive_rate: number | null; reply_rate_24h: number | null; zhima_verified: boolean | null } | null;
 };
+/**
+ * The facts a card states about itself outside its fixed fields: the tag strip split into condition,
+ * badges, a price drop and attributes, plus the shipping evidence and the source it came from. Every
+ * member is optional -- a card that stated none of it carries none of these keys.
+ */
+export type ListingDerived = {
+  condition?: string;
+  badges?: string[];
+  price_drop?: { percent: number } | { when: string } | null;
+  attributes?: Record<string, string>;
+  free_shipping?: boolean;
+  shipping_source?: 'tag' | 'title' | 'detail';
+};
 /** A flat listing, the typed view of it, and the leaves of that view the site left out. */
-export type TypedListing<T> = T & { price_info: PriceInfo; typed: ListingTyped; missing: string[] };
+export type TypedListing<T> = T & ListingDerived & { price_info: PriceInfo; typed: ListingTyped; missing: string[] };
 
 /**
  * A number, or null. The site sends numbers as strings and decorates them -- `"1,299"`, `"¥9"`,
@@ -373,15 +386,95 @@ export const missingPaths = (typed: any, prefix = ''): string[] => {
   return Object.entries(typed).flatMap(([k, v]) => missingPaths(v, prefix ? `${prefix}.${k}` : k));
 };
 
+const isRecord = (v: unknown): v is Record<string, any> => Boolean(v) && typeof v === 'object' && !Array.isArray(v);
+
 /**
- * The row plus its typed view and the list of what the site did not render. Applied on this side of
- * the page boundary on purpose: the normalisers inside `FEED_NORMALIZE_JS` cannot close over these,
- * and typing the values there would mean a second copy of the rules to drift.
+ * What a card's tag strip actually states, split into the four kinds of statement it mixes.
+ *
+ * The strip is one array of prose -- "验货宝", "累计降价12%", "13人想要", "轻微磕碰划痕",
+ * "Lenovo/联想", "8GB" -- and a caller deciding whether a listing is worth opening cannot use an
+ * unordered bag of it. Each tag is classified by ordered rules and lands in at most one bucket; a tag
+ * no rule recognises is left in `tags` alone, because filing it under a bucket would be a guess
+ * dressed as data. `condition` here is a heuristic on words this site uses to describe wear, and the
+ * caller's own flat `condition` wins over it where one exists.
+ */
+export type TagFacts = { condition: string; badges: string[]; price_drop: { percent: number } | { when: string } | null; attributes: Record<string, string> };
+const PRICE_DROP_PERCENT = /^累计降价\s*(\d+(?:\.\d+)?)\s*%$/;
+const PRICE_DROP_WHEN = /^(\d+\s*(?:分钟|小时|天|日|周|个月)\s*(?:前|内)?)降价$/;
+const BADGE_TAG = /^(验货宝|百分百好评|回复超快|严选|公益|可小刀)$|^卖家信用|^买家信用/;
+const CONDITION_TAG = /(全新|成新|磕碰|划痕|磨损|使用痕迹|维修|拆修|进水|氧化|瑕疵|缺件|褪色|泛黄)/;
+// A brand tag is the site's "Latin/中文" or "中文/Latin" pair (Lenovo/联想); a capacity tag is a
+// storage size or a memory generation. Both are stored verbatim -- normalising the brand to one half
+// would be inventing which spelling the seller meant.
+const BRAND_PAIR_TAG = /^(?:[A-Za-z][A-Za-z0-9&+.\- ]{0,29}\s*\/\s*[\u4e00-\u9fa5][\u4e00-\u9fa5A-Za-z0-9&+.\- ]{0,29}|[\u4e00-\u9fa5]{2,12}\s*\/\s*[A-Za-z][A-Za-z0-9&+.\- ]{0,29})$/;
+const CAPACITY_TAG = /^(?:\d+(?:\.\d+)?\s*(?:GB|TB|MB|G|T)|DDR\d(?:L|LP)?)$/i;
+export const tagFactsOf = (tags: unknown): TagFacts => {
+  const facts: TagFacts = { condition: '', badges: [], price_drop: null, attributes: {} };
+  for (const raw of Array.isArray(tags) ? tags : []) {
+    const tag = asText(raw);
+    // A want count is a count, not a fact about the item; it is parsed where the count is published.
+    if (!tag || /人想要/.test(tag)) continue;
+    const percent = tag.match(PRICE_DROP_PERCENT);
+    if (percent) { facts.price_drop ??= { percent: Number(percent[1]) }; continue; }
+    const when = tag.match(PRICE_DROP_WHEN);
+    if (when) { facts.price_drop ??= { when: when[1].replace(/\s+/g, '') }; continue; }
+    if (BADGE_TAG.test(tag)) { if (!facts.badges.includes(tag)) facts.badges.push(tag); continue; }
+    if (!facts.condition && CONDITION_TAG.test(tag)) { facts.condition = tag; continue; }
+    if (!facts.attributes.brand && BRAND_PAIR_TAG.test(tag)) { facts.attributes.brand = tag; continue; }
+    if (!facts.attributes.capacity && CAPACITY_TAG.test(tag)) { facts.attributes.capacity = tag; continue; }
+  }
+  return facts;
+};
+
+const SHIPPING_PAID = /不包邮|邮费另算|到付/;
+const SHIPPING_FREE = /包邮/;
+/** Within one source the paid wording wins: "不包邮" contains "包邮", so a free-first test would read
+ *  every paid listing as free. */
+const shippingVerdict = (texts: string[]): boolean | null => {
+  for (const text of texts) if (SHIPPING_PAID.test(text)) return false;
+  for (const text of texts) if (SHIPPING_FREE.test(text)) return true;
+  return null;
+};
+/**
+ * The shipping answer a card can support, and where it came from, or null when it supports none.
+ * The site sends no fee on a search card (verified: only the detail API has `transportFee`), so the
+ * only card evidence is the wording in the tag strip or the title. A tag is the structured source and
+ * wins over the title; a listing that mentioned neither is unknown, never "not free".
+ */
+export const shippingEvidenceOf = (tags: unknown, title: unknown): { free_shipping: boolean; source: 'tag' | 'title' } | null => {
+  const tagged = shippingVerdict((Array.isArray(tags) ? tags : []).map(asText));
+  if (tagged !== null) return { free_shipping: tagged, source: 'tag' };
+  const titled = shippingVerdict([asText(title)]);
+  return titled === null ? null : { free_shipping: titled, source: 'title' };
+};
+
+/**
+ * The row plus its typed view and the list of what the site did not render, plus the facts a card's
+ * own tag strip supports. Applied on this side of the page boundary on purpose: the normalisers inside
+ * `FEED_NORMALIZE_JS` cannot close over these, and typing the values there would mean a second copy of
+ * the rules to drift.
  */
 export const enrichListing = <T extends Record<string, any>>(row: T): TypedListing<T> => {
-  const typed = listingTyped(row);
-  return { ...row, price_info: priceOf(row.price), typed, missing: missingPaths(typed) };
+  const facts = tagFactsOf(row.tags);
+  const condition = asText(row.condition) || facts.condition;
+  // A route that already knows the exact fee (the detail API) has published a boolean; its answer is
+  // not re-derived from a tag that may say something else.
+  const declared = typeof row.free_shipping === 'boolean' ? null : shippingEvidenceOf(row.tags, row.title);
+  const attributes = Object.keys(facts.attributes).length
+    ? { ...facts.attributes, ...(isRecord(row.attributes) ? row.attributes : {}) }
+    : undefined;
+  const merged: Record<string, any> = { ...row, ...(condition ? { condition } : {}), ...(attributes ? { attributes } : {}) };
+  const typed = listingTyped(merged);
+  return { ...merged, price_info: priceOf(merged.price), typed, missing: missingPaths(typed),
+    ...(facts.badges.length ? { badges: facts.badges } : {}),
+    ...(facts.price_drop ? { price_drop: facts.price_drop } : {}),
+    ...(declared ? { free_shipping: declared.free_shipping, shipping_source: declared.source } : {}) } as TypedListing<T>;
 };
+
+/** The short tokens `item_status` can be normalised to. Only labels seen on the site are mapped, and
+ *  an unrecognised one gets no token: a status invented from an unknown string is a fact nobody sent. */
+const ITEM_STATUS_TOKENS: Record<string, string> = { '在线': 'online', '已下架': 'offline', '已售出': 'sold', '交易中': 'reserved' };
+const itemStatusToken = (v: unknown): string => ITEM_STATUS_TOKENS[asText(v)] ?? '';
 
 /**
  * One listing out of the captured `mtop.taobao.idle.pc.detail` payload, or null when the payload is
@@ -416,6 +509,14 @@ export const detailListing = (data: any, wanted: string): any | null => {
     if (k && v) attributes[k] = v;
   }
   const tenure = Number(seller.userRegDay);
+  // The seller's two ratings, kept apart on purpose: `newGoodRatioRate` is the lifetime positive rate
+  // the profile page shows, and the search card's "好评率73%" is a different, recent metric. Both are
+  // numbers under `seller_good_rate`/`seller_positive_rate` here, with the raw string still beside
+  // them because that is what every existing caller reads.
+  const goodRateRaw = asText(seller.newGoodRatioRate).replace('%', '');
+  const replyRateRaw = asText(seller.replyRatio24h).replace('%', '');
+  const replyRate = numberOrNull(replyRateRaw);
+  const shippingFee = firstText(item.transportFee);
   return {
     item_id: id,
     title: asText(item.title),
@@ -427,7 +528,11 @@ export const detailListing = (data: any, wanted: string): any | null => {
     collect_count: countOf(item.collectCnt),
     quantity: countOf(item.quantity),
     item_status: asText(item.itemStatusStr),
-    shipping_fee: firstText(item.transportFee),
+    item_status_token: itemStatusToken(item.itemStatusStr),
+    shipping_fee: shippingFee,
+    // The one route that carries the fee itself; `free_shipping` is derived from it here rather than
+    // from any tag wording. 0.00 is free on this site, and an unreadable fee leaves both absent.
+    ...(numberOrNull(shippingFee) === null ? {} : { free_shipping: numberOrNull(shippingFee) === 0, shipping_source: 'detail' }),
     // The raw sources the typed block reads, kept here rather than typed here so there is exactly one
     // place that turns a string into a number or a timestamp -- and so a route that cannot reach them
     // (the DOM card) publishes the same keys as null rather than a differently-shaped answer.
@@ -439,8 +544,12 @@ export const detailListing = (data: any, wanted: string): any | null => {
     seller_tenure_years: Number.isFinite(tenure) && tenure > 0 ? String(Math.floor(tenure / 365)) : '',
     seller_items_sold: countOf(seller.hasSoldNumInteger),
     seller_items_listed: countOf(seller.itemCount),
-    seller_positive_rate: asText(seller.newGoodRatioRate).replace('%', ''),
-    seller_reply_rate_24h: asText(seller.replyRatio24h).replace('%', ''),
+    seller_good_rate: numberOrNull(goodRateRaw),
+    seller_positive_rate: goodRateRaw,
+    // The site can print a floor instead of a number ("低于50"), and inventing 50 for it would be a
+    // figure nobody stated. The raw words ride beside the null so the caller can see what it said.
+    seller_reply_rate_24h: replyRate,
+    ...(replyRateRaw && replyRate === null ? { seller_reply_rate_24h_raw: replyRateRaw } : {}),
     seller_signature: asText(seller.signature),
     seller_avatar: asText(seller.portraitUrl).replace(/^http:\/\//, 'https://'),
     seller_last_active: asText(seller.lastVisitTime),
@@ -448,8 +557,10 @@ export const detailListing = (data: any, wanted: string): any | null => {
     // Not in `ITEM_FIELDS`, so `fields_present` / `fields_missing` are unchanged. This is the one hop
     // from a listing to the seller behind it. `sellerId` is goofish's plain numeric user id (`kcUserId`
     // in the profile payload, the `userId` /personal?userId= takes); measured live, a detail reply's
-    // sellerDO carries `sellerId` and no `userId`/`userIdStr` at all.
-    seller_id: asText(seller.sellerId),
+    // sellerDO carries `sellerId` and no `userId`/`userIdStr` at all. Deliberately NOT `seller_id`: a
+    // search card's `seller_id` is an opaque encrypted value, so one name over both would change type
+    // and meaning between a card and its detail merge.
+    seller_user_id: numberOrNull(asText(seller.sellerId)),
     brand: asText(attributes['品牌']),
     condition: asText(attributes['成色']),
     used_years: asText(attributes['已用年限']),
@@ -619,8 +730,8 @@ export const searchListings = (data: any): any[] => {
         // review count and positive rate from the shop label, credit from the tag strip, and whether
         // the seller hid their profile. All of it is free -- it is in the reply we already hold.
         seller_id: asText(args.seller_id),
-        seller_reviews: labelStats.reviews,
-        seller_positive_rate: labelStats.positive_rate,
+        seller_card_reviews: labelStats.reviews,
+        seller_card_good_rate: labelStats.positive_rate,
         seller_credit: sellerCreditOf(tags),
         seller_identity: asText(ex.userIdentityShow),
         seller_hidden: Boolean(ex.hideUserInfo) || asText(args.HideUserInfo) === 'true',
@@ -728,6 +839,12 @@ export const PAGER_STATE_JS = (): any => {
 export const FEED_NORMALIZE_JS = (spec: { rows: any[] }): any[] => {
   const clean = (v: any) => String(v ?? '').replace(/\s+/g, ' ').trim();
   const pick = (...vals: any[]) => { for (const v of vals) { const s = clean(v); if (s) return s; } return ''; };
+  // A want count is the site's prose ("13人想要", "1.2万人想要") unless a numeric field really states
+  // one. The search card's `wantNum` is "0" as a placeholder -- verified on item 1083923766396, whose
+  // tag strip says 13 -- so zero is an absence here, not a count.
+  const wantField = (v: any) => { const s = clean(v); const n = s ? Number(s) : NaN; return Number.isFinite(n) && n > 0 ? String(Math.trunc(n)) : ''; };
+  const wantProse = (v: any) => { const m = clean(v).match(/([\d.]+)\s*(万)?\s*人想要/); return m ? String(m[2] ? Math.round(parseFloat(m[1]) * 10000) : Math.round(parseFloat(m[1]))) : ''; };
+  const wantTags = (tags: any) => { for (const t of Array.isArray(tags) ? tags : []) { const w = wantProse(t); if (w) return w; } return ''; };
   const out: any[] = [];
   for (const row of spec.rows) {
     const card = row?.cardData || row || {};
@@ -748,7 +865,7 @@ export const FEED_NORMALIZE_JS = (spec: { rows: any[] }): any[] => {
       price: pick(dp.soldPrice, am.soldPrice, am.firstPrice, card.priceInfo?.price, card.price),
       original_price: pick(am.originalPrice, dp.originalPrice, card.priceInfo?.oriPrice),
       city: pick(card.city, dp.city, am.city),
-      want_count: pick(am.wantNum, dp.wantNum, hot ? String(hot[2] ? Math.round(parseFloat(hot[1]) * 10000) : Math.round(parseFloat(hot[1]))) : ''),
+      want_count: pick(wantField(am.wantNum), wantField(dp.wantNum), wantTags(ex.tags), hot ? wantProse(card.hotPoint?.text) : ''),
       image_count: String(imageUrls.length || am.image_count || ''),
       seller: pick(dp.userNick, card.user?.userNick, am.userNick),
       // `ex.showVideoIcon` is how a search card says it; the feed card has no such field, hence the
@@ -764,8 +881,8 @@ export const FEED_NORMALIZE_JS = (spec: { rows: any[] }): any[] => {
       seller_avatar: pick(ex.seller_avatar),
       seller_shop: Boolean(ex.seller_shop),
       seller_id: pick(ex.seller_id),
-      seller_reviews: pick(ex.seller_reviews),
-      seller_positive_rate: pick(ex.seller_positive_rate),
+      seller_card_reviews: pick(ex.seller_card_reviews),
+      seller_card_good_rate: pick(ex.seller_card_good_rate),
       seller_credit: pick(ex.seller_credit),
       seller_identity: pick(ex.seller_identity),
       seller_hidden: Boolean(ex.seller_hidden),

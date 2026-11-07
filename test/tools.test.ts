@@ -552,6 +552,8 @@ test('item_view answers from the page\'s own detail reply, with the fields the D
   assert.equal(out.source, 'item_detail_api');
   assert.equal(out.title, '腾亚40C瓦斯钉抢，功能正常使用', 'the field the DOM could never fill');
   assert.equal(out.price, '366');
+  assert.equal(out.price_amount, 366, 'the numeric twin of the price string');
+  assert.equal(out.seller_good_rate, 80, 'the lifetime rate as a number, beside the legacy string');
   assert.equal(out.want_count, '1'); assert.equal(out.browse_count, '34');
   assert.equal(out.description, '刚保养清洗干净，收到就可以用');
   assert.equal(out.seller, '今生有缘xy');
@@ -567,7 +569,7 @@ test('item_view answers from the page\'s own detail reply, with the fields the D
   assert.equal(out.used_years, '1年(含)-3年(不含)');
   assert.equal(out.seller_city, '台州');
   assert.equal(out.seller_signature, '二手电动工具，');
-  assert.equal(out.seller_reply_rate_24h, '97');
+  assert.equal(out.seller_reply_rate_24h, 97, 'a stated reply rate is a number');
   assert.equal(out.seller_items_listed, '655');
   assert.equal(out.collect_count, '2');
   assert.equal(out.seller_zhima_verified, true);
@@ -1128,7 +1130,7 @@ test('search_items compact returns the deal fields, drops the evidence trail and
   assert.equal(out.attempts, 1, 'the attempt count survives without the log');
   assert.equal('sample_titles' in out.diagnostics, false);
   assert.deepEqual(out.items.map((i: any) => i.item_id), ['1001', '1002', '1003']);
-  assert.deepEqual(Object.keys(out.items[0]).sort(), ['city', 'first_seen_age_s', 'is_new', 'item_id', 'price', 'price_amount', 'publish_time', 'rank', 'seller', 'seller_id', 'title', 'url', 'want_count']);
+  assert.deepEqual(Object.keys(out.items[0]).sort(), ['city', 'first_seen_age_s', 'is_new', 'item_id', 'price', 'price_amount', 'publish_time', 'rank', 'seller', 'seller_id', 'title', 'title_len', 'url', 'want_count', 'want_count_num']);
   assert.equal(out.items[0].price_amount, 300, 'the typed price rides along as a number');
   assert.equal(out.items[0].is_new, true, 'and novelty rides along without un-compacting the card');
   assert.equal('typed' in out.items[0], false, 'and the block it came from does not');
@@ -1169,6 +1171,73 @@ test('compact and sort run after `detail`, so the reported prices are the deepen
   assert.equal(out.price_stats.max, 123);
   assert.equal('description' in out.items[0], false, 'and the detail block itself is not what a compact caller pays for');
   assert.equal('typed' in out.items[0], false);
+});
+
+test('a detail read merges quantity, status, exact shipping and the lifetime seller rate into the card', async () => {
+  process.env.XIANYU_DETAIL_FANOUT = '0';
+  const search = { resultList: [{ data: { item: { main: {
+    clickParam: { args: { item_id: '1001', price: '300', wantNum: '0' } },
+    exContent: {
+      area: '北京',
+      detailParams: { itemId: '1001', title: '联想Thinkpad X220 笔记本 甲', soldPrice: '300' },
+      userNickName: '卖家',
+      userFishShopLabel: { tagList: [{ data: { content: '663条评价' } }, { data: { content: '好评率73%' } }] },
+      fishTags: { r2: { tagList: ['13人想要', '不包邮', '验货宝', '8GB', 'Lenovo/联想'].map((content) => ({ data: { content } })) } },
+    },
+  } } } }] };
+  const detail = ok({
+    itemDO: { itemId: '1001', title: '联想Thinkpad X220 详情 成色好', soldPrice: '300', wantCnt: 13, quantity: 1, itemStatusStr: '在线', transportFee: '20',
+      cpvLabels: [{ propertyName: '成色', valueName: '轻微磕碰划痕' }] },
+    sellerDO: { nick: '卖家', sellerId: '2200778316916', userRegDay: 730, hasSoldNumInteger: 2071, newGoodRatioRate: '99%', replyRatio24h: '低于50' },
+  });
+  const s = use(makeSession({ mtop: { 'mtop.taobao.idlemtopsearch.pc.search': [ok(search)], 'mtop.taobao.idle.pc.detail': [detail] } }));
+  s.runRealNormalizer = true;
+  const out = await run('search_items')({ query: 'thinkpad x220', detail: 1, limit: 3, compact: true, attempts: 1 });
+  delete process.env.XIANYU_DETAIL_FANOUT;
+  assert.equal(out.items.length, 1);
+  const card = out.items[0];
+  // The three facts that exist only on the detail API, and that a compact caller used to lose.
+  assert.deepEqual([card.quantity, card.item_status, card.item_status_token], [1, '在线', 'online']);
+  assert.deepEqual([card.free_shipping, card.shipping_source, card.shipping_fee], [false, 'detail', 20], 'the exact fee replaces the tag evidence, and says so');
+  // The two rates stay apart after the merge: the card label under its own name, the lifetime rate under
+  // its own -- 73 and 99 are the same seller and must never be readable as one metric.
+  assert.deepEqual([card.seller_card_good_rate, card.seller_card_reviews], [73, 663]);
+  assert.deepEqual([card.seller_good_rate, card.seller_positive_rate], [99, 99]);
+  assert.deepEqual([card.seller_reply_rate_24h, card.seller_reply_rate_24h_raw], [null, '低于50']);
+  assert.equal(card.seller_user_id, 2200778316916);
+  assert.deepEqual([card.seller_items_sold, card.seller_tenure_years], [2071, 2]);
+  // What only the card stated survives the merge -- including the tag-derived attributes, which the
+  // detail read's own 品牌/成色 block extends rather than replaces.
+  assert.deepEqual(card.badges, ['验货宝']);
+  assert.deepEqual(card.attributes, { capacity: '8GB', brand: 'Lenovo/联想', '成色': '轻微磕碰划痕' });
+  assert.equal(card.want_count, '13');
+  assert.equal(card.want_count_num, 13);
+});
+
+test('search_items truncates a compact title to title_max_len, and never the full card', async () => {
+  const longTitle = '联想Thinkpad X220 笔记本电脑 9成新 '.repeat(20);
+  // The normaliser collapses runs of whitespace, so this is the title a card really carries.
+  const stored = longTitle.replace(/\s+/g, ' ').trim();
+  const c = searchCase('thinkpad x220', [[longTitle, '1001', '300', '北京', '1']]);
+  const s = use(makeSession({ cards: [c.rows], mtop: c.mtop }));
+  s.runRealNormalizer = true;
+  const compact = await run('search_items')({ query: 'thinkpad x220', compact: true, title_max_len: 40, attempts: 1 });
+  assert.equal(Array.from(compact.items[0].title).length, 40);
+  assert.equal(compact.items[0].title_len, Array.from(stored).length, 'the original length is still reported');
+  assert.ok(stored.startsWith(compact.items[0].title));
+  const full = await run('search_items')({ query: 'thinkpad x220', compact: false, attempts: 1 });
+  assert.equal(full.items[0].title, stored, 'matching and filtering read the whole title');
+  assert.equal('title_len' in full.items[0], false);
+});
+
+test('search_batch passes title_max_len through to its compact rows', async () => {
+  const longTitle = '联想Thinkpad X220 笔记本电脑 9成新 '.repeat(20);
+  const c = searchCase('thinkpad x220', [[longTitle, '1001', '300', '北京', '1']]);
+  const s = use(makeSession({ cards: [c.rows], mtop: c.mtop }));
+  s.runRealNormalizer = true;
+  const out = await run('search_batch')({ queries: [{ query: 'thinkpad x220', attempts: 1 }], title_max_len: 40, timeout_s: 60 });
+  assert.equal(Array.from(out.queries[0].items[0].title).length, 40);
+  assert.equal(out.queries[0].items[0].title_len, Array.from(longTitle.replace(/\s+/g, ' ').trim()).length);
 });
 
 test('search_items remembers what a scan already saw, filters new_only, and reports a lower price', async () => {
@@ -2446,6 +2515,33 @@ test('inventory contradictions, token mismatches and throttling are structured e
   assert.equal(failed.diagnostics.inventory.match_count, 12338); assert.equal(failed.retry_after_s, 60);
   assert.equal(s.opened.length, 1, 'a measured throttle stops the retry loop immediately');
   resetCooldown(); resetCaches();
+});
+
+test('a refused search names its cause instead of reporting an inventory fact', async () => {
+  resetCaches(); resetCooldown();
+  // The count endpoint answering 0 must not turn a refusal into a confirmed empty answer: nothing was
+  // inspected, and `no_inventory` is a statement about Goofish's stock, not about this call.
+  use(makeSession({ mtop: { 'mtop.taobao.idlemtopsearch.pc.search': [refused('RGV587_ERROR::SM::哎哟喂,被挤爆啦,请稍后重试!')] } }, { hitnum: ok({ hitnum: 0 }) }));
+  const failed = await executeTool(TOOLS.find(t => t.name === 'search_items')!, { query: 'x220', attempts: 1, timeout_s: 5 });
+  assert.equal(failed.ok, false);
+  assert.equal(failed.data, null);
+  assert.equal(failed.diagnostics.empty_reason, 'rejected');
+  assert.equal(failed.diagnostics.titles_inspected, 0, 'nothing was read, and the answer says so rather than claiming stock');
+  assert.notEqual(failed.diagnostics.empty_reason, 'no_inventory');
+  resetCooldown();
+});
+
+test('a refused search reports the titles it inspected instead of a zero', async () => {
+  resetCaches(); resetCooldown();
+  // The page rendered 40 cards of which one was collected and none matched. The refusal that follows
+  // must not report titles_inspected: 0 -- that number is the difference between "Goofish sent no
+  // usable page" and "we read a page and its titles did not match".
+  use(makeSession({ scrape: [SEARCH_RAIL] }));
+  const failed = await executeTool(TOOLS.find(t => t.name === 'search_items')!, { query: 'thinkpad x220', attempts: 1, timeout_s: 8 });
+  assert.equal(failed.ok, false);
+  assert.ok(failed.diagnostics.titles_inspected >= 1, `titles were read but diagnostics says 0: ${JSON.stringify(failed.diagnostics)}`);
+  assert.equal(failed.diagnostics.empty_reason, 'no_relevant_results');
+  resetCooldown();
 });
 
 test('only confirmed zero inventory makes an empty upstream search successful', async () => {
