@@ -179,7 +179,18 @@ Title matching ignores spacing, punctuation and case, so `E5-2680v4` matches `E5
 `Xeon`/`至强` are equivalent in title matching (`expand_synonyms:false` disables that expansion).
 The query sent to Goofish remains the requested string. `diagnostics.tokens` reports alternatives
 and title match counts; `unmatched_tokens` names misses. 服务器/工控 and 显卡/计算卡 are related-query
-suggestions, not automatic equivalents. The relevance guard still refuses recommendation rails.
+suggestions, not automatic equivalents.
+
+Goofish’s own search is fuzzy: `E5 2680 v4` can return a page of E5 parts of which two are the CPU,
+and the strict rule — every query term in the title, on at least a fifth of the fetched cards —
+would refuse that page. With relaxed matching on (the default), a set the strict rule refuses is kept
+down to the titles that carry at least 60% of the query’s terms (never fewer than two), best matches
+first. Such an answer says so: `matched_by` is `"partial_terms"` and `partial_relevance` is `true`,
+so a loose match is never indistinguishable from an exact one. For a set the strict rule accepts,
+`matched_by` names what admitted it: `"phrase"` when every kept title contains the query as one
+phrase, `"all_terms"` when every term is present in some other order, and `"synonym_terms"` when the
+match needed the Xeon/至强 equivalence. Recommendation rails and pages with no query terms are
+refused in both states. Set `XIANYU_RELAX_MATCH=0` to restore the strict guard; nothing else changes.
 
 Continue with `{"query":"P100","cursor":"<next_cursor>","timeout_s":30}`. The opaque cursor
 preserves filters, limit, page depth and detail settings, plus matches omitted by a small limit.
@@ -922,6 +933,13 @@ page -- named as `site_error`, and retried rather than waited on.
   serves a different listing than the one asked for, or a page with no listing id at all,
   `item_view` raises instead of reporting its fields. The recommendation rail is never returned as
   search results.
+- **A loose relevance match is explicit, never silent.** The strict guard refuses a result set that
+  does not contain the query terms; the recommendation rail is never returned as results in either
+  state. Relaxed matching (`XIANYU_RELAX_MATCH`, default on) is the one deliberate exception: a set
+  the strict rule refuses is kept down to titles carrying at least 60% of the query’s terms (never
+  fewer than two) and the answer says `matched_by: "partial_terms"` with `partial_relevance: true`.
+  With `XIANYU_RELAX_MATCH=0` the strict refusal stands. Both routes — the pooled API/cache pull and
+  the rendered-page fallback — read the same switch, and tests cover both states.
 - A cached answer is never indistinguishable from a live one. Item detail and search pages are
   cached for a TTL (45s and 120s, overridable, `XIANYU_CACHE=0` disables). Every answer that can come
   from the cache publishes `hit`, `age_s`, `stored_at`, `ttl_s` and the key it was looked up under:

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { enrichListing, numberOrNull, priceOf } from '../src/extract.ts';
-import { filterRows, hardwareOf, matchesGroups, queryDiagnostics, readCursor, saveCursor, termGroups } from '../src/search-policy.ts';
+import { filterRows, hardwareOf, matchesGroups, queryDiagnostics, readCursor, relaxMatch, saveCursor, termGroups } from '../src/search-policy.ts';
 import { displaySetting } from '../src/display.ts';
 
 test('mixed-language CPU matches preserve model terms and normalize spacing and punctuation', () => {
@@ -44,6 +44,14 @@ test('continuations are opaque, query-bound and retain filters', () => {
   assert.equal(readCursor(cursor, 'P100').options.form_factor, 'sxm2');
   assert.throws(() => readCursor(cursor, 'V100'), /different query/);
   assert.throws(() => readCursor('not-a-cursor', 'P100'), /unknown or expired/);
+});
+test('the relaxed relevance rule is on by default and has one kill switch', () => {
+  // On by default: goofish's own search is fuzzy, and refusing a page of real CPU listings because
+  // only two of thirty titles carry the exact phrase is the behaviour this switch exists to change.
+  assert.equal(relaxMatch({}), true);
+  assert.equal(relaxMatch({ XIANYU_RELAX_MATCH: '1' }), true);
+  assert.equal(relaxMatch({ XIANYU_RELAX_MATCH: '' }), true, 'only the literal 0 turns it off');
+  assert.equal(relaxMatch({ XIANYU_RELAX_MATCH: '0' }), false);
 });
 test('explicit virtual display takes precedence, then DISPLAY, then automatic startup', () => {
   assert.equal(displaySetting({ XIANYU_DISPLAY: ':7', DISPLAY: ':0' }), ':7');

@@ -16,6 +16,14 @@ export const matchesGroups = (title: unknown, groups: string[][]): boolean => {
   const text = compact(title);
   return groups.length > 0 && groups.every(g => g.some(t => text.includes(compact(t))));
 };
+/**
+ * Is the relaxed relevance rule on? It is a deliberate exception to the strict guard, so it has a
+ * visible name and one kill switch. Default on, because goofish's own search is fuzzy: `E5 2680 v4`
+ * returns a page of E5 parts of which two are the CPU, and refusing the page throws away the exact
+ * titles a shopper asked for. `XIANYU_RELAX_MATCH=0` restores the strict rule; only the literal `0`
+ * turns it off, so an empty or misspelled value cannot silently change what a refusal means.
+ */
+export const relaxMatch = (env: NodeJS.ProcessEnv = process.env): boolean => env.XIANYU_RELAX_MATCH !== '0';
 export const queryDiagnostics = (query: string, rows: any[], aliases = true) => {
   const groups = termGroups(query, aliases);
   const tokens = groups.map((alternatives, i) => ({ token: queryTerms(query)[i], alternatives,

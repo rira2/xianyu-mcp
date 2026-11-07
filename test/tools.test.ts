@@ -279,7 +279,7 @@ const realSession = (opts: Parameters<typeof drivenPage>[0] = {}) => {
 // cleared between tests the same way the env budget is: a test that seeded one would otherwise have
 // the next item_view or search_items answered from it -- and, worse, would stop exercising the
 // refusal paths, since a cached listing never reaches them.
-test.afterEach(() => { setSession(null); resetCardCache(); resetCaches(); resetHistory(); for (const g of ['document', 'location', 'window']) delete (globalThis as any)[g]; for (const k of ['SEARCH', 'ITEM_VIEW', 'RECOMMENDATIONS']) delete process.env[`XIANYU_${k}_BUDGET_S`]; delete process.env.XIANYU_SEARCH_MAX_ITEMS; delete process.env.XIANYU_DETAIL_FANOUT; delete process.env.XIANYU_REPLAY; });
+test.afterEach(() => { setSession(null); resetCardCache(); resetCaches(); resetHistory(); for (const g of ['document', 'location', 'window']) delete (globalThis as any)[g]; for (const k of ['SEARCH', 'ITEM_VIEW', 'RECOMMENDATIONS']) delete process.env[`XIANYU_${k}_BUDGET_S`]; delete process.env.XIANYU_SEARCH_MAX_ITEMS; delete process.env.XIANYU_DETAIL_FANOUT; delete process.env.XIANYU_REPLAY; delete process.env.XIANYU_RELAX_MATCH; });
 
 const cards = (ids: string[]) => ({ ok: true, ret: 'SUCCESS::调用成功', data: { cardList: ids.map((id) => ({ cardData: { itemId: id, title: `t${id}`, soldPrice: '5' } })) } });
 const listed = (ids: string[]) => ids.map((id) => ({ item_id: id, title: `t${id}`, price: '5', city: '杭州', seller: 'a', want_count: '1', image_urls: [], url: `https://www.goofish.com/item?id=${id}` }));
@@ -1226,6 +1226,42 @@ test('search_items refuses a search reply that is really the recommendation rail
   const c = searchCase('thinkpad x220', cards);
   use(makeSession({ cards: [c.rows], scrape: [{ items: [], cards_scanned: 0, rendered: false, rail: '猜你喜欢' }], mtop: c.mtop }));
   await assert.rejects(run('search_items')({ query: 'thinkpad x220', attempts: 1, limit: 5 }), (e: any) => e instanceof SearchUnavailableError);
+});
+
+test('a partial-term result set is accepted with matched_by partial_terms, unless XIANYU_RELAX_MATCH=0', async () => {
+  // Goofish's own search for "E5 2680 v4" returns E5 parts: here 2 titles carry the exact phrase and
+  // 12 more carry two of the three terms (the v3 CPU). The strict rule needs 6 of 30, so refusing the
+  // whole page would throw away the two CPUs a shopper actually asked for.
+  const cards = [
+    ['至强 E5 2680 v4 处理器 甲', '2001', '100', '北京', '1'],
+    ['至强 E5 2680 v4 处理器 乙', '2002', '110', '北京', '1'],
+    ...Array.from({ length: 12 }, (_, i) => [`至强 E5 2680 v3 处理器 ${i}`, String(2100 + i), '90', '北京', '1']),
+    ...Array.from({ length: 16 }, (_, i) => [`木瓜丝 广西特产 ${i}`, String(2200 + i), '9', '南宁', '0']),
+  ];
+  // A fresh fixture per session: `makeSession` shallow-copies the reply map, so two sessions built
+  // from one `searchCase` would compete for the same single seeded reply.
+  const session = () => {
+    const c = searchCase('E5 2680 v4', cards);
+    const s = use(makeSession({ cards: [c.rows], mtop: c.mtop }));
+    s.runRealNormalizer = true;
+    return s;
+  };
+
+  session();
+  const out = await run('search_items')({ query: 'E5 2680 v4', attempts: 1 });
+  assert.equal(out.matched_by, 'partial_terms');
+  assert.equal(out.partial_relevance, true);
+  assert.equal(out.query_hits, 2, 'the exact phrase really was in two titles');
+  assert.equal(out.count, 14, 'the two CPUs plus the twelve closest parts');
+  assert.deepEqual(out.items.map((i: any) => i.item_id), ['2001', '2002', ...Array.from({ length: 12 }, (_, i) => String(2100 + i))], 'exact matches first, then the closest');
+  assert.ok(out.items.every((i: any) => /E5 2680/.test(i.title)), 'nothing from the unrelated rail was kept');
+
+  // The strict rule is still available, and it refuses this same reply: that is what the switch is for.
+  process.env.XIANYU_RELAX_MATCH = '0';
+  resetCaches();
+  session();
+  await assert.rejects(run('search_items')({ query: 'E5 2680 v4', attempts: 1 }), (e: any) => e instanceof SearchUnavailableError
+    && /irrelevant_api_results/.test(e.message));
 });
 
 test('the mtop-only tools do not queue behind a search on the shared page', async () => {

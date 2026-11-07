@@ -95,6 +95,13 @@ The Python implementation this is a port of is not in this history at all: it li
   and row statuses follow what is returned. The store is a 20,000-entry least-recently-seen map,
   `capabilities` publishes it (including on `probe: false`), and `XIANYU_HISTORY=0` turns it off --
   it is memory in the server process, so a restart forgets it and a first-ever scan is all new.
+- Finish the relaxed relevance rule as an explicit switch (`XIANYU_RELAX_MATCH`, default on). When
+  the strict guard would refuse a result set, the server keeps the titles carrying at least 60% of
+  the query's terms (never fewer than two), best matches first, and publishes `matched_by:
+  "partial_terms"` with `partial_relevance: true`; `XIANYU_RELAX_MATCH=0` restores the strict
+  refusal. The pooled API/cache path and the rendered-page fallback read the same switch.
+  Recommendation rails and pages carrying none of the query terms are refused in both states, and
+  the README documents what each `matched_by` value means.
 
 ## [0.2.1] — 2026-10-08
 
