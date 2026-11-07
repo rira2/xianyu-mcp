@@ -471,9 +471,10 @@ export const enrichListing = <T extends Record<string, any>>(row: T): TypedListi
     ...(declared ? { free_shipping: declared.free_shipping, shipping_source: declared.source } : {}) } as TypedListing<T>;
 };
 
-/** The short tokens `item_status` can be normalised to. Only labels seen on the site are mapped, and
- *  an unrecognised one gets no token: a status invented from an unknown string is a fact nobody sent. */
-const ITEM_STATUS_TOKENS: Record<string, string> = { '在线': 'online', '已下架': 'offline', '已售出': 'sold', '交易中': 'reserved' };
+/** The short tokens `item_status` can be normalised to. Only the label verified against a live detail
+ *  payload is mapped; an unrecognised status keeps its raw string and gets no token, because a status
+ *  invented from an unknown string is a fact nobody sent. */
+const ITEM_STATUS_TOKENS: Record<string, string> = { '在线': 'online' };
 const itemStatusToken = (v: unknown): string => ITEM_STATUS_TOKENS[asText(v)] ?? '';
 
 /**
@@ -510,9 +511,9 @@ export const detailListing = (data: any, wanted: string): any | null => {
   }
   const tenure = Number(seller.userRegDay);
   // The seller's two ratings, kept apart on purpose: `newGoodRatioRate` is the lifetime positive rate
-  // the profile page shows, and the search card's "好评率73%" is a different, recent metric. Both are
-  // numbers under `seller_good_rate`/`seller_positive_rate` here, with the raw string still beside
-  // them because that is what every existing caller reads.
+  // the profile page shows, and the search card's "好评率73%" is a different, recent metric. It is a
+  // number under `seller_good_rate`, with the legacy string `seller_positive_rate` still beside it
+  // because that is what every existing caller reads.
   const goodRateRaw = asText(seller.newGoodRatioRate).replace('%', '');
   const replyRateRaw = asText(seller.replyRatio24h).replace('%', '');
   const replyRate = numberOrNull(replyRateRaw);
