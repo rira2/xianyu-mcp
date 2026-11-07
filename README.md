@@ -96,7 +96,7 @@ full answer, base ref and fetch included, is what it runs when it has to rebuild
 | `XIANYU_HEADLESS` | `0` (windowed) | `1` runs headless. Headed is the default because goofish serves headless Chromium its risk-control page instead of the app -- see [Headless vs headed](#headless-vs-headed). Uses an existing display or automatically starts Xvfb. |
 | `XIANYU_DISPLAY` | `DISPLAY`, then automatic Xvfb | explicit display override |
 | `XIANYU_XVFB_PATH` | `Xvfb` on PATH | virtual display executable |
-| `XIANYU_CALL_TIMEOUT_S` | 90 (longer for requested search detail) | default total call deadline, 1–600s; `search_items.timeout_s` overrides it |
+| `XIANYU_CALL_TIMEOUT_S` | 90 (180 for `search_batch`, longer for requested search detail) | default total call deadline, 1–600s; a tool's own `timeout_s` (`search_items`, `search_batch`) overrides it |
 | `XIANYU_SEARCH_BUDGET_S` | 90 | wall-clock budget for the `search_items` retry loop (5–600s) |
 | `XIANYU_ITEM_VIEW_BUDGET_S` | 90 | wall-clock budget for the `item_view` retry loop (5–600s) |
 | `XIANYU_RECOMMENDATIONS_BUDGET_S` | 45 | wall-clock budget for the `recommendations` retry loop (5–600s) |
@@ -227,7 +227,8 @@ between the closest ranks, the same rule the benchmark uses.
 `sort` reorders the kept listings before any compaction: `relevance` (the default) keeps Goofish’s
 own order, `price_asc`/`price_desc` sort on `typed.price_amount`, and `newest` sorts on
 `publish_time`. A listing whose price or date is unknown goes last in either direction, and any sort
-other than `relevance` renumbers `rank` 1..n.
+other than `relevance` renumbers `rank` 1..n. `new_only` renumbers the cards its filter keeps, so a
+sorted-and-filtered answer is contiguous too.
 
 Observed rate-limit or risk-control failures recommend an initial 60-second pause and establish a
 process-wide cooldown; another measured failure after cooldown increases it, capped at 300 seconds.
@@ -296,10 +297,14 @@ The defaults are the batch's own, and they are not `search_items`':
   than for a complete inventory. Pass `topup_pages` on a query to get the single-search behaviour
   back.
 - `timeout_s: 180` bounds the **whole** list, `per_query_timeout_s: 60` bounds one query and is
-  clipped to whatever is left of the call, and `attempts: 2` is the per-query retry count. A query is
-  only started when at least 10s of the call's budget remain (its own floor), so a list that nears
-  its deadline answers `partial` with the remaining queries `skipped: true` instead of being cut off
-  mid-search; a `timeout_s` under 10 therefore runs nothing and says so.
+  clipped to whatever is left of the call above a 5s reserve, and `attempts: 2` is the per-query
+  retry count. The batch's own deadline is itself 5s inside the envelope's, so a query is only
+  started when its 10s floor fits above both reserves: a list that nears its deadline answers
+  `partial` with the remaining queries `skipped: true` instead of being cut off mid-search, and a
+  `timeout_s` of 20s or less therefore runs nothing and says so. If the envelope's deadline still
+  fires mid-query — a hung route can overrun a query's own budget — the batch is published as
+  `status: "partial"` with the completed rows in `data.queries[]` and the rest `skipped`, never as
+  "Call deadline reached".
 
 Measured against the built server (2026-11-07, [full record](docs/benchmark-2026-11-07.md)), one
 `search_batch` of six two-page queries answered 6/6 in **20.6s** and 152,739B (240 listings, 239
@@ -360,12 +365,14 @@ whose price is now **below the last price this process read**, largest absolute 
 with no readable price leaves the last readable one in place.
 
 `new_only: true` (default `false`, so nothing changes unless asked) keeps only the new listings and
-updates `count`, `price_stats` and `history.known_count` to match what is returned. On `search_batch`
-it filters each query's `items`; a row that had listings and now has none reports `status: "empty"`,
-and the item-derived `totals` (`listings`, `unique_listings`, `duplicates`, `ok`, `empty`) count what
-the call returns. Every batch also gains `totals.new_listings` and `totals.known_listings`
-(duplicates across queries counted as returned listings, exactly like `totals.listings`). A price drop
-on a known listing is still reported when `new_only` suppresses that listing.
+updates `count`, `price_stats`, `rank` and `history.known_count` to match what is returned: the kept
+cards are renumbered 1..n, since the filter removes some of the cards a sort had numbered. On
+`search_batch` it filters each query's `items`; a row that had listings and now has none reports
+`status: "empty"`, and the item-derived `totals` (`listings`, `unique_listings`, `duplicates`, `ok`,
+`empty`) count what the call returns. Every batch also gains `totals.new_listings` and
+`totals.known_listings` (duplicates across queries counted as returned listings, exactly like
+`totals.listings`). A price drop on a known listing is still reported when `new_only` suppresses that
+listing.
 
 ```json
 { "queries": [{ "query": "Tesla P100 16G", "limit": 60 }], "new_only": true, "compact": true }
@@ -489,6 +496,13 @@ recommendation rail is refused, and the typed route takes its place.
 shape change or a timeout is logged in `attempt_log` and the call falls through to the route below,
 unchanged -- including a replay the relevance guard refuses. `XIANYU_REPLAY=0` turns the fast path off
 entirely.
+
+A replay that answers the pages asked for and then fails during the **shortfall top-up** keeps the
+pages it already validated and publishes them as `partial`; `stop_reason` names why the walk stopped.
+A failed page fetch (or a refusal that carried no `ret` at all) says `replay_failed`; a non-`SUCCESS`
+`ret` is classified the way the typed route classifies a refused pager click, so Goofish's throttle
+is its own `rate_limited` / `risk_control` — carrying `retry_after_s` — and stops a batch instead of
+reading as a generic replay failure. `timeout` still means the call's budget ended.
 
 **Why search is signed on a homepage and item detail on an item page.** goofish signs an in-page
 `fetch` with whatever the page's own bundle can sign, and a bundle only signs the APIs it uses. A

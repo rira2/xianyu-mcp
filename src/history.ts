@@ -109,6 +109,12 @@ const summary = (observed: { item: any; observation: Observation }[]): Record<st
 const mark = (item: any, observation: Observation): Record<string, any> =>
   identified(item) ? { ...item, is_new: observation.is_new, first_seen_age_s: observation.first_seen_age_s } : { ...item };
 
+/** The ranks of a filtered answer, 1..n in the order it returns. A `sort` has already numbered the
+ *  cards it reordered, but `new_only` then removes some of them; without renumbering, the surviving
+ *  ranks are the old positions (1, 3, 4...) while the answer promises 1..n. Applied only when the
+ *  filter ran, because an unfiltered `relevance` answer keeps the ranking goofish gave it. */
+const numbered = (items: any[]): any[] => items.map((item, index) => ({ ...item, rank: index + 1 }));
+
 /** The statistics over these cards. `priceStats` reads only `typed.price_amount`, while a shaped
  *  card (a compact one, and every card a batch row publishes) keeps the same number flat -- so one
  *  restatement, shared by both annotators, rather than two answers that could disagree about the
@@ -117,14 +123,15 @@ const statsOf = (items: any[]): PriceStats | null =>
   priceStats((Array.isArray(items) ? items : []).map((item: any) => ({ typed: { price_amount: priceOf(item) } })));
 
 /** Annotate every card in an answer with `is_new`/`first_seen_age_s`. With `new_only`, keep only the
- *  listings this process had not seen before, so `count`, `price_stats` and `history.known_count`
- *  all describe what the answer actually returns. The caller's object is not mutated. */
+ *  listings this process had not seen before, so `count`, `price_stats`, `rank` and
+ *  `history.known_count` all describe what the answer actually returns (the kept cards are numbered
+ *  1..n, since the filter broke the sort's numbering). The caller's object is not mutated. */
 export const annotateSearchData = (data: Record<string, any>, opts: { new_only?: boolean } = {}): Record<string, any> => {
   if (!historyEnabled()) return data;
   const items = Array.isArray(data.items) ? data.items : null;
   const observed = (items ?? []).map((item) => ({ item, observation: observeListing(item) }));
   const annotated = observed.map(({ item, observation }) => mark(item, observation));
-  const kept = opts.new_only ? annotated.filter((item: any) => item.is_new) : annotated;
+  const kept = opts.new_only ? numbered(annotated.filter((item: any) => item.is_new)) : annotated;
   const out: Record<string, any> = { ...data };
   if (items) out.items = kept;
   if (opts.new_only && items) {
@@ -145,7 +152,9 @@ export const annotateSearchData = (data: Record<string, any>, opts: { new_only?:
  * duplicate across two queries is two returned listings, exactly as `totals.listings` counts them).
  * With `new_only`, each row keeps only its new listings and the item-derived totals are recomputed
  * from what is returned, so a row that had listings and now has none says `status: "empty"` and
- * `history.known_count` names how many known listings were suppressed. Rows the call never answered
+ * `history.known_count` names how many known listings were suppressed. A row's kept cards are
+ * renumbered 1..n, because removing cards from a sorted row would otherwise leave gaps in `rank`.
+ * Rows the call never answered
  * (`error`, `skipped`) are left alone except for their annotation, and their partial cards are
  * observed too -- they were read from goofish and paid for.
  */
@@ -159,7 +168,7 @@ export const annotateBatchData = (data: Record<string, any>, opts: { new_only?: 
       observed.push({ item, observation });
       return mark(item, observation);
     });
-    const kept = opts.new_only ? rows.filter((item: any) => item.is_new) : rows;
+    const kept = opts.new_only ? numbered(rows.filter((item: any) => item.is_new)) : rows;
     const out: Record<string, any> = { ...row, items: kept };
     if (opts.new_only) {
       out.count = kept.length;

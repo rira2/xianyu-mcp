@@ -4,7 +4,7 @@ import { z } from 'zod';
 import type { Page } from 'playwright';
 import { DetailUnavailableError, describe, GatedError, NavigationError, ParseError, SearchUnavailableError, XianyuError } from './errors.ts';
 import { buildBlock } from './build.ts';
-import { runBatch, type BatchArgs } from './batch.ts';
+import { BATCH_DEADLINE_MARGIN_MS, runBatch, type BatchArgs } from './batch.ts';
 import { getItem, getSearchPage, itemKey, itemTtl, missed, notCached, observationAge, pageReport, putItem, putSearchPage, searchTtl, stats as cacheStats } from './cache.ts';
 import type { CacheVerdict } from './cache.ts';
 import { annotateBatchData, annotateSearchData, disabledHistory, historyEnabled, stats as historyStats } from './history.ts';
@@ -536,12 +536,22 @@ const searchItems = async (args: SearchArgs): Promise<Data> => {
     }
     const payloads: any[] = [], pageLines: { page: number; hit: boolean; age_s: number | null; observed_at: string }[] = [];
     let nextPage = startPage, stopReason: string | null = null;
+    // Goofish's own reason for a page it refused, in the same vocabulary the typed route publishes
+    // for a refused pager click (`failureDetails(new GatedError(ret))`). Without it a `RGV587` refusal
+    // during a top-up read as a generic `replay_failed`, so a throttled replay neither latched the
+    // batch nor armed the cooldown.
+    let refusalReason: string | null = null;
     const fetchPage = async (pn: number): Promise<'ok' | 'end' | 'fail'> => {
       if (Date.now() >= deadline) { stopReason = stopReason ?? 'timeout'; return 'fail'; }
       let reply: any;
       try { reply = await session.replay(SEARCH_API, searchPayload(q, pn), { spmCnt: 'a21ybx.search.0.0', spmPre: 'a21ybx.home.searchInput.0' }); }
       catch (e: unknown) { log.push({ attempt: attemptNo, via: 'search_replay', page: pn, ok: false, why: `${(e as any)?.error_type ?? 'Error'}: ${String((e as any)?.message ?? e).slice(0, 120)}` }); return 'fail'; }
-      if (!reply?.ok) { log.push({ attempt: attemptNo, via: 'search_replay', page: pn, ok: false, ret: String(reply?.ret ?? ''), why: String(reply?.why ?? 'the replay did not answer') }); return 'fail'; }
+      if (!reply?.ok) {
+        const ret = String(reply?.ret ?? '');
+        if (ret) refusalReason = failureDetails(new GatedError(ret)).reason;
+        log.push({ attempt: attemptNo, via: 'search_replay', page: pn, ok: false, ret, why: String(reply?.why ?? 'the replay did not answer') });
+        return 'fail';
+      }
       if (!Array.isArray(reply.data?.resultList)) { log.push({ attempt: attemptNo, via: 'search_replay', page: pn, ok: false, why: 'unexpected_payload: the replay carried no resultList' }); return 'fail'; }
       const items = searchListings(reply.data).length;
       if (!items) { log.push({ attempt: attemptNo, via: 'search_replay', page: pn, ok: true, items: 0 }); return 'end'; }
@@ -584,7 +594,7 @@ const searchItems = async (args: SearchArgs): Promise<Data> => {
     if (!found) return null;
     while (found.accepted && (found.count ?? 0) < cap && nextPage <= deepLimit) {
       const state = await fetchPage(nextPage);
-      if (state === 'fail') { stopReason = stopReason ?? 'replay_failed'; break; }
+      if (state === 'fail') { stopReason = stopReason ?? refusalReason ?? 'replay_failed'; break; }
       if (state === 'end') { stopReason = 'end_of_pages'; break; }
       found = (await finish(payloads, q, cap, (rows: any[]) => FEED_NORMALIZE_JS({ rows }))) ?? found;
     }
@@ -649,9 +659,11 @@ const searchItems = async (args: SearchArgs): Promise<Data> => {
       // below only runs if no reply ever arrived.
       const reply = early ?? await session.domTap.take(SEARCH_API, Math.min(SEARCH_REPLY_WAIT_MS, Math.max(0, deadline - Date.now())));
       if (reply?.ok) {
-        // Walk the pager for the rest. One reply is 30 listings and the search API cannot be
-        // re-issued (replaying the page's own payload through the same client answers TIMEOUT), so the
-        // page's own pager is the only way deeper, and it is much cheaper than a fresh load.
+        // Walk the pager for the rest. One typed reply is 30 listings and this route has no cheap way
+        // to ask the search API again -- the signed replay above does re-issue it, with a fresh
+        // signature, and it was tried before this route ran; what the page's own client answers when
+        // handed the same payload is TIMEOUT. So on this route the page's own pager is how the walk
+        // goes deeper, and it is much cheaper than a fresh load.
         const replies = startPage === 1 ? [reply.data] : [], pageLines: { page: number; hit: boolean; age_s: number | null; observed_at?: string | null }[] = startPage === 1 ? [{ page: 1, hit: false, age_s: null, observed_at: new Date().toISOString() }] : [];
         let nextPage = startPage, stopReason: string | null = null, onPage = 1;
         if (!Array.isArray(reply.data?.resultList)) throw Object.assign(new ParseError('Search reply is missing resultList.'), { details: { reason: 'unexpected_payload', retryable: false, retry_after_s: 0 } });
@@ -1270,13 +1282,16 @@ const capabilities = async ({ probe = true }: Args<typeof CAP_ARGS> = {}): Promi
  * The bulk scan: the list, the shared page, one envelope. `runBatch` owns the ordering, the per-query
  * isolation and the totals; this wrapper only turns the process's remaining call budget and its
  * throttle cooldown into what that module needs. `remainingMs` is what makes the list stop at the
- * call's deadline rather than at a second, independently counted one -- and the schema always fills
- * `timeout_s`, so the fallback is only for a direct `run()` call (it is the same number, so the two
- * cannot drift).
+ * call's deadline rather than at a second, independently counted one, and the margin is subtracted
+ * here so `opts.deadline` is strictly before the envelope's: a query can then never be granted the
+ * seconds `withDeadline` is about to take away. `timeout_s` is optional in the schema and defaults
+ * here, not at parse time, so `XIANYU_CALL_TIMEOUT_S` can still raise the envelope (and with it the
+ * batch) when the caller did not name a budget. A direct `run()` call gets the same default.
  */
 const searchBatch = async (args: BatchArgs): Promise<Data> => {
+  const left = remainingMs((args.timeout_s ?? BATCH_TIMEOUT_S) * 1000);
   const result = await runBatch(args, searchItems, {
-    deadline: Date.now() + remainingMs((args.timeout_s ?? BATCH_TIMEOUT_S) * 1000),
+    deadline: Date.now() + Math.max(1, left - BATCH_DEADLINE_MARGIN_MS),
     cooldown,
   });
   // A batch that stopped on a throttle has just heard Goofish say "not now" in the site's own words,
@@ -1360,8 +1375,10 @@ const BATCH_ARGS = {
   compact: z.boolean().default(true),
   sort: z.enum(['relevance', 'price_asc', 'price_desc', 'newest']).default('relevance'),
   // Bounds the whole list, not one query: a query's own budget is `per_query_timeout_s`, clipped to
-  // whatever is left of this one.
-  timeout_s: z.number().int().min(5).max(600).default(BATCH_TIMEOUT_S),
+  // whatever is left of this one minus the batch's reserve. Optional so `XIANYU_CALL_TIMEOUT_S` can
+  // still raise the envelope when the caller did not name a budget; `searchBatch` applies the 180s
+  // default itself, and the tool definition below publishes the same number as the envelope fallback.
+  timeout_s: z.number().int().min(5).max(600).optional(),
   attempts: z.number().int().min(1).max(5).default(2),
   per_query_timeout_s: z.number().int().min(10).max(300).default(60),
 // The same novelty control `search_items` takes, applied per query against one process-wide store:
@@ -1382,7 +1399,7 @@ type FeedArgs = Args<typeof FEED_ARGS>; type CountArgs = Args<typeof COUNT_ARGS>
 type SearchArgs = Args<typeof SEARCH_ARGS>; type RelatedArgs = Args<typeof RELATED_ARGS>; type ItemArgs = Args<typeof ITEM_ARGS>; type RecoArgs = Args<typeof RECO_ARGS>;
 type SellerArgs = Args<typeof SELLER_ARGS>;
 
-type ToolDef = { name: string; description: string; schema: z.ZodRawShape; run: (args: any) => Promise<Data> };
+type ToolDef = { name: string; description: string; schema: z.ZodRawShape; run: (args: any) => Promise<Data>; default_timeout_s?: number };
 /** Wrap a tool in the one lock that matters. The three DOM tools read and navigate the single
  *  shared `domPage`; two at once would navigate it out from under each other and one would report the
  *  other's page as its own data. The mtop-only tools and `capabilities` never touch it, so making them
@@ -1403,15 +1420,15 @@ const novel = (fn: (args: any) => Promise<Data>): ((args: any) => Promise<Data>)
   if (historyEnabled()) return annotateSearchData(data, { new_only: args.new_only });
   return args.new_only ? { ...data, history: disabledHistory() } : data;
 };
-const tool = <S extends z.ZodRawShape>(def: { name: string; description: string; schema: S; run: (args: Args<S>) => Promise<Data> }): ToolDef => def as ToolDef;
+const tool = <S extends z.ZodRawShape>(def: { name: string; description: string; schema: S; run: (args: Args<S>) => Promise<Data>; default_timeout_s?: number }): ToolDef => def as ToolDef;
 const NO_ACCOUNT = ' No Xianyu account, cookie or login is required or used. Read-only: this server cannot publish, message, or change anything.';
 export const TOOLS: ToolDef[] = [
   tool({ name: 'capabilities', description: 'Report build identity, effective limits, cache settings and browser/display support. With probe:false, return immediately without contacting Goofish. With probe:true, also test anonymous session and feed access; failed probes appear as explicit error fields. Start here to check server readiness.' + NO_ACCOUNT, schema: CAP_ARGS, run: capabilities }),
   tool({ name: 'browse_feed', description: 'Read pages of the public homepage feed. Returns listings, count and page reports. This feed is not a keyword search and has no verified upstream filters. Use search_items for a product query. Args: page_number (1-10000), pages (1-25), limit (1-500, default 60).' + NO_ACCOUNT, schema: FEED_ARGS, run: browseFeed }),
   tool({ name: 'search_count', description: 'Get Goofish’s keyword inventory estimate, not the number of cards this server can retrieve. A positive count does not prove search_items can load results, and may include broad matches. Refusals and unreadable counts are errors, never zero. Args: query.' + NO_ACCOUNT, schema: COUNT_ARGS, run: searchCount }),
   tool({ name: 'search_suggest', description: 'Get Goofish’s autocomplete suggestions for a query prefix. Returns suggestions and count; this is not a product search. Args: query, limit (1-500, default 20).' + NO_ACCOUNT, schema: SUGGEST_ARGS, run: searchSuggest }),
-  tool({ name: 'search_items', description: 'Search product listings by calling Goofish’s own search API from a live page (a signed replay), falling back to typing into the SPA when Goofish refuses. Only relevant titles are returned; punctuation and spacing are normalized, and Xeon/至强 are equivalent unless expand_synonyms:false. Args: query; pages (1-10, default 1); topup_pages (0-2, default 2: extra pages walked while the kept set is short of limit, 0 walks only the pages asked for); limit (1-300, default 120, further capped by XIANYU_SEARCH_MAX_ITEMS); detail (0-50, default 0, enrich a shortlist); attempts (1-10, default 4); timeout_s (1-600, bounds total time including queue and detail). Optional filters: min_price/max_price in CNY, city, province, exclude_keywords, form_factor (pcie/sxm2/sxm3/sxm4/sxm5), bare_card_only. Filters run on fetched cards, not at Goofish; unknown price/location/hardware fails a requested filter. Bare-card matching requires explicit title evidence. Read status, diagnostics, effective_limit and freshness; `via` names the route that answered (search_replay when the signed API call did, searchbox when the page had to be typed into, cache when nothing was asked). Partial calls retain items and next_cursor; resume with the same query and cursor (10-minute process-local lifetime), preserving original filters. Errors report retry_after_s; do not retry during cooldown. Prices and counts are numeric under typed, with raw strings preserved. compact:true keeps only item_id, rank, title, price, price_amount, city, want_count, seller, url (plus tags/publish_time when the card has them), drops attempt_log and diagnostics.sample_titles, and returns the same listings in a fraction of the bytes. sort (relevance default, price_asc, price_desc, newest) reorders the kept listings and renumbers rank; an unknown price or date sorts last. Every answer carries price_stats: count, min, p10, p25, median, p75, p90, max and mean over typed.price_amount, currency CNY, or null when no kept listing carried a numeric price. new_only (default false) is novelty against this server process’s own memory: every identified card also carries is_new and first_seen_age_s (a card with no item_id is left unmarked, since it cannot be recognised twice), data.history reports tracked/known_count/new_count/price_drops, and new_only keeps only the ids this process had not seen. It is process-local; XIANYU_HISTORY=0 turns it off, and a new_only call then returns every fetched listing with data.history saying enabled:false, applied:false and why.' + NO_ACCOUNT, schema: SEARCH_ARGS, run: locked(novel(shaped(searchItems))) }),
-  tool({ name: 'search_batch', description: 'Bulk scans: run a list of 1-20 searches in one call, in order, and get one compact answer. Each query reports its own ok/status/error, so a failed query does not fail the call and the queries after it still run. Args: queries[] (each with query plus its own pages (1-10, default 1), limit (1-300, default 60), detail (0-50, default 0), topup_pages (0-2, default 0 here -- a batch walks only the pages it asks for), and the same filters as search_items: min_price/max_price in CNY, city, province, exclude_keywords, form_factor (pcie/sxm2/sxm3/sxm4/sxm5), bare_card_only); compact (default true, keeps item_id, rank, title, price, price_amount, city, want_count, seller and url); sort (relevance default, price_asc, price_desc, newest); timeout_s (5-600, default 180, bounds the whole call, not one query); attempts (1-5, default 2 per query); per_query_timeout_s (10-300, default 60). data.queries[] carries index, query, ok, status (success/empty/partial/error/skipped), count, ms, source, via, pages_fetched, stop_reason when one applies, items, price_stats and, on failure, error_type/message/retryable/retry_after_s/reason; a query the call never reached is skipped:true with status skipped, stop_reason timeout or cooldown and the retry_after_s to observe. A query that reports Goofish’s throttle (rate_limited or risk_control) stops the list instead of spending the same patience on the queries after it: data.stop_reason is cooldown, data.throttle_reason is the site’s own word and the process cooldown is armed. data.totals counts requested/ok (success only)/empty/partial/failed (answered with an error)/skipped (never reached), listings, unique_listings and duplicates across queries; data.failed_queries lists the indexes that did not answer, failed or skipped; data.stop_reason is timeout or cooldown when the call stopped early, and data.partial is true whenever a query failed or the call stopped early. Items are the same compact cards and price_stats search_items publishes. new_only (default false) filters every query’s items to ids this server process had not seen; data.totals gains new_listings and known_listings, data.history carries tracked/known_count/new_count/price_drops, and the store is process-local (XIANYU_HISTORY=0 turns it off; a new_only call then returns every fetched listing and data.history says enabled:false, applied:false with the reason).' + NO_ACCOUNT, schema: BATCH_ARGS, run: locked(searchBatch) }),
+  tool({ name: 'search_items', description: 'Search product listings by calling Goofish’s own search API from a live page (a signed replay), falling back to typing into the SPA when Goofish refuses. Only relevant titles are returned; punctuation and spacing are normalized, and Xeon/至强 are equivalent unless expand_synonyms:false. Args: query; pages (1-10, default 1); topup_pages (0-2, default 2: extra pages walked while the kept set is short of limit, 0 walks only the pages asked for); limit (1-300, default 120, further capped by XIANYU_SEARCH_MAX_ITEMS); detail (0-50, default 0, enrich a shortlist); attempts (1-10, default 4); timeout_s (1-600, bounds total time including queue and detail). Optional filters: min_price/max_price in CNY, city, province, exclude_keywords, form_factor (pcie/sxm2/sxm3/sxm4/sxm5), bare_card_only. Filters run on fetched cards, not at Goofish; unknown price/location/hardware fails a requested filter. Bare-card matching requires explicit title evidence. Read status, diagnostics, effective_limit and freshness; `via` names the route that answered (search_replay when the signed API call did, searchbox when the page had to be typed into, cache when nothing was asked). Partial calls retain items and next_cursor; resume with the same query and cursor (10-minute process-local lifetime), preserving original filters. A partial answer names why its walk stopped in stop_reason: timeout, end_of_pages, pager_unavailable, unexpected_payload, replay_failed, or Goofish’s own rate_limited/risk_control (with retry_after_s for those two). Errors report retry_after_s; do not retry during cooldown. Prices and counts are numeric under typed, with raw strings preserved. compact:true keeps only item_id, rank, title, price, price_amount, city, want_count, seller, url (plus tags/publish_time when the card has them), drops attempt_log and diagnostics.sample_titles, and returns the same listings in a fraction of the bytes. sort (relevance default, price_asc, price_desc, newest) reorders the kept listings and renumbers rank; an unknown price or date sorts last. Every answer carries price_stats: count, min, p10, p25, median, p75, p90, max and mean over typed.price_amount, currency CNY, or null when no kept listing carried a numeric price. new_only (default false) is novelty against this server process’s own memory: every identified card also carries is_new and first_seen_age_s (a card with no item_id is left unmarked, since it cannot be recognised twice), data.history reports tracked/known_count/new_count/price_drops, and new_only keeps only the ids this process had not seen. It is process-local; XIANYU_HISTORY=0 turns it off, and a new_only call then returns every fetched listing with data.history saying enabled:false, applied:false and why.' + NO_ACCOUNT, schema: SEARCH_ARGS, run: locked(novel(shaped(searchItems))) }),
+  tool({ name: 'search_batch', description: 'Bulk scans: run a list of 1-20 searches in one call, in order, and get one compact answer. Each query reports its own ok/status/error, so a failed query does not fail the call and the queries after it still run. Args: queries[] (each with query plus its own pages (1-10, default 1), limit (1-300, default 60), detail (0-50, default 0), topup_pages (0-2, default 0 here -- a batch walks only the pages it asks for), and the same filters as search_items: min_price/max_price in CNY, city, province, exclude_keywords, form_factor (pcie/sxm2/sxm3/sxm4/sxm5), bare_card_only); compact (default true, keeps item_id, rank, title, price, price_amount, city, want_count, seller and url); sort (relevance default, price_asc, price_desc, newest); timeout_s (5-600, default 180, bounds the whole call, not one query); attempts (1-5, default 2 per query); per_query_timeout_s (10-300, default 60). data.queries[] carries index, query, ok, status (success/empty/partial/error/skipped), count, ms, source, via, pages_fetched, stop_reason when one applies, items, price_stats and, on failure, error_type/message/retryable/retry_after_s/reason; a query the call never reached is skipped:true with status skipped, stop_reason timeout or cooldown and the retry_after_s to observe. A query that reports Goofish’s throttle (rate_limited or risk_control) stops the list instead of spending the same patience on the queries after it: data.stop_reason is cooldown, data.throttle_reason is the site’s own word and the process cooldown is armed. data.totals counts requested/ok (success only)/empty/partial/failed (answered with an error)/skipped (never reached), listings, unique_listings and duplicates across queries; data.failed_queries lists the indexes that did not answer, failed or skipped; data.stop_reason is timeout or cooldown when the call stopped early, and data.partial is true whenever a query failed or the call stopped early. Items are the same compact cards and price_stats search_items publishes. new_only (default false) filters every query’s items to ids this server process had not seen; data.totals gains new_listings and known_listings, data.history carries tracked/known_count/new_count/price_drops, and the store is process-local (XIANYU_HISTORY=0 turns it off; a new_only call then returns every fetched listing and data.history says enabled:false, applied:false with the reason).' + NO_ACCOUNT, schema: BATCH_ARGS, default_timeout_s: BATCH_TIMEOUT_S, run: locked(searchBatch) }),
   tool({ name: 'related_items', description: 'Read products Goofish recommends for an item; these are recommendations, not keyword matches. Omit item_id for generic suggestions. Returns items and count. Args: item_id (digits or item URL, optional), limit (1-500, default 30), page (1-10000).' + NO_ACCOUNT, schema: RELATED_ARGS, run: relatedItems }),
   tool({ name: 'seller_profile', description: 'Read a seller’s public profile and trust fields. Pass exactly one of user_id (seller digits or profile URL) or item_id (listing digits or URL). A user_id needs one API call; item_id first loads the listing and can add city, sales, tenure and reply rate. Unknown facts are null and named in fields_missing. No account is required.' + NO_ACCOUNT, schema: SELLER_ARGS, run: sellerProfile }),
   tool({ name: 'seller_items', description: 'Read a seller’s listings. Pass exactly one of user_id or item_id; item_id first loads the listing to identify its seller. Each page contains at most 20 cards; limit (1-20, default 20) only truncates that page. Walk page (1-50) while has_more is true. Returns effective_limit, page_size, items and numeric fields under typed.' + NO_ACCOUNT, schema: SELLER_ITEMS_ARGS, run: sellerItems }),

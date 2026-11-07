@@ -12,8 +12,10 @@
  *   - sequential and in the order asked, because one page answers them all;
  *   - a throw is a row in `queries`, never the end of the call;
  *   - one deadline for the whole call, and the process cooldown consulted before every query;
- *   - a query is only started if its own minimum budget still fits, so the call stops itself rather
- *     than being cut off mid-query by the envelope's deadline;
+ *   - a query is only started if its own minimum budget still fits above the call's reserve, and it
+ *     is granted no more time than that reserve leaves, so its own deadline is never the envelope's;
+ *   - the completed rows are recorded as a batch-shaped partial after each one, so a deadline that
+ *     fires mid-query publishes them instead of throwing the call away;
  *   - a throttle a query reports stops the list, because every later query would spend the same
  *     patience;
  *   - a query the call never reached says `skipped: true`, so `ok: false` is never ambiguous between
@@ -26,7 +28,7 @@
 import { describe, XianyuError } from './errors.ts';
 import { shapeSearchData } from './output.ts';
 import { failureDetails } from './response.ts';
-import { checkpoint } from './runtime.ts';
+import { checkpoint, recordBatchPartial } from './runtime.ts';
 
 /** One query of a batch: the search arguments `search_items` takes, minus the ones a batch owns. */
 export type BatchQuery = {
@@ -53,6 +55,12 @@ const BATCH_PAGES = 1, BATCH_LIMIT = 60, BATCH_DETAIL = 0, BATCH_TOPUP_PAGES = 0
 // page load do not fit in less, and the search tool would spend the call learning that. It is also
 // the smallest slice of the call's budget that can start another query at all.
 const MIN_PER_QUERY_TIMEOUT_S = 10;
+/** How much of the call's clock is never granted to a query. `tools.ts` places `opts.deadline` this
+ *  far before the envelope deadline `executeTool` tears the call down at, and `runBatch` grants a
+ *  query at most `opts.deadline - this`. A query therefore ends before the envelope's clock even when
+ *  the route it took overshoots its own budget, and a tear-down still has a margin to publish what
+ *  had already been paid for. */
+export const BATCH_DEADLINE_MARGIN_MS = 5_000;
 // Goofish's own words for "not now", and the wait a batch imposes when a row carries neither a
 // `retry_after_s` nor a cooldown to inherit.
 const THROTTLE_REASONS = ['rate_limited', 'risk_control'];
@@ -133,11 +141,15 @@ const failedRow = (index: number, query: string, e: unknown, ms: number, compact
  * `opts.cooldown` is the process's own throttle state, consulted before every query -- including the
  * first, because a caller that reached this module directly never passed `executeTool`'s check.
  *
- * The per-query budget is the smaller of `per_query_timeout_s` and what is left of the call, so a
- * query late in a long batch cannot promise Goofish more time than the call has. It is never below
- * `MIN_PER_QUERY_TIMEOUT_S`, which is why a query whose floor no longer fits is skipped instead of
- * started: granting ten seconds out of two used to let the envelope's deadline fire mid-query and
- * replace the whole answer with "Call deadline reached".
+ * The per-query budget is the smaller of `per_query_timeout_s` and what is left of the call after
+ * `BATCH_DEADLINE_MARGIN_MS`, so a query late in a long batch cannot promise Goofish time the
+ * envelope will take away. It is never below `MIN_PER_QUERY_TIMEOUT_S`, which is why a query whose
+ * floor no longer fits above the reserve is skipped instead of started: granting ten seconds out of
+ * two used to let the envelope's deadline fire mid-query and replace the whole answer with "Call
+ * deadline reached". A query that is started can no longer outlive `opts.deadline`, and if the
+ * envelope still tears the call down mid-query -- a hung route page can overrun its own budget -- the
+ * rows completed so far were recorded as a batch-shaped partial after each one, so the caller gets
+ * them as `status: "partial"` rather than an empty error.
  */
 export const runBatch = async (args: BatchArgs, searchOne: SearchOne, opts: { deadline: number; cooldown: () => { retry_after_s: number } }): Promise<Record<string, any>> => {
   const asked = Array.isArray(args?.queries) ? args.queries : [];
@@ -157,11 +169,17 @@ export const runBatch = async (args: BatchArgs, searchOne: SearchOne, opts: { de
     // Read before every query, including the first: a caller that reached this module directly never
     // passed `executeTool`'s own cooldown refusal, and a cooldown can appear in the middle of a batch.
     const cooldownWait = opts.cooldown().retry_after_s;
+    // What a query could be granted right now: everything up to the batch's deadline, less the
+    // reserve the envelope needs. Reading it once per query keeps the skip decision and the granted
+    // `timeout_s` on the same clock, so the two cannot disagree. Milliseconds here, and only the
+    // whole-second grant is rounded down, so a query does not lose a second to the arithmetic.
+    const availableMs = opts.deadline - Date.now() - BATCH_DEADLINE_MARGIN_MS;
     if (!stopCause) {
-      // Stop before a query that cannot fit. This check comes before `checkpoint()` on purpose: the
-      // envelope's deadline and this one are the same clock, so an exhausted budget must reach the
-      // skip branch as a named `timeout` rather than throw out of the loop as a deadline error.
-      if (Date.now() + MIN_PER_QUERY_TIMEOUT_S * 1000 > opts.deadline) stopCause = 'deadline';
+      // Stop before a query that cannot fit its own floor above the reserve. This check comes before
+      // `checkpoint()` on purpose: the envelope's deadline and this one are the same clock, so an
+      // exhausted budget must reach the skip branch as a named `timeout` rather than throw out of the
+      // loop as a deadline error.
+      if (availableMs < MIN_PER_QUERY_TIMEOUT_S * 1000) stopCause = 'deadline';
       else if (cooldownWait) stopCause = 'cooldown';
       // The envelope can be torn down under this loop by `withDeadline`; `checkpoint` is how a module
       // that never builds an envelope still honours that. It is only asked when a query would start.
@@ -172,8 +190,10 @@ export const runBatch = async (args: BatchArgs, searchOne: SearchOne, opts: { de
       continue;
     }
     const { query: _query, pages = BATCH_PAGES, limit = BATCH_LIMIT, detail = BATCH_DETAIL, topup_pages = BATCH_TOPUP_PAGES, ...filters } = entry;
-    const left = Math.floor((opts.deadline - Date.now()) / 1000);
-    const timeout_s = Math.max(MIN_PER_QUERY_TIMEOUT_S, Math.min(perQueryS, left));
+    // The floor is already guaranteed above; the grant never exceeds the available slice, so the
+    // query's own deadline is at least the margin before the batch's and two margins before the
+    // envelope's. `Math.max` only protects a direct caller's sub-floor `per_query_timeout_s`.
+    const timeout_s = Math.max(MIN_PER_QUERY_TIMEOUT_S, Math.min(perQueryS, Math.floor(availableMs / 1000)));
     const at = Date.now();
     let row: Record<string, any>;
     try {
@@ -191,8 +211,28 @@ export const runBatch = async (args: BatchArgs, searchOne: SearchOne, opts: { de
       latchedWait = Number(row.retry_after_s) || THROTTLE_RETRY_S;
       throttleReason = throttled;
     }
+    // Recorded after the row, while the loop still owns the truth: if the envelope tears the call
+    // down during the next query, this is what `executeTool` publishes as the call's data. The rows
+    // the call had not reached yet are filled in as the skips the loop would have produced.
+    recordBatchPartial(partialOf(asked, rows, stopCause, throttleReason, stopCause === 'throttled' ? latchedWait : cooldownWait, started));
   }
   return totalsFor(asked.length, rows, stopCause, throttleReason, Date.now() - started);
+};
+
+/**
+ * The batch-shaped partial a deadline tear-down publishes: every row this call completed, plus a
+ * named skipped row for every query it had not reached (the same rows the loop would produce next).
+ * It deliberately has the whole envelope shape -- `queries`, `totals`, `count`, `partial`,
+ * `stop_reason` -- so `executeTool` can publish it rather than a single search's page-level partial.
+ */
+const partialOf = (asked: BatchQuery[], rows: Record<string, any>[], stopCause: SkipCause | null, throttleReason: string | null, wait: number, started: number): Record<string, any> => {
+  const cause: SkipCause = stopCause ?? 'deadline';
+  const filled = [...rows];
+  const skipWait = cause === 'deadline' ? 0 : wait;
+  for (let index = filled.length; index < asked.length; index++) {
+    filled.push(skippedRow(index, String(asked[index]?.query ?? ''), cause, skipWait));
+  }
+  return totalsFor(asked.length, filled, cause, throttleReason, Date.now() - started);
 };
 
 /**

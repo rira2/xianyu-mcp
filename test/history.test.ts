@@ -143,6 +143,43 @@ test('annotateBatchData recomputes a compact row\'s price_stats from the new car
   assert.deepEqual([unpriced.queries[0].price_stats.count, unpriced.queries[0].price_stats.min], [1, 40]);
 });
 
+test('new_only renumbers the cards it keeps, so a filtered answer is contiguous 1..n', () => {
+  observeListing({ item_id: 'a', typed: { price_amount: 300 } });
+  const single = annotateSearchData({
+    query: 'x', count: 3,
+    items: [
+      { item_id: 'a', rank: 1, price_amount: 300 },
+      { item_id: 'b', rank: 2, price_amount: 200 },
+      { item_id: 'c', rank: 3, price_amount: 100 },
+    ],
+  }, { new_only: true });
+  assert.deepEqual(single.items.map((i: any) => [i.item_id, i.rank]), [['b', 1], ['c', 2]], 'the survivors are renumbered, not left at 2,3');
+
+  reset();
+  observeListing({ item_id: 'a', typed: { price_amount: 300 } });
+  const batch = annotateBatchData({
+    queries: [{ index: 0, query: 'q1', ok: true, status: 'success', count: 3, items: [
+      { item_id: 'a', rank: 1, price_amount: 300 },
+      { item_id: 'b', rank: 2, price_amount: 200 },
+      { item_id: 'c', rank: 3, price_amount: 100 },
+    ] }],
+    totals: { requested: 1, ok: 1, empty: 0, failed: 0, skipped: 0, partial: 0, listings: 3, unique_listings: 3, duplicates: 0, ms: 1 },
+  }, { new_only: true });
+  assert.deepEqual(batch.queries[0].items.map((i: any) => [i.item_id, i.rank]), [['b', 1], ['c', 2]], 'a batch row is renumbered the same way');
+  // Without the filter the server's own numbering is untouched (a relevance answer keeps its ranks).
+  reset();
+  observeListing({ item_id: 'a', typed: { price_amount: 300 } });
+  const unfiltered = annotateSearchData({
+    query: 'x', count: 3,
+    items: [
+      { item_id: 'a', rank: 1, price_amount: 300 },
+      { item_id: 'b', rank: 2, price_amount: 200 },
+      { item_id: 'c', rank: 3, price_amount: 100 },
+    ],
+  }, {});
+  assert.deepEqual(unfiltered.items.map((i: any) => i.rank), [1, 2, 3]);
+});
+
 test('XIANYU_HISTORY=0 disables the store and leaves annotate* untouched', () => {
   process.env.XIANYU_HISTORY = '0';
   assert.equal(historyEnabled(), false);

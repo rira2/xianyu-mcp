@@ -250,7 +250,10 @@ test('the published argument names and defaults are exactly these', () => {
     // A bulk scan is the one place the depth default is 0: the pages a query asks for are what it
     // pays for, and the top-up exists for a single search's completeness rather than a scan's speed.
     // `queries` publishes as one required array argument even though each element has its own shape.
-    search_batch: { queries: '<required>', compact: true, sort: 'relevance', timeout_s: 180, attempts: 2, per_query_timeout_s: 60, new_only: false },
+    // `timeout_s` is optional rather than 180 at parse time so `XIANYU_CALL_TIMEOUT_S` can set the
+    // envelope; the 180 default is applied inside `searchBatch` and republished as the tool's
+    // `default_timeout_s` (pinned by the search_batch tests).
+    search_batch: { queries: '<required>', compact: true, sort: 'relevance', timeout_s: '<optional>', attempts: 2, per_query_timeout_s: 60, new_only: false },
     related_items: { item_id: '<optional>', limit: 30, page: 1 },
     item_view: { item_id: '<required>' },
     recommendations: { limit: 30, url: '<optional>' },
@@ -261,6 +264,8 @@ test('the published argument names and defaults are exactly these', () => {
     seller_items: { user_id: '<optional>', item_id: '<optional>', limit: 20, page: 1 },
   };
   assert.deepEqual(Object.fromEntries(TOOLS.map((t) => [t.name, shape(t)])), published);
+  // The one arg whose default left the schema keeps its published number on the tool itself.
+  assert.equal(TOOLS.find((t) => t.name === 'search_batch')?.default_timeout_s, 180, 'search_batch still promises a 180s call by default');
   // and bounded where the agent can see it. `related_items.page` was the one number in the contract
   // with no ceiling at all, so the served JSON Schema invited page 1e9.
   for (const t of TOOLS) {
@@ -415,9 +420,10 @@ test('the read path never clicks the page: the login dialog is left alone, on ev
   // is the one change that must not be able to come back quietly, and no live page load can be part
   // of a unit test.
   // There is exactly one click in this server, and it is the search results pager. It is not a
-  // dialog dismissal: it is the page's own pagination control, and it is the only way past 30 results,
-  // because the search API cannot be re-issued (replaying the page's own payload answers TIMEOUT).
-  // Measured 5-9.5s per page against 13-25s for a fresh load, 30 new items each, zero overlap.
+  // dialog dismissal: it is the page's own pagination control, and it is the typed route's only way
+  // past 30 results -- the signed replay re-issues the search API from the page, but a typed attempt
+  // that lost the replay has no such call. Measured 5-9.5s per page against 13-25s for a fresh load,
+  // 30 new items each, zero overlap.
   //
   // So the blanket "no click anywhere" ban becomes what it was always protecting: no click on the
   // login dialog, and no pointer simulation anywhere. Both still hold absolutely.

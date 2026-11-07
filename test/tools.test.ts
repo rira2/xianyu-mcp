@@ -878,20 +878,51 @@ test('search_items answers from a signed replay without touching the search box,
 test('a replay page that fails during the top-up still publishes what it already answered, as partial', async () => {
   // The requested page answered 30 of the 60 asked for; the top-up page is refused. That is what a
   // pager click stopping mid-walk is on the typed route: keep the validated pages and say so, rather
-  // than spending a 30s typed search to re-fetch page 1.
+  // than spending a 30s typed search to re-fetch page 1. The refusal is Goofish's own throttle, so
+  // `stop_reason` must be its word -- `rate_limited` -- not the generic `replay_failed`; otherwise a
+  // batch cannot latch on it and the envelope cannot arm the process cooldown.
   const s = use(makeSession({ replay: async (api: string, data: any) => data.pageNumber === 1
     ? { ok: true, ret: 'SUCCESS::调用成功', data: replayPageReply(1), ms: 10 }
     : { ok: false, ret: 'RGV587_ERROR::SM::被挤爆啦', why: 'goofish refused the replay: RGV587_ERROR::SM::被挤爆啦', ms: 9 } }));
   const out = await run('search_items')({ query: 'thinkpad x220', pages: 1, limit: 60 });
   assert.equal(out.via, 'search_replay');
   assert.equal(out.partial, true);
-  assert.equal(out.stop_reason, 'replay_failed');
+  assert.equal(out.stop_reason, 'rate_limited', 'the refused top-up is classified from goofish\'s ret');
+  assert.equal(out.retry_after_s, 60, 'and carries the site\'s throttle wait');
   assert.equal(out.count, 30);
   assert.equal(out.pages_fetched, 1);
   assert.equal(out.scraped_cards, 30);
   assert.equal(s.search.value, '', 'no typed fallback was needed');
   const failed = out.attempt_log.find((e: any) => e.via === 'search_replay' && e.ok === false);
   assert.match(failed.ret, /RGV587/, 'and the reason the walk stopped is in the log');
+});
+
+test('a replay top-up refusal is classified as a throttle, so a batch latches on it', async () => {
+  resetCaches(); resetCooldown();
+  use(makeSession({ replay: async (api: string, data: any) => data.pageNumber === 1
+    ? { ok: true, ret: 'SUCCESS::调用成功', data: replayPageReply(1), ms: 10 }
+    : { ok: false, ret: 'RGV587_ERROR::SM::被挤爆啦', why: 'goofish refused the replay: RGV587_ERROR::SM::被挤爆啦', ms: 9 } }));
+  try {
+    // `timeout_s: 60` leaves the first query 55s, which is more than the replay's own gate, so the
+    // fast path really runs. `topup_pages: 1` makes the shortfall walk page 2, which is the refusal.
+    const out = await executeTool(TOOLS.find((t) => t.name === 'search_batch')!, {
+      queries: [{ query: 'thinkpad x220', limit: 60, topup_pages: 1 }, { query: 'iphone 13', limit: 10 }],
+      timeout_s: 60,
+    });
+    assert.equal(out.ok, true);
+    assert.equal(out.status, 'partial');
+    const data = out.data!;
+    assert.equal(data.queries[0].ok, true);
+    assert.equal(data.queries[0].status, 'partial');
+    assert.equal(data.queries[0].stop_reason, 'rate_limited', 'the row carries goofish\'s own reason');
+    assert.equal(data.queries[0].retry_after_s, 60);
+    assert.equal(data.queries[1].skipped, true, 'the query after the throttle was never asked');
+    assert.equal(data.queries[1].stop_reason, 'cooldown');
+    assert.equal(data.stop_reason, 'cooldown');
+    assert.equal(data.throttle_reason, 'rate_limited');
+    assert.equal(data.partial, true);
+    assert.ok(cooldown().retry_after_s > 0, 'and the process cooldown is armed');
+  } finally { resetCooldown(); resetCaches(); }
 });
 
 test('a refused replay falls through to the typed path in the same attempt, and the refusal is in the log', async () => {
@@ -1247,6 +1278,7 @@ test('a compact batch row under new_only publishes price_stats over the new card
   const filtered = await batch({ new_only: true });
   const row = filtered.data.queries[0];
   assert.deepEqual(row.items.map((i: any) => i.item_id), ['1001', '1003']);
+  assert.deepEqual(row.items.map((i: any) => i.rank), [1, 2], 'the filter renumbers the kept cards 1..n');
   assert.equal('typed' in row.items[0], false, 'the row really is the compact shape a batch publishes');
   assert.deepEqual([row.price_stats.count, row.price_stats.min, row.price_stats.median], [2, 100, 150]);
   assert.deepEqual([row.count, row.status], [2, 'success']);
@@ -1462,9 +1494,9 @@ test('a seller lookup by user_id never waits for the lock, and one by item_id on
 });
 
 test('search_items walks the pager for more pages, and the guard runs over the whole pooled set', async () => {
-  // One reply is 30 listings and the search API cannot be re-issued, so the page's own pager is the
-  // only way deeper. Three replies of 10, pooled, and the guard has to judge all thirty at once --
-  // judging page 3 on its own could throw away two good pages.
+  // One typed reply is 30 listings and this route has no signed call to ask again, so the page's own
+  // pager is the only way deeper here. Three replies of 10, pooled, and the guard has to judge all
+  // thirty at once -- judging page 3 on its own could throw away two good pages.
   const page = (n: number, titles: string[]) => ok(searchReply('x220', titles.map((t, i) => [t, String(n * 100 + i), '50', '北京', '1'])));
   const t1 = Array.from({ length: 10 }, (_, i) => `联想 X220 键盘 ${i}`);
   const t2 = Array.from({ length: 10 }, (_, i) => `ThinkPad X220 笔记本 ${i}`);
@@ -2556,14 +2588,46 @@ test('search_batch publishes its query-list bounds and refuses what falls outsid
   assert.equal(typo.count, 0);
 });
 
+test('search_batch leaves timeout_s optional so XIANYU_CALL_TIMEOUT_S can bound it', async () => {
+  const def = TOOLS.find((t) => t.name === 'search_batch')!;
+  // The arg must stay absent at parse time: a schema default would always win over the environment,
+  // so `XIANYU_CALL_TIMEOUT_S` could never raise (or lower) a batch's envelope. The batch default
+  // lives on the tool definition, where `executeTool` reads it when nothing else set a deadline.
+  const parsed = z.strictObject(def.schema).parse({ queries: [{ query: 'thinkpad x220' }] });
+  assert.equal(parsed.timeout_s, undefined, 'the schema does not pre-fill the budget');
+  assert.equal(def.default_timeout_s, 180, 'the batch default is executeTool\'s fallback, not a parsed arg');
+  // With neither the arg nor the environment set, that fallback is what runs the call: a missing
+  // budget would make `withDeadline` reject immediately rather than answer.
+  resetCaches(); resetCooldown();
+  use(makeSession({ replay: async (api: string, data: any) => replayAnswer(data) }));
+  const normal = await executeTool(def, { queries: [{ query: 'thinkpad x220' }] });
+  assert.equal(normal.ok, true);
+  assert.equal(normal.status, 'success');
+  assert.equal(normal.count, 30);
+  // A 6s envelope is below one query's 10s floor plus the batch's 5s reserve, so the batch answers
+  // partial with named skips instead of starting a query the envelope would cut off.
+  process.env.XIANYU_CALL_TIMEOUT_S = '6';
+  try {
+    resetCaches(); resetCooldown();
+    use(makeSession());
+    const out = await executeTool(def, { queries: [{ query: 'thinkpad x220' }] });
+    assert.equal(out.ok, true);
+    assert.equal(out.status, 'partial');
+    const data = out.data as any;
+    assert.equal(data.stop_reason, 'timeout');
+    assert.equal(data.totals.skipped, 1);
+  } finally { delete process.env.XIANYU_CALL_TIMEOUT_S; }
+});
+
 test('search_batch stops before the call deadline instead of letting it cut the answer off', async () => {
   resetCaches(); resetCooldown();
   use(makeSession());
   const out = await executeTool(TOOLS.find((t) => t.name === 'search_batch')!, {
     queries: [{ query: 'thinkpad x220' }, { query: 'x220 battery' }],
-    // The published minimum, and still below one query's 10s floor: no query can fit, so the batch
-    // must stop itself and answer partial with named skips. Before the fix this path let the
-    // envelope's own deadline fire mid-call and turned the whole answer into "Call deadline reached".
+    // The published minimum, and still below one query's 10s floor plus the batch's 5s reserve: no
+    // query can fit, so the batch must stop itself and answer partial with named skips. Before the
+    // fix this path let the envelope's own deadline fire mid-call and turned the whole answer into
+    // "Call deadline reached".
     timeout_s: 5,
   });
   assert.equal(out.ok, true, 'the call answered');

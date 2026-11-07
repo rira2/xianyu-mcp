@@ -650,12 +650,13 @@ const tagContents = (fishTags: any): string[] => {
 /**
  * Click the Nth box of the search results pager.
  *
- * The only way past 30 results, and the one click in this server. Two things make it safe. It is a
- * DOM `click()` rather than a Playwright pointer click, so the anonymous login dialog's
- * `ant-modal-mask` cannot intercept it -- the same reason nothing else here clicks anything, and
- * the reason those four close controls are left alone. And it is the search page's own pagination
- * control, not a dismissal: the page then issues its own `idlemtopsearch.pc.search` for the next
- * page, and the answer is read off the wire exactly as the first page's was.
+ * The typed route's only way past 30 results, and the one click in this server. Two things make it
+ * safe. It is a DOM `click()` rather than a Playwright pointer click, so the anonymous login
+ * dialog's `ant-modal-mask` cannot intercept it -- the same reason nothing else here clicks
+ * anything, and the reason those four close controls are left alone. And it is the search page's own
+ * pagination control, not a dismissal: the page then issues its own `idlemtopsearch.pc.search` for
+ * the next page, and the answer is read off the wire exactly as the first page's was. (The signed
+ * replay re-issues that API itself when it is available, re-signing `pageNumber`.)
  *
  * Measured: 30 new items per click, 5–9.5s, zero overlap with the page before, against 13–25s for a
  * fresh page load. Four tabs doing this concurrently gained nothing -- 8.2s per listing either way --

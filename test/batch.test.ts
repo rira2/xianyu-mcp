@@ -8,8 +8,11 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { runBatch } from '../src/batch.ts';
+import { BATCH_DEADLINE_MARGIN_MS, runBatch } from '../src/batch.ts';
 import { XianyuError } from '../src/errors.ts';
+import { executeTool } from '../src/response.ts';
+import { recordPartial, withDeadline } from '../src/runtime.ts';
+import { TOOLS } from '../src/tools.ts';
 
 /** One listing in the shape `searchItems` publishes: the flat fields plus the typed block the price
  *  statistics and `compact` read. `image_urls` is here because compaction drops it, which is how the
@@ -93,10 +96,10 @@ test('the call stops before starting a query that cannot fit, and names what it 
   const asked: string[] = [];
   const out = await runBatch({ queries: [{ query: 'alpha' }, { query: 'beta' }, { query: 'gamma' }] }, async (args) => {
     asked.push(args.query);
-    await new Promise((resolve) => setTimeout(resolve, 600));
+    await new Promise((resolve) => setTimeout(resolve, 2000));
     return answer([`${args.query}-1`]);
-  }, opts({ deadline: Date.now() + 10_500 }));
-  assert.deepEqual(asked, ['alpha'], 'one query fits in 10.5s; after it, 9.9s is less than the next query\'s 10s floor');
+  }, opts({ deadline: Date.now() + 16_500 }));
+  assert.deepEqual(asked, ['alpha'], 'one query fits in 16.5s; after it, the rest is under the 10s floor plus the 5s reserve');
   assert.equal(out.stop_reason, 'timeout');
   assert.equal(out.partial, true);
   for (const skipped of out.queries.slice(1)) {
@@ -114,6 +117,83 @@ test('the call stops before starting a query that cannot fit, and names what it 
   assert.deepEqual(out.failed_queries, [1, 2]);
   assert.equal(out.totals.skipped, 2);
   assert.equal(out.count, 1);
+});
+
+test('a query is granted only what remains before the batch deadline, less the reserve', async () => {
+  const seen: { at: number; timeout_s: number }[] = [];
+  const deadline = Date.now() + 17_000;
+  const out = await runBatch({ queries: [{ query: 'alpha' }], per_query_timeout_s: 60 }, async (args) => {
+    seen.push({ at: Date.now(), timeout_s: args.timeout_s });
+    return answer(['1']);
+  }, opts({ deadline }));
+  assert.equal(out.queries[0].status, 'success');
+  assert.equal(seen.length, 1);
+  const { at, timeout_s } = seen[0];
+  assert.ok(timeout_s >= 10, 'the 10s floor is still granted when it fits');
+  assert.ok(timeout_s <= 12, `17s less the 5s reserve leaves at most 12s for this query, got ${timeout_s}`);
+  // The property the fix is for: start + grant is inside the batch deadline, so the envelope's
+  // deadline (which is a further margin away) cannot fire while this query is still running.
+  assert.ok(at + timeout_s * 1000 <= deadline - BATCH_DEADLINE_MARGIN_MS + 1000, `${at + timeout_s * 1000} exceeds ${deadline - BATCH_DEADLINE_MARGIN_MS}`);
+  assert.equal(out.stop_reason, null);
+  assert.equal(out.partial, false);
+});
+
+/** The published `search_batch` definition with only its `run` replaced. The two cases below simulate
+ *  an envelope deadline (`executeTool`'s `withDeadline`) in milliseconds rather than seconds: the
+ *  real wrapper would put the batch's own deadline 5s before a real envelope, which is the behaviour
+ *  under test but costs 15+ seconds to reach. The schema, `runBatch`, the runtime and the envelope
+ *  are the real ones. */
+const served = (run: (args: any) => Promise<Record<string, any>>) => ({ ...TOOLS.find((t) => t.name === 'search_batch')!, run });
+
+test('a query that no longer fits ends the list as a partial with its completed rows, never a deadline error', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'] });
+  const asked: string[] = [];
+  const out = await executeTool(served((args) => runBatch(args, async (q: any) => {
+    asked.push(q.query);
+    // The clock moves past the batch's own budget while the first query runs. The next one could
+    // only be granted 8s, under its 10s floor, so it must be a named skip, not a started query.
+    if (q.query === 'alpha') t.mock.timers.setTime(Date.now() + 3_000);
+    return answer([`${q.query}-1`, `${q.query}-2`]);
+  }, { deadline: Date.now() + 16_000, cooldown: noCooldown })), { queries: [{ query: 'alpha' }, { query: 'beta' }, { query: 'gamma' }] });
+  assert.deepEqual(asked, ['alpha'], 'the later queries were never started');
+  assert.equal(out.ok, true);
+  assert.equal(out.status, 'partial');
+  assert.equal(out.error_type, null);
+  assert.equal(out.message, null);
+  const data = out.data!;
+  assert.deepEqual(data.queries.map((row: any) => row.status), ['success', 'skipped', 'skipped']);
+  assert.equal(data.queries[0].items.length, 2, 'the listings alpha returned are still in the answer');
+  assert.equal(data.queries[0].ok, true);
+  assert.equal(data.count, 2);
+  assert.equal(data.totals.skipped, 2);
+  assert.equal(data.stop_reason, 'timeout');
+  assert.equal(data.partial, true);
+  assert.doesNotMatch(JSON.stringify(out), /Call deadline reached/, 'the batch stopped itself; the envelope never had to');
+});
+
+test('a deadline tear-down after a row publishes the completed rows, not a single-search partial', async () => {
+  // The envelope fires while the second query is still in flight. The batch had recorded its rows as
+  // a batch-shaped partial after the first one, and the in-flight search records its own page-level
+  // partial in the meantime; the envelope must publish the batch, never the single query.
+  const out = await executeTool(served(() => withDeadline(0.35, () => runBatch({ queries: [{ query: 'alpha' }, { query: 'beta' }] }, async (q: any) => {
+    if (q.query === 'beta') {
+      recordPartial({ query: 'beta', items: [listing('single')], count: 1 });
+      return await new Promise<Record<string, any>>(() => {});
+    }
+    return answer(['alpha-1']);
+  }, { deadline: Date.now() + 60_000, cooldown: noCooldown }))), { queries: [{ query: 'alpha' }, { query: 'beta' }] });
+  assert.equal(out.ok, true);
+  assert.equal(out.status, 'partial');
+  assert.equal(out.message, null);
+  const data = out.data!;
+  assert.ok(Array.isArray(data.queries), 'the published partial is the batch, with data.queries[] intact');
+  assert.deepEqual(data.queries.map((row: any) => row.status), ['success', 'skipped']);
+  assert.deepEqual(data.queries[0].items.map((item: any) => item.item_id), ['alpha-1'], 'the completed row survived');
+  assert.equal(data.queries[1].skipped, true, 'the query that was in flight is a named skip');
+  assert.equal(data.stop_reason, 'timeout');
+  assert.equal(data.count, 1);
+  assert.doesNotMatch(JSON.stringify(out), /"single"/, 'the in-flight single-search partial did not replace the batch');
+  assert.doesNotMatch(JSON.stringify(out), /Call deadline reached/);
 });
 
 test('a deadline that has already passed skips the whole list instead of throwing', async () => {

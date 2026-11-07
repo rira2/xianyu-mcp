@@ -48,7 +48,11 @@ const refreshObservationAge = (data: Record<string, any>) => {
   }
 };
 
-type Definition = { name: string; schema: z.ZodRawShape; run: (args: any) => Promise<Record<string, any>> };
+type Definition = { name: string; schema: z.ZodRawShape; run: (args: any) => Promise<Record<string, any>>;
+  /** The envelope's fallback budget in seconds when neither the call nor `args.timeout_s` set one.
+   *  A tool whose own default is longer than `search_items`' 90s names it here, so the schema can
+   *  leave `timeout_s` optional and let `XIANYU_CALL_TIMEOUT_S` through. */
+  default_timeout_s?: number };
 export const executeTool = async (tool: Definition, input: unknown) => {
   const started = Date.now(), build = buildBlock();
   const common = { schema_version: 2, build };
@@ -63,7 +67,7 @@ export const executeTool = async (tool: Definition, input: unknown) => {
     }
     const searchDefault = tool.name === 'search_items' && args.detail > 0 ? Math.min(600, 60 + args.detail * 10) : 90;
     const configuredSearch = Number(process.env.XIANYU_SEARCH_BUDGET_S);
-    const fallback = tool.name === 'search_items' && Number.isInteger(configuredSearch) && configuredSearch >= 5 ? Math.min(600, configuredSearch) : searchDefault;
+    const fallback = tool.default_timeout_s ?? (tool.name === 'search_items' && Number.isInteger(configuredSearch) && configuredSearch >= 5 ? Math.min(600, configuredSearch) : searchDefault);
     const envBudget = Number(process.env.XIANYU_CALL_TIMEOUT_S);
     const timeout = args.timeout_s ?? (Number.isInteger(envBudget) && envBudget >= 1 ? Math.min(600, envBudget) : fallback);
     const data = await withDeadline(Math.max(0.001, timeout - (Date.now() - started) / 1000), () => tool.run(args));
@@ -85,11 +89,26 @@ export const executeTool = async (tool: Definition, input: unknown) => {
     }
     let partial: any;
     try { partial = (e as any)?.partial; } catch { /* preserve an opaque failure */ }
-    if (partial && Array.isArray(partial.items)) {
-      const data = { ...partial, partial: true, stop_reason: details.reason, retry_after_s: details.retry_after_s };
+    // Two shapes reach this arm: a single search's page-level partial (`items`) and a batch's
+    // `queries[]` snapshot. A batch is recognised by its `queries` array and published as the call's
+    // data whole -- completed rows, totals, count and stop_reason -- instead of being forced into the
+    // single-search shape, which is how a deadline tear-down used to lose the rows it had paid for.
+    if (partial && (Array.isArray(partial.queries) || Array.isArray(partial.items))) {
+      const batch = Array.isArray(partial.queries);
+      // A batch partial is self-describing: it already carries `stop_reason`, `retry_after_s`, `count`
+      // and its totals, so the deadline's own details must not overwrite what the rows recorded (a
+      // partial that latched a throttle would lose the wait). A single-search page partial carries
+      // none of those, so the failure details fill them in as they always have.
+      const data = batch
+        ? { ...partial, partial: true as const }
+        : { ...partial, partial: true as const, stop_reason: details.reason, retry_after_s: details.retry_after_s };
       refreshObservationAge(data);
-      return { ...common, ok: true, status: 'partial' as const, count: data.items.length, data,
-        error_type: null, message: null, retryable: true, retry_after_s: details.retry_after_s, diagnostics: details, elapsed_ms: Date.now() - started };
+      const count = batch
+        ? Number.isSafeInteger(data.count) && data.count >= 0 ? data.count : 0
+        : data.items.length;
+      const retryAfter = batch ? Number(data.retry_after_s) || 0 : details.retry_after_s;
+      return { ...common, ok: true, status: 'partial' as const, count, data,
+        error_type: null, message: null, retryable: true, retry_after_s: retryAfter, diagnostics: details, elapsed_ms: Date.now() - started };
     }
     return { ...common, ok: false, status: 'error' as const, count: 0, data: null, ...describe(e),
       retryable: Boolean(details.retryable), retry_after_s: details.retry_after_s ?? 0, diagnostics: details, elapsed_ms: Date.now() - started };

@@ -33,8 +33,9 @@ The Python implementation this is a port of is not in this history at all: it li
   (`item_id`, `rank`, `title`, `price`, `price_amount`, `city`, `want_count`, `seller`, `url`, plus
   `tags`/`publish_time` when present) and drops `attempt_log` and `diagnostics.sample_titles`; every
   answer carries `price_stats` (count/min/p10/p25/median/p75/p90/max/mean in CNY, or null); `sort`
-  orders the kept listings by relevance, price or publish time. The default envelope only gains
-  `price_stats`, and filters and `detail` still run on full cards.
+  orders the kept listings by relevance, price or publish time. The default envelope gains
+  `price_stats` plus the per-card `is_new` / `first_seen_age_s` marks and the `history` block, and
+  filters and `detail` still run on full cards.
 - Call goofish's search and item-detail APIs directly, without the SPA. The call is an md5-signed
   `fetch` issued from a goofish page, where the page's own interceptor attaches the `bx-ua` /
   `bx-umidtoken` / `bx_et` anti-bot fields; `mtop.taobao.idlemtopsearch.pc.search` and
@@ -69,8 +70,11 @@ The Python implementation this is a port of is not in this history at all: it li
   so `ok: false` is never ambiguous between "goofish refused this" and "this was never asked". A
   query that reports Goofish's throttle (`rate_limited`/`risk_control`) stops the list with
   `stop_reason: cooldown`, `throttle_reason` naming the site's own word, and the process cooldown
-  armed. A query is only started when at least 10s of the call's budget remain, so a list near its
-  deadline answers partial with the rest skipped instead of being cut off mid-search.
+  armed. A query is only started when its 10s minimum fits above the batch's 5s reserve, and it is
+  granted no more than what remains there; the envelope's deadline sits another 5s beyond the
+  batch's, so a list near its deadline answers partial with the rest skipped instead of being cut off
+  mid-search. If the envelope still tears the call down mid-query, the completed rows are published
+  as a batch-shaped `status: "partial"` rather than "Call deadline reached".
   `data.totals` counts requested/ok (success only)/empty/partial/failed/skipped, listings, unique
   listings across queries and duplicates; `failed_queries` names the indexes that did not answer,
   failed or skipped; `stop_reason` is `timeout` or `cooldown` when the call stopped early, and
@@ -96,7 +100,8 @@ The Python implementation this is a port of is not in this history at all: it li
   `new_count` and `price_drops` (up to 50, largest first) against the last price this process read.
   `new_only` (default false) on either tool keeps only the listings this process had not seen; a
   batch reports `totals.new_listings`/`known_listings`, and under `new_only` its item-derived totals
-  and row statuses follow what is returned. The store is a 20,000-entry least-recently-seen map,
+  and row statuses follow what is returned, with the kept cards renumbered `rank` 1..n. The store is
+  a 20,000-entry least-recently-seen map,
   `capabilities` publishes it (including on `probe: false`), and `XIANYU_HISTORY=0` turns it off --
   it is memory in the server process, so a restart forgets it and a first-ever scan is all new.
 - Finish the relaxed relevance rule as an explicit switch (`XIANYU_RELAX_MATCH`, default on). When
