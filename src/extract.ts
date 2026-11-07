@@ -999,7 +999,11 @@ export const SCRAPE_CARDS_JS = (spec: { query: string; terms: string[]; groups?:
   const q = String(spec.query || '').toLowerCase(), terms = (spec.terms || []).map((t: any) => String(t).toLowerCase());
   const seen = new Set<string>();
   const items: any[] = [];
-  let queryHits = 0, tokenHits = 0, cards = 0;
+  // The same three rules the tool publishes as `match_mode`, counted here so the fraction is over the
+  // whole page rather than over the cards that happened to be collected.
+  const phraseNorm = String(spec.query || '').normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+  const norm = (t: string) => String(t).normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+  let queryHits = 0, tokenHits = 0, anyHits = 0, phraseHits = 0, cards = 0;
   for (const card of document.querySelectorAll(sel.card)) {
     const href = card.href || card.getAttribute('href') || '';
     const id = (href.match(/[?&]id=([0-9]+)/) || [])[1];
@@ -1015,9 +1019,13 @@ export const SCRAPE_CARDS_JS = (spec: { query: string; terms: string[]; groups?:
     const has_phrase = Boolean(q) && low.includes(q);
     const normalized = low.normalize('NFKC').replace(/[^\p{L}\p{N}]/gu, '');
     const groups = spec.groups || terms.map((t: string) => [t]);
-    const has_terms = groups.length > 0 && groups.every((g: string[]) => g.some(t => normalized.includes(t.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, ''))));
+    const has_terms = groups.length > 0 && groups.every((g: string[]) => g.some(t => normalized.includes(norm(t))));
+    const has_any = groups.length > 0 && groups.some((g: string[]) => g.some(t => normalized.includes(norm(t))));
+    const has_phrase_norm = Boolean(phraseNorm) && normalized.includes(phraseNorm);
     if (has_phrase) queryHits++;
     if (has_terms) tokenHits++;
+    if (has_any) anyHits++;
+    if (has_phrase_norm) phraseHits++;
     if (items.length >= spec.limit) continue;   // keep counting, stop collecting: the fraction needs the whole page
     const priceWrap = card.querySelector(sel.priceWrap);
     const attrs = Array.from(card.querySelectorAll(sel.attrs)).map((n: any) => clean(n.textContent)).filter(Boolean);
@@ -1041,6 +1049,8 @@ export const SCRAPE_CARDS_JS = (spec: { query: string; terms: string[]; groups?:
     items,
     query_hits: queryHits,
     token_hits: tokenHits,
+    any_hits: anyHits,
+    phrase_hits: phraseHits,
     cards_scanned: cards,
     rail: spec.rails.find((m) => text.includes(m)) || '',
     says_no_results: /没有找到你想要的宝贝|未找到相关宝贝|没有找到相关/.test(text),

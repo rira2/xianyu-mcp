@@ -437,11 +437,21 @@ test('search_items over-asks the scraper, so leading non-matching cards cannot f
   assert.equal(reordered.token_hits, 8, 'all eight carry every term');
   assert.equal(reordered.matched_by, 'all_terms', 'and the envelope says the phrase was not the match');
 
-  // ...and the guard still has teeth: a page carrying only some of the terms is a rail, not results.
+  // ...and the guard still has teeth. A page carrying only one of the two terms used to be a refusal;
+  // under the OR-relax it is a named, weaker answer (`relaxed: true`, `match_mode_used: "any"`, with
+  // `unmatched_tokens` naming the term nobody used), and `XIANYU_RELAX_MATCH=0` restores the refusal.
+  domSession(Array.from({ length: 8 }, (_, i) => `机械硬盘 台式机内存条 ${i}`));
+  const relaxed4t = await run('search_items')({ query: '机械硬盘4t', attempts: 1 });
+  assert.equal(relaxed4t.count, 8);
+  assert.equal(relaxed4t.relaxed, true);
+  assert.equal(relaxed4t.match_mode_used, 'any');
+  assert.deepEqual(relaxed4t.diagnostics.unmatched_tokens, ['4t'], 'the half of the query nobody listed is named');
+  process.env.XIANYU_RELAX_MATCH = '0';
   domSession(Array.from({ length: 8 }, (_, i) => `机械硬盘 台式机内存条 ${i}`));
   await assert.rejects(run('search_items')({ query: '机械硬盘4t', attempts: 1 }), (e: any) => e instanceof SearchUnavailableError
     && e.details?.last_attempt.query_hits === 0 && e.details?.last_attempt.token_hits === 0
     && e.details?.last_attempt.scraped_cards === 8 && /\b1 attempt\(s\)/.test(e.message));
+  delete process.env.XIANYU_RELAX_MATCH;
 });
 
 test('every DOM read re-checks the URL first, so a page moved off goofish mid-call is refused', async () => {
@@ -1505,13 +1515,13 @@ test('the mtop-only tools do not queue behind a search on the shared page', asyn
   assert.equal(s.launches, 0);
 });
 
-test('the lock is on the four page-reading tools and nowhere else, through the registered tool table', async () => {
+test('the lock is on the five page-reading tools and nowhere else, through the registered tool table', async () => {
   // The regression guard for the defect above, stated about the tool table itself rather than about
   // one hand-wrapped call. Which tools take the shared-page lock is a contract with index.ts -- it
   // must not wrap them again, or the fast tools queue behind every slow one -- so assert it here.
   // `search_batch` is in the set because it is `search_items` in a loop: every query it runs walks the
   // same shared page, so the whole list has to hold the lock rather than each query separately.
-  const LOCKED = ['search_items', 'search_batch', 'item_view', 'recommendations'];
+  const LOCKED = ['search_items', 'search_batch', 'item_view', 'item_view_batch', 'recommendations'];
   const free = TOOLS.filter((t) => !LOCKED.includes(t.name)).map((t) => t.name);
   // The two seller tools are in the free set for a reason that is not "they never touch the dom page":
   // given a user_id they do not, and given an item_id they take the lock for exactly the hop that
@@ -2970,4 +2980,304 @@ test('a batch row carries the same diagnostics flat: suggested_queries, unmatche
     assert.equal(answered.titles_inspected, 4);
     assert.deepEqual(answered.unmatched_tokens, []);
   } finally { delete process.env.XIANYU_RELAX_MATCH; resetCaches(); resetCooldown(); }
+});
+
+// ---------------------------------------------------------------- match_mode, and the automatic OR-relax
+/** A rendered result page as the fake session hands it over: titles only, with the page-level counts the
+ *  tool recomputes (a fake has no scraper to count them). */
+const matchPage = (titles: string[]) => ({ rendered: true, cards_scanned: titles.length, rail: '', says_no_results: false, blocked: false, text_preview: '4U',
+  items: titles.map((title, i) => ({ item_id: String(600 + i), title, price: '100', condition: '', brand: '', city: '北京', url: `u${i}`, matches_query: false })) });
+/** 22 of 30 titles carry exactly one of the three terms, 8 carry none: the field report's `4U 服务器
+ *  机箱` page, where the strict rule finds nothing and the interrupted-word sellers are still real. */
+const OR_PAGE = matchPage([
+  ...Array.from({ length: 8 }, (_, i) => `4U 静音风扇 ${i}`),
+  ...Array.from({ length: 7 }, (_, i) => `服务器 电源 模块 ${i}`),
+  ...Array.from({ length: 7 }, (_, i) => `机箱 配件 螺丝 ${i}`),
+  ...Array.from({ length: 8 }, (_, i) => `木瓜丝 广西特产 ${i}`),
+]);
+
+test('`4U 服务器 机箱` returns the one-term titles with relaxed: true instead of nothing', async () => {
+  // The acceptance case. The old rule needs all three terms, and the partial rescue needs two, so this
+  // page was an empty refusal even though 22 of its 30 cards are about one of the words asked for.
+  resetCaches(); resetCooldown();
+  use(makeSession({ scrape: [OR_PAGE] }));
+  const out = await run('search_items')({ query: '4U 服务器 机箱', limit: 30, attempts: 1 });
+  assert.equal(out.count, 22, 'every title carrying at least one term');
+  assert.equal(out.matched_by, 'any_terms');
+  assert.equal(out.match_mode_used, 'any', 'the rule that actually admitted it');
+  assert.equal(out.relaxed, true, 'the answer is weaker than the requested mode, and says so');
+  assert.equal(out.partial_relevance, undefined, 'the OR-relax is not the partial-term rescue');
+  assert.ok(out.items.every((i: any) => /4U|服务器|机箱/.test(i.title)));
+  // The one kill switch still turns the whole relaxed path off: strict refusal, not a silent loosening.
+  process.env.XIANYU_RELAX_MATCH = '0';
+  resetCaches();
+  use(makeSession({ scrape: [OR_PAGE] }));
+  await assert.rejects(run('search_items')({ query: '4U 服务器 机箱', attempts: 1 }), (e: any) => e instanceof SearchUnavailableError
+    && e.details?.last_attempt.token_hits === 0, 'the strict rule still reads zero matches; only the switch changed');
+  delete process.env.XIANYU_RELAX_MATCH;
+  resetCooldown();
+});
+
+test('an explicit match_mode any answers the same page without being called relaxed', async () => {
+  resetCaches(); resetCooldown();
+  use(makeSession({ scrape: [OR_PAGE] }));
+  const out = await run('search_items')({ query: '4U 服务器 机箱', limit: 30, attempts: 1, match_mode: 'any' });
+  assert.equal(out.count, 22);
+  assert.equal(out.matched_by, 'any_terms');
+  assert.equal(out.match_mode_used, 'any');
+  assert.equal(out.relaxed, undefined, 'the caller asked for any; nothing was relaxed, so the flag is absent');
+  // The floor still applies: a mode that matches almost nothing is a decline, not an answer.
+  const thin = matchPage([...Array.from({ length: 4 }, (_, i) => `4U 风扇 ${i}`), ...Array.from({ length: 26 }, (_, i) => `木瓜丝 ${i}`)]);
+  use(makeSession({ scrape: [thin] }));
+  resetCaches();
+  await assert.rejects(run('search_items')({ query: '4U 服务器 机箱', attempts: 1, match_mode: 'any' }), (e: any) => e instanceof SearchUnavailableError);
+  resetCooldown();
+});
+
+test('an explicit match_mode phrase needs the whole query as one normalised run', async () => {
+  // Ten titles carry the query as typed; twenty carry all three terms in another order. `all` keeps all
+  // thirty, and `phrase` keeps the ten -- and refuses the reordered page when none of it is a phrase.
+  const mixed = matchPage([
+    ...Array.from({ length: 10 }, (_, i) => `4U 服务器 机箱 全新 ${i}`),
+    ...Array.from({ length: 20 }, (_, i) => `机箱 4U 服务器 拆机 ${i}`),
+  ]);
+  resetCaches(); resetCooldown();
+  use(makeSession({ scrape: [mixed] }));
+  const all = await run('search_items')({ query: '4U 服务器 机箱', limit: 30, attempts: 1 });
+  assert.equal(all.count, 30);
+  assert.equal(all.match_mode_used, 'all');
+  assert.equal(all.relaxed, undefined, 'the strict rule answered; nothing was relaxed');
+  assert.equal(all.matched_by, 'all_terms');
+  resetCaches();
+  use(makeSession({ scrape: [mixed] }));
+  const phrase = await run('search_items')({ query: '4U 服务器 机箱', limit: 30, attempts: 1, match_mode: 'phrase' });
+  assert.equal(phrase.count, 10);
+  assert.equal(phrase.matched_by, 'phrase');
+  assert.equal(phrase.match_mode_used, 'phrase');
+  assert.equal(phrase.relaxed, undefined);
+  assert.ok(phrase.items.every((i: any) => /4U 服务器 机箱/.test(i.title)));
+  // The same page under phrase when no title carries the phrase: refused, not relaxed to `all`.
+  const reordered = matchPage(Array.from({ length: 30 }, (_, i) => `机箱 4U 服务器 ${i}`));
+  resetCaches();
+  use(makeSession({ scrape: [reordered] }));
+  await assert.rejects(run('search_items')({ query: '4U 服务器 机箱', attempts: 1, match_mode: 'phrase' }), (e: any) => e instanceof SearchUnavailableError);
+  resetCooldown();
+});
+
+test('a batch query carries its own match_mode, and the row says which rule answered', async () => {
+  resetCaches(); resetCooldown();
+  use(makeSession({ scrape: [OR_PAGE] }));
+  const out = await executeTool(TOOLS.find((t) => t.name === 'search_batch')!, {
+    queries: [{ query: '4U 服务器 机箱', match_mode: 'any', limit: 30 }], attempts: 1, timeout_s: 60,
+  });
+  assert.equal(out.ok, true);
+  const row = out.data!.queries[0];
+  assert.equal(row.status, 'success');
+  assert.equal(row.count, 22);
+  assert.equal(row.match_mode_used, 'any');
+  assert.equal(row.matched_by, 'any_terms');
+  assert.equal(row.relaxed, undefined, 'an explicit any is not a relaxation');
+  resetCooldown();
+});
+
+test('a detail read re-checks a relaxed answer with the rule that admitted it, not with the strict one', async () => {
+  // The regression this pins: `publishSearch` re-ran the strict all-terms test after a detail read,
+  // which by definition no OR-relaxed title passes -- so `detail: 2` on a relaxed answer emptied it.
+  // Driven through the replay route because that is the one that publishes through `publishSearch`
+  // (the rendered-page route has no detail enrichment at all).
+  process.env.XIANYU_DETAIL_FANOUT = '0';
+  resetCaches(); resetCooldown();
+  const rows: string[][] = [
+    ...Array.from({ length: 8 }, (_, i) => [`4U 静音风扇 ${i}`, String(600 + i), '100', '北京', '1']),
+    ...Array.from({ length: 7 }, (_, i) => [`服务器 电源 模块 ${i}`, String(610 + i), '100', '北京', '1']),
+    ...Array.from({ length: 7 }, (_, i) => [`机箱 配件 螺丝 ${i}`, String(620 + i), '100', '北京', '1']),
+    ...Array.from({ length: 8 }, (_, i) => [`木瓜丝 广西特产 ${i}`, String(630 + i), '9', '南宁', '0']),
+  ];
+  const detail = (id: string) => ok({ itemDO: { itemId: id, title: `4U 静音风扇 ${id}`, soldPrice: '100', desc: '成色好' }, sellerDO: { nick: '卖家', city: '北京' } });
+  const replaySession = use(makeSession({
+    mtop: { 'mtop.taobao.idle.pc.detail': [detail('600'), detail('601')] },
+    replay: async () => ({ ...ok(searchReply('4U 服务器 机箱', rows)), ms: 5 }),
+  }));
+  replaySession.runRealNormalizer = true;
+  const out = await run('search_items')({ query: '4U 服务器 机箱', match_mode: 'any', detail: 2, limit: 30, attempts: 1 });
+  try {
+    assert.equal(out.match_mode_used, 'any');
+    assert.equal(out.count, 22, 'the relaxed set survived its detail reads');
+    assert.equal(out.detail_report.length, 2);
+    assert.equal(out.post_detail_filter.query_mismatches, 0, 'no listing was dropped for failing a rule it was never admitted by');
+  } finally { delete process.env.XIANYU_DETAIL_FANOUT; resetCooldown(); resetCaches(); }
+});
+
+
+// ---------------------------------------------------------------- item_view projection, fields and the batch tool
+/** The projection every shortlist call publishes, for the size pin below. */
+const projectionSize = (item: any) => Buffer.byteLength(JSON.stringify(item));
+
+test('item_view compact publishes the shortlist projection, not the page prose', async () => {
+  const longTitle = '联想Thinkpad X220 笔记本电脑 9成新 '.repeat(20);
+  use(makeSession({ item: [UNRENDERED], mtop: { 'mtop.taobao.idle.pc.detail': [ok({
+    itemDO: { itemId: '42', title: longTitle, soldPrice: '1999', wantCnt: 13, quantity: 1, itemStatusStr: '在线', transportFee: '20.00', desc: '专柜入手，成色好。' },
+    sellerDO: { nick: '汴梁', sellerId: '2200778316916', city: '北京', userRegDay: 730, hasSoldNumInteger: 27, newGoodRatioRate: '99%', replyRatio24h: '97%', zhimaAuth: true },
+  })] } }));
+  const out = await run('item_view')({ item_id: '42', compact: true });
+  assert.equal(out.compact, true);
+  assert.equal(out.item_id, '42');
+  assert.equal(out.title_len, Array.from(longTitle.replace(/\s+/g, ' ').trim()).length, 'the original title length survives the truncation');
+  assert.ok(Array.from(out.title).length <= 120);
+  assert.deepEqual(out.seller, {
+    name: '汴梁', user_id: 2200778316916, city: '北京', good_rate: 99, positive_rate: '99',
+    reply_rate_24h: 97, tenure_years: '2', items_sold: 27, zhima_verified: true,
+  });
+  assert.deepEqual([out.price_amount, out.quantity, out.item_status, out.item_status_token], [1999, 1, '在线', 'online']);
+  assert.equal(out.free_shipping, false, 'the exact fee of 20 is not free shipping');
+  assert.equal(out.shipping_fee, 20);
+  assert.equal(out.want_count, '13', 'the site\'s own string, as on a search card');
+  assert.equal(out.url, 'https://www.goofish.com/item?id=42');
+  assert.equal(out.source, 'item_detail_api');
+  assert.equal('description' in out, false, 'the prose a shortlist does not need');
+  assert.equal('typed' in out, false);
+  assert.equal('fields_present' in out, false);
+  assert.ok(projectionSize(out) <= 1024, `projection is ${projectionSize(out)}B`);
+  // A card-only read still projects, and names nothing it did not read: no seller block numbers.
+  resetCaches();   // the detail read above cached item 42; this arm must be a fresh page read
+  use(makeSession({ item: [{ ...RENDERED, title: '男士羊毛呢大衣', seller_positive_rate: '', seller_items_sold: '' }] }));
+  const cardish = await run('item_view')({ item_id: '42', compact: true });
+  assert.equal(cardish.item_id, '42');
+  assert.equal(cardish.price_amount, 1999);
+  assert.equal('quantity' in cardish, false, 'a rendered page states no quantity, so the projection omits it');
+  assert.equal(cardish.seller.name, '汴梁');
+  assert.equal('user_id' in cardish.seller, false, 'and no numeric id it never read');
+});
+
+test('item_view fields is a whitelist that refuses a name it does not publish', async () => {
+  use(makeSession({ item: [RENDERED] }));
+  const out = await run('item_view')({ item_id: '42', compact: true, fields: ['title', 'price_amount', 'seller'] });
+  assert.deepEqual(Object.keys(out).sort(), ['item_id', 'price_amount', 'seller', 'title'], 'item_id always identifies the row');
+  assert.equal(out.title, '男士羊毛呢大衣');
+  assert.equal('quantity' in out, false);
+  // A typo is refused rather than silently dropped: a caller who asked for a field and got an envelope
+  // without it cannot tell a typo from an absent fact.
+  use(makeSession({ item: [RENDERED] }));
+  await assert.rejects(run('item_view')({ item_id: '42', compact: true, fields: ['titel'] }), (e: any) => e instanceof XianyuError && /fields/.test(e.message));
+});
+
+test('item_view_batch reads a shortlist in one call, with a per-id report and no throw for one dead id', async () => {
+  resetCaches(); resetCooldown();
+  process.env.XIANYU_DETAIL_FANOUT = '0';
+  use(makeSession({
+    mtop: { 'mtop.taobao.idle.pc.detail': [
+      ok({ itemDO: { itemId: '42', title: '男士羊毛呢大衣', soldPrice: '1999', quantity: 1, itemStatusStr: '在线', transportFee: '0.00' }, sellerDO: { nick: '汴梁', sellerId: '2200778316916', city: '北京', userRegDay: 730, hasSoldNumInteger: 27, newGoodRatioRate: '99%' } }),
+      ok({ itemDO: { itemId: '43', title: '女士羊毛围巾', soldPrice: '299', quantity: 2, itemStatusStr: '在线' }, sellerDO: { nick: '汴梁', sellerId: '2200778316916', city: '北京', userRegDay: 730, hasSoldNumInteger: 27, newGoodRatioRate: '99%' } }),
+    ] },
+  }));
+  const out = await run('item_view_batch')({ item_ids: ['42', '43', '44'] });
+  try {
+    assert.equal(out.count, 2, 'two listings answered, one did not');
+    assert.equal(out.requested, 3);
+    assert.equal(out.items.length, 2);
+    assert.deepEqual(out.items.map((i: any) => i.item_id), ['42', '43']);
+    assert.ok(out.items.every((i: any) => projectionSize(i) <= 1024), 'the shortlist projection is the batch default');
+    assert.deepEqual(out.reports.map((r: any) => [r.index, r.item_id, r.ok]), [[0, '42', true], [1, '43', true], [2, '44', false]]);
+    assert.equal(out.reports[2].error_type, 'DetailUnavailableError');
+    assert.equal(out.reports[2].reason, 'unavailable');
+    assert.equal(out.reports[0].source, 'item_detail_api');
+    assert.equal(out.reports[0].cached, false);
+    // The ids are normalised and de-duplicated, and a pasted URL is accepted like item_view accepts one.
+    const deduped = await run('item_view_batch')({ item_ids: ['https://www.goofish.com/item?id=42', '42', 'not-an-id'] });
+    assert.equal(deduped.count, 1);
+    assert.equal(deduped.duplicates_skipped, 1);
+    assert.equal(deduped.reports.at(-1).ok, false);
+    assert.equal(deduped.reports.at(-1).reason, 'invalid_arguments');
+  } finally { delete process.env.XIANYU_DETAIL_FANOUT; resetCooldown(); resetCaches(); }
+});
+
+test('item_view_batch fan-out is bounded by its concurrency, and 1 keeps it on the shared page', async () => {
+  resetCaches(); resetCooldown();
+  const ids = ['42', '43', '44', '45'];
+  const served = (poolMs: number) => {
+    const s = use(makeSession({ mtop: { 'mtop.taobao.idle.pc.detail': ids.map((id) => detailReply(id)) }, poolMs }));
+    return s;
+  };
+  // concurrency: 2 means at most two pool pages, and DETAIL_POOL_MAX bounds it above. Four ids is two
+  // full slices, so no id is left for the shared page (a leftover read would be served the wrong
+  // reply by the fixture, which is a fixture artefact rather than a tool fact).
+  const fanned = served(40);
+  const out = await run('item_view_batch')({ item_ids: ids, concurrency: 2 });
+  assert.equal(out.count, 4);
+  assert.ok(fanned.pool.length <= 2, `leased ${fanned.pool.length} pool pages`);
+  const windows = fanned.poolLoads.filter((l: any) => l.to > l.from);
+  const peak = Math.max(...windows.map((l: any) => windows.filter((o: any) => o.from <= l.to && o.to >= l.from).length));
+  assert.ok(peak <= 2, `peak concurrency ${peak} exceeded the requested 2`);
+  assert.equal(fanned.opened.length, 0, 'the shared page was not navigated');
+  // A three-id slice at concurrency 3 is the widest the contract allows, and it really fans out.
+  resetCaches(); resetCooldown();
+  const wide = served(40);
+  const three = await run('item_view_batch')({ item_ids: ids.slice(0, 3), concurrency: 3 });
+  assert.equal(three.count, 3);
+  assert.ok(wide.poolLoads.length >= 3);
+  assert.equal(wide.opened.length, 0);
+  // concurrency: 1 is a serial walk on the shared page: no pool page is leased for it.
+  resetCaches(); resetCooldown();
+  const serial = served(0);
+  const one = await run('item_view_batch')({ item_ids: ['42', '43'], concurrency: 1 });
+  assert.equal(one.count, 2);
+  assert.equal(serial.pool.length, 0, 'a serial batch buys no pool page');
+  assert.equal(serial.opened.length, 2, 'each listing was loaded on the shared page');
+  delete process.env.XIANYU_DETAIL_FANOUT;
+  resetCooldown(); resetCaches();
+});
+
+test('item_view_batch publishes the listings a deadline never reached as timeout reports', async () => {
+  resetCaches(); resetCooldown();
+  // Two ids are read inside the millisecond grant (the pool pages load in 40ms, but the check is made
+  // before the slice, and the first slice fits); the third is past the budget by the time the loop
+  // reaches it. It must be a named timeout row, not an exception that loses the two listings.
+  const s = use(makeSession({ mtop: { 'mtop.taobao.idle.pc.detail': ['42', '43', '44'].map((id) => detailReply(id)) }, poolMs: 40 }));
+  const out = await run('item_view_batch')({ item_ids: ['42', '43', '44'], timeout_s: 0.001, concurrency: 2 });
+  assert.equal(out.reports.length, 3);
+  const timedOut = out.reports.filter((r: any) => r.reason === 'timeout');
+  assert.ok(timedOut.length >= 1, 'the ids the clock never reached are named');
+  for (const report of timedOut) {
+    assert.equal(report.ok, false);
+    assert.equal(report.error_type, 'XianyuError');
+    assert.equal(report.retryable, true);
+    assert.equal(report.retry_after_s, 0, 'timeout is the zero-wait reason, and the row says which it is');
+  }
+  assert.equal(out.count + timedOut.length, 3, 'every id is either a listing or a timeout row');
+  assert.ok(s.opened.length === 0, 'nothing was read on the shared page after the clock ran out');
+  resetCooldown(); resetCaches();
+});
+
+test('cards keep the opaque seller id, detail and item_view publish the numeric one, and it bridges to the seller tools', async () => {
+  // Two different ids for the same seller: a search card's `seller_id` is opaque (an encrypted value
+  // that page.head refuses), and the detail record's `sellerDO.sellerId` is the plain numeric id the
+  // /personal page and both seller tools take. One name over both would change type and meaning
+  // between a card and its detail merge, which is why the numeric one is `seller_user_id`.
+  resetCaches(); resetCooldown();
+  const c = searchCase('thinkpad x220', [['联想 Thinkpad X220 笔记本', '1001', '300', '北京', '1']]);
+  const s = use(makeSession({ cards: [c.rows], mtop: c.mtop }));
+  s.runRealNormalizer = true;
+  const card = (await run('search_items')({ query: 'thinkpad x220', compact: true, attempts: 1 })).items[0];
+  assert.equal(card.seller_id, 'jRM3w0UnqSvHrFFMpqPdsQ==', 'the card carries the opaque id it was sent');
+  assert.equal('seller_user_id' in card, false, 'and no numeric id it never read');
+  // The detail read merges the numeric twin in beside the opaque one -- neither replaces the other.
+  const detail = ok({ itemDO: { itemId: '1001', title: '联想 Thinkpad X220 笔记本', soldPrice: '300' }, sellerDO: { sellerId: '2214350705775', nick: '卖家', city: '北京' } });
+  use(makeSession({ mtop: { 'mtop.taobao.idle.pc.detail': [detail] } }));
+  const deepened = (await run('search_items')({ query: 'thinkpad x220', detail: 1, compact: true, attempts: 1 })).items[0];
+  assert.equal(deepened.seller_id, 'jRM3w0UnqSvHrFFMpqPdsQ==', 'the card id survives the merge');
+  assert.equal(deepened.seller_user_id, 2214350705775, 'and the numeric id arrives as a number, not a string');
+  // item_view publishes the numeric id; the opaque one is not in the detail record at all, and is
+  // reported absent rather than copied from some earlier card.
+  resetCaches();
+  resetCardCache();
+  use(makeSession({ item: [UNRENDERED], mtop: { 'mtop.taobao.idle.pc.detail': [detail] } }));
+  const view = await run('item_view')({ item_id: '1001' });
+  assert.equal(view.seller_user_id, 2214350705775);
+  assert.equal('seller_id' in view, false, 'the detail route never sent an opaque id, so none is invented');
+  // The bridge: the number item_view just published is what seller_profile takes, one call, no page.
+  use(makeSession({}, { head: { ok: true, ret: 'SUCCESS::调用成功', data: HEAD } }));
+  const profile = await run('seller_profile')({ user_id: String(view.seller_user_id) });
+  assert.equal(profile.user_id, '2214350705775');
+  assert.equal(profile.display_name, '汴梁资深化镁');
+  resetCooldown(); resetCaches();
 });

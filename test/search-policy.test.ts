@@ -83,3 +83,29 @@ test('diagnostics carry the suggested queries beside the unmatched tokens', asyn
   assert.deepEqual(d.suggested_queries, ['32G 2400'], 'computed from the unmatched token, on the same block');
   assert.equal(d.titles_inspected, 2);
 });
+
+test('match_mode all|any|phrase picks different titles from the same page, and refuses an empty query', async () => {
+  const { matchingRows, titleMatches, partialTermRows } = await import('../src/search-policy.ts');
+  const rows = [
+    { title: '4U 服务器 机箱 全新' },   // every term, in order  -> phrase and all
+    { title: '4U机箱 服务器' },        // every term, reordered -> all only
+    { title: '4U 机箱 便宜出' },       // two of three
+    { title: '服务器 机箱 配件' },     // two of three
+    { title: '4U 静音风扇' },          // one term
+    { title: '木瓜丝 广西特产' },      // none
+  ];
+  const groups = termGroups('4U 服务器 机箱');
+  const titles = (mode: any) => matchingRows(rows, '4U 服务器 机箱', groups, mode).map((r: any) => r.title);
+  // Phrase is the whole query, normalised: case, spaces and punctuation do not matter, order does.
+  assert.deepEqual(titles('phrase'), ['4U 服务器 机箱 全新']);
+  // All terms is today's rule: every term, any order.
+  assert.deepEqual(titles('all'), ['4U 服务器 机箱 全新', '4U机箱 服务器']);
+  // Any is one term, which is what the OR-relax falls back to.
+  assert.deepEqual(titles('any'), ['4U 服务器 机箱 全新', '4U机箱 服务器', '4U 机箱 便宜出', '服务器 机箱 配件', '4U 静音风扇']);
+  // The loosest useful rule is still not "everything": the unrelated card is never kept.
+  assert.equal(titles('any').includes('木瓜丝 广西特产'), false);
+  // A query with no terms is not a licence to match every title.
+  for (const mode of ['all', 'any', 'phrase'] as const) assert.equal(titleMatches('anything', '', [], mode), false, mode);
+  // The partial rule is the 60%-of-terms rescue, never fewer than two.
+  assert.deepEqual(partialTermRows(rows, groups).map((r: any) => r.title), ['4U 服务器 机箱 全新', '4U机箱 服务器', '4U 机箱 便宜出', '服务器 机箱 配件']);
+});

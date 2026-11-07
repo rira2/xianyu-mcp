@@ -119,8 +119,8 @@ test('only the nine read-only mtop APIs are named anywhere: a closed list, so a 
   assert.deepEqual(write.match(/mtop\.[A-Za-z0-9_.]+/g), [write]);
 });
 
-test('exactly the eleven read-only tools exist, and none of them can change state', () => {
-  assert.deepEqual(TOOLS.map((t) => t.name).sort(), ['browse_feed', 'capabilities', 'item_view', 'recommendations', 'related_items', 'search_batch', 'search_count', 'search_items', 'search_suggest', 'seller_items', 'seller_profile']);
+test('exactly the twelve read-only tools exist, and none of them can change state', () => {
+  assert.deepEqual(TOOLS.map((t) => t.name).sort(), ['browse_feed', 'capabilities', 'item_view', 'item_view_batch', 'recommendations', 'related_items', 'search_batch', 'search_count', 'search_items', 'search_suggest', 'seller_items', 'seller_profile']);
   for (const t of TOOLS) {
     assert.equal(/publish|delete|remove|message|send|upload|comment|order|buy|checkout|follow|favou?rite/i.test(t.name), false, `${t.name} looks like a write tool`);
   }
@@ -168,7 +168,10 @@ test('the detail fan-out is reachable only from inside the lock its caller alrea
   assert.match(fanout, /session\.fanoutSurface\(/, 'the fan-out leases its pages from the session');
   assert.equal((toolsSrc.match(/enrichDetails\(/g) ?? []).length, 1, 'exactly one call site');
   assert.equal((toolsSrc.match(/publishSearch\(/g) ?? []).length, 4, 'all four routes use its publisher');
-  assert.equal((toolsSrc.match(/session\.fanoutSurface\(/g) ?? []).length, 1, 'so nothing else leases a pool page');
+  // Two call sites now: this one and `item_view_batch`, which is registered `locked(...)` for the same
+  // reason -- the pool pages are invisible to every other tool while that lock is held.
+  assert.equal((toolsSrc.match(/session\.fanoutSurface\(/g) ?? []).length, 2, 'the two bounded fan-outs are the only pool tenants');
+  assert.match(toolsSrc, /run: locked\(itemViewBatch\)/, 'the shortlist batch holds the lock the pool is only safe inside');
   // Every route into a pooled answer goes through that one publisher, so there is no way to reach the
   // fan-out that skips the lock -- including the replay route, which is the fourth and returns a
   // published answer from inside the same tool.
@@ -189,14 +192,14 @@ test('every tool says that no account is required, and that it is read-only', ()
   }
 });
 
-test('the entry point does not serialise the tools: the lock belongs to the four page-reading tools only', () => {
+test('the entry point does not serialise the tools: the lock belongs to the page-reading tools only', () => {
   // The regression guard for a defect that shipped: index.ts wrapped *every* tool in `exclusive()`,
   // so the four mtop-only tools queued behind a 70s search -- exactly the latency the two-page
   // session exists to remove -- while browser.ts's own comment claimed they did not. Nothing failed,
   // because the test that "proved" it called `t.run` directly and hand-wrapped the search itself.
   // Read the source, because the property is about the entry point, not about any one tool's runtime.
   const entry = readFileSync(join(ROOT, 'src', 'index.ts'), 'utf8');
-  assert.equal(/exclusive/.test(entry), false, 'index.ts must not take the lock; tools.ts owns it. Re-wrapping all eleven re-serialises the fast tools behind every slow one.');
+  assert.equal(/exclusive/.test(entry), false, 'index.ts must not take the lock; tools.ts owns it. Re-wrapping every tool re-serialises the fast ones behind every slow one.');
   // ...and the lock really is on the four page-reading tools, so the promise is kept rather than deleted.
   const toolsSrc = readFileSync(join(ROOT, 'src', 'tools.ts'), 'utf8');
   // `search_items` is registered as `locked(novel(shaped(searchItems)))`: the shaping wrapper rewrites
@@ -204,8 +207,8 @@ test('the entry point does not serialise the tools: the lock belongs to the four
   // history, both inside the one lock, so the promise is unchanged.
   // `search_batch` is one lock around the whole list, because every query in it walks the same page.
   const lockSite: Record<string, string> = {
-    searchItems: 'run: locked\\(novel\\(shaped\\(searchItems\\)\\)\\)', itemView: 'run: locked\\(itemView\\)', recommendations: 'run: locked\\(recommendations\\)',
-    searchBatch: 'run: locked\\(searchBatch\\)',
+    searchItems: 'run: locked\\(novel\\(shaped\\(searchItems\\)\\)\\)', itemView: 'run: locked\\(itemView\\)', itemViewBatch: 'run: locked\\(itemViewBatch\\)',
+    recommendations: 'run: locked\\(recommendations\\)', searchBatch: 'run: locked\\(searchBatch\\)',
   };
   for (const [name, registration] of Object.entries(lockSite)) {
     assert.match(toolsSrc, new RegExp(registration), `${name} reads the shared navigating page and must take the lock`);
@@ -246,7 +249,7 @@ test('the published argument names and defaults are exactly these', () => {
     browse_feed: { page_number: 1, pages: 1, limit: 60, include_meta: false },
     search_count: { query: '<required>', include_meta: false },
     search_suggest: { query: '<required>', limit: 20, include_meta: false },
-    search_items: { query: '<required>', limit: 120, attempts: 4, pages: 1, topup_pages: 2, detail: 0, timeout_s: '<optional>', deadline_s: '<optional>', expand_synonyms: true, min_price: '<optional>', max_price: '<optional>', city: '<optional>', province: '<optional>', exclude_keywords: '<optional>', form_factor: '<optional>', bare_card_only: '<optional>', cursor: '<optional>', compact: false, sort: 'relevance', title_max_len: 120, new_only: false, include_meta: false },
+    search_items: { query: '<required>', limit: 120, attempts: 4, pages: 1, topup_pages: 2, detail: 0, timeout_s: '<optional>', deadline_s: '<optional>', match_mode: 'all', expand_synonyms: true, min_price: '<optional>', max_price: '<optional>', city: '<optional>', province: '<optional>', exclude_keywords: '<optional>', form_factor: '<optional>', bare_card_only: '<optional>', cursor: '<optional>', compact: false, sort: 'relevance', title_max_len: 120, new_only: false, include_meta: false },
     // A bulk scan is the one place the depth default is 0: the pages a query asks for are what it
     // pays for, and the top-up exists for a single search's completeness rather than a scan's speed.
     // `queries` publishes as one required array argument even though each element has its own shape.
@@ -255,7 +258,10 @@ test('the published argument names and defaults are exactly these', () => {
     // `default_timeout_s` (pinned by the search_batch tests).
     search_batch: { queries: '<required>', compact: true, sort: 'relevance', title_max_len: 120, timeout_s: '<optional>', deadline_s: '<optional>', attempts: 2, per_query_timeout_s: 30, new_only: false, include_meta: false },
     related_items: { item_id: '<optional>', limit: 30, page: 1, include_meta: false },
-    item_view: { item_id: '<required>', include_meta: false },
+    item_view: { item_id: '<required>', compact: false, fields: '<optional>', include_meta: false },
+    // The shortlist batch: the same projection and whitelist as item_view, a bounded fan-out and its
+    // own budget. Concurrency is capped at 3 by the contract.
+    item_view_batch: { item_ids: '<required>', compact: true, fields: '<optional>', concurrency: 2, timeout_s: '<optional>', include_meta: false },
     recommendations: { limit: 30, url: '<optional>', include_meta: false },
     // Both seller tools take two alternatives and neither is required: which one is missing is the
     // question, and a schema that forced one would push the "give exactly one of these" message into

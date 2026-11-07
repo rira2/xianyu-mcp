@@ -33,6 +33,8 @@ import { checkpoint, recordBatchPartial } from './runtime.ts';
 /** One query of a batch: the search arguments `search_items` takes, minus the ones a batch owns. */
 export type BatchQuery = {
   query: string; pages?: number; limit?: number; detail?: number; topup_pages?: number;
+  /** Which relevance rule this query asks for (see `search-policy.ts`); absent means `search_items`' own default. */
+  match_mode?: 'all' | 'any' | 'phrase';
   min_price?: number; max_price?: number; city?: string; province?: string; exclude_keywords?: string[];
   form_factor?: 'pcie' | 'sxm2' | 'sxm3' | 'sxm4' | 'sxm5'; bare_card_only?: boolean;
 };

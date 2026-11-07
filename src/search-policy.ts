@@ -17,6 +17,36 @@ export const matchesGroups = (title: unknown, groups: string[][]): boolean => {
   return groups.length > 0 && groups.every(g => g.some(t => text.includes(compact(t))));
 };
 /**
+ * Which rule a title has to satisfy. `all` is the long-standing one (every query term, any order),
+ * `any` is the OR the field report asked for, and `phrase` is the whole query as one normalised run --
+ * case, spaces and punctuation ignored, order kept. The names are the published `match_mode`.
+ */
+export const MATCH_MODES = ['all', 'any', 'phrase'] as const;
+export type MatchMode = (typeof MATCH_MODES)[number];
+/** The whole query as one comparable run. Empty when the query has no letters or digits at all, and
+ *  an empty phrase matches nothing: `''.includes('')` would otherwise admit every title on the page. */
+const phraseRun = (query: unknown): string => compact(query);
+export const titleMatches = (title: unknown, query: string, groups: string[][], mode: MatchMode): boolean => {
+  const text = compact(title);
+  if (mode === 'phrase') { const phrase = phraseRun(query); return Boolean(phrase) && text.includes(phrase); }
+  if (mode === 'any') return groups.length > 0 && groups.some((g) => g.some((t) => text.includes(compact(t))));
+  return matchesGroups(title, groups);
+};
+/** The rows a rule admits, in their original order. One function for all three so the tool, the
+ *  relabelling and the post-detail re-check cannot disagree about what "matched" means. */
+export const matchingRows = <T>(rows: T[], query: string, groups: string[][], mode: MatchMode): T[] =>
+  rows.filter((row) => titleMatches((row as any)?.title, query, groups, mode));
+/**
+ * The terms a failed strict match still has in common: at least 60% of them, and never fewer than two.
+ * This is the long-standing partial-term rescue, kept ahead of the OR-relax because it is the tighter
+ * answer when it exists.
+ */
+export const partialTermRows = <T>(rows: T[], groups: string[][]): T[] => {
+  const need = Math.max(2, Math.ceil(groups.length * 0.6));
+  return rows.filter((row) => { const text = compact((row as any)?.title); return groups.filter((g) => g.some((t) => text.includes(compact(t)))).length >= need; });
+};
+
+/**
  * Is the relaxed relevance rule on? It is a deliberate exception to the strict guard, so it has a
  * visible name and one kill switch. Default on, because goofish's own search is fuzzy: `E5 2680 v4`
  * returns a page of E5 parts of which two are the CPU, and refusing the page throws away the exact

@@ -202,3 +202,61 @@ export const shapeSearchData = (data: Record<string, any>, opts: { compact?: boo
   }
   return out;
 };
+
+/**
+ * The shortlist projection: what a deal scan keeps from one listing, and nothing of the page's prose.
+ *
+ * It is deliberately smaller than `compactItem` (a search card) and smaller than the `item_view`
+ * envelope: a shortlist of twenty listings is compared on price, quantity, status, who sells it, how
+ * they rate, shipping and age. `title` is truncated to the same 120 characters a compact search card
+ * uses, because a listing title genuinely carries the seller's description spam and this is the one
+ * projection whose per-listing size a caller can plan on (~1KB); `title_len` keeps the original length.
+ * Every optional block is omitted when the source did not state it -- a rendered page has no quantity
+ * and no numeric seller id, and the projection says so by absence rather than by a zero.
+ */
+export const compactListing = (listing: any, opts: { titleMaxLen?: number } = {}): Record<string, any> => {
+  const l = listing ?? {};
+  const title = typeof l.title === 'string' ? l.title : String(l.title ?? '');
+  const chars = Array.from(title);
+  const titleMax = opts.titleMaxLen === undefined ? DEFAULT_TITLE_MAX_LEN : titleMaxLenOf(opts.titleMaxLen);
+  const amount = priceAmountOf(l) ?? numOrNull(l.price_amount);
+  const seller: Record<string, any> = {};
+  if (l.seller) seller.name = l.seller;
+  const user = numOrNull(l.seller_user_id), good = numOrNull(l.seller_good_rate);
+  const reply = numOrNull(l.seller_reply_rate_24h), replyRaw = typeof l.seller_reply_rate_24h_raw === 'string' ? l.seller_reply_rate_24h_raw : '';
+  const tenure = numOrNull(l.seller_tenure_years), sold = numOrNull(l.seller_items_sold), listed = numOrNull(l.seller_items_listed);
+  if (user !== null) seller.user_id = user;
+  if (l.seller_city) seller.city = l.seller_city;
+  if (l.seller_positive_rate !== undefined && String(l.seller_positive_rate).trim() !== '') seller.positive_rate = String(l.seller_positive_rate);
+  if (good !== null) seller.good_rate = good;
+  if (reply !== null) seller.reply_rate_24h = reply;
+  if (replyRaw) { seller.reply_rate_24h_raw = replyRaw; if (reply === null) seller.reply_rate_24h = null; }
+  if (tenure !== null) seller.tenure_years = String(Math.trunc(tenure));
+  if (sold !== null) seller.items_sold = sold;
+  if (listed !== null) seller.items_listed = listed;
+  if (l.seller_zhima_verified === true) seller.zhima_verified = true;
+  const quantity = numOrNull(l.quantity), fee = numOrNull(l.shipping_fee);
+  const stamp = timestampOf(l);
+  const published = stamp !== null ? isoOf(stamp) : (l.published_at ?? l.typed?.published_at ?? null);
+  const wants = l.want_count === undefined || l.want_count === null ? '' : String(l.want_count);
+  return {
+    item_id: l.item_id,
+    title: titleMax === 0 ? title : chars.slice(0, titleMax).join(''), title_len: chars.length,
+    ...(amount === null ? {} : { price_amount: amount }),
+    ...(quantity === null ? {} : { quantity }),
+    ...(l.item_status ? { item_status: String(l.item_status) } : {}),
+    ...(l.item_status_token ? { item_status_token: l.item_status_token } : {}),
+    ...(Object.keys(seller).length ? { seller } : {}),
+    ...(typeof l.free_shipping === 'boolean' ? { free_shipping: l.free_shipping } : {}),
+    ...(fee === null ? {} : { shipping_fee: fee }),
+    ...(wants === '' ? {} : { want_count: wants }),
+    ...(published === null ? {} : { published_at: published }),
+    ...(l.url ? { url: l.url } : {}),
+  };
+};
+/** The published moment of a listing in ISO form, or null. A card stamps milliseconds; a detail reply
+ *  may stamp ISO already. */
+const isoOf = (ms: number | null): string | null => (ms === null || !Number.isFinite(ms) ? null : new Date(ms).toISOString());
+/** The fields `compactListing` can publish, in one place so the `fields` whitelist cannot drift from
+ *  the projection and a test can assert the pair. */
+export const COMPACT_LISTING_FIELDS = ['item_id', 'title', 'title_len', 'price_amount', 'quantity', 'item_status', 'item_status_token', 'seller', 'free_shipping', 'shipping_fee', 'want_count', 'published_at', 'url'] as const;

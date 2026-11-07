@@ -122,8 +122,11 @@ default and a headless machine needs `xvfb-run` or an X server. The mtop-only to
 ## Tools
 
 Every response has `schema_version: 2`, `ok`, `status`, `count`, `data`, `error_type`, `message`,
-`diagnostics`, `retryable`, `retry_after_s`, `elapsed_ms`, and `build`. `build` includes the version,
-commit, dirty state, TypeScript implementation identity and a fingerprint of the loaded modules.
+`diagnostics`, `retryable`, `retry_after_s`, `elapsed_ms`, and `build`. `build` is the slim
+`{version, commit}` by default -- the two fields a caller cannot reconstruct, ~70B -- and
+`include_meta: true` returns the full block (TypeScript implementation identity, a fingerprint of the
+loaded modules, dirty state, deploy verdict, base commit and freshness). `capabilities` always
+publishes the full block, because it is the tool that exists to answer "which build is answering".
 The result appears in both MCP text content and `structuredContent`; failures set MCP `isError: true`.
 
 - `success`: a completed response. Listings are in `data.items`.
@@ -137,8 +140,14 @@ The result appears in both MCP text content and `structuredContent`; failures se
   diagnostics identify the failure. A failed search also names why nothing was returned:
   `diagnostics.empty_reason` is `rejected` when Goofish refused the page, `page_unavailable` when
   nothing was inspected, or `no_relevant_results` when titles were read and none matched, with
-  `diagnostics.titles_inspected` counting the titles that were actually read. **Check status before
-  interpreting count as inventory.**
+  `diagnostics.titles_inspected` counting the titles that were actually read. The evidence a caller
+  acts on is structured, not pasted into the message: `diagnostics.last_attempt` is the last
+  attempt's own verdict (`scraped_cards`, `query_hits`, `token_hits`, `min_query_hits`, rail/blocked
+  flags), `diagnostics.page_text_preview` is what the page said, `diagnostics.unmatched_tokens` names
+  the query terms no title carried, and `diagnostics.suggested_queries` lists the next queries worth
+  trying, built only from the caller's own words (drop an unmatched term, spell a glossary term the
+  other way, or name a related category). `message` is one short sentence on every failed query.
+  **Check status before interpreting count as inventory.**
 
 `count` counts returned cards or suggestions (0 for non-collection tools); keyword inventory is
 `search_count.data.match_count`. A positive inventory estimate can coexist with an unavailable search.
@@ -148,6 +157,12 @@ zero inventory count becomes a successful upstream empty search.
 `error_type` is the class name, and the list is exhaustive: `BrowserError`, `GatedError`,
 `SearchUnavailableError`, `DetailUnavailableError`, `ParseError`, `NavigationError` or `XianyuError`,
 plus `Error` for a throw that is none of ours (a test pins the list against the classes in `errors.ts`).
+
+A retry hint is coherent on every path: `retryable: true` always carries a positive `retry_after_s`
+unless `reason` is one of the documented **zero-wait reasons** (`timeout` -- the work stopped on this
+call's own clock, so there is nothing to wait for), and the **request-shaped reasons**
+(`query_mismatch`, `invalid_arguments`, `unexpected_payload`) are never retryable. A tool that claims
+retryable without naming a wait gets the conservative 5s, and a request-shaped claim is overruled.
 Calls are serialised: one browser, one page, so two tools in flight cannot navigate each other out of
 their own data.
 
@@ -157,7 +172,10 @@ their own data.
 | `browse_feed` | `page_number` (1–10000, d1), `pages` (1–25, d1), `limit` (≤500, d60) | `items[]` of `rank, item_id, title, price, original_price, city, seller, want_count, image_count, image_urls, is_video, category_id, url`; `page_reports`, `raw_cards`, `unique_items`, `count`, `source: homepage_feed`. Every item also carries `typed` + `missing`; see [the typed block](#the-typed-block-every-listing-carries) |
 | `search_count` | `query` | `match_count`, `has_matches`, `source: filter_hitnum`. Zero is an answer, not an error, but only when the site said zero: a `hitnum` that is missing, null, a string or carries a thousands separator is a `ParseError`, never `match_count: 0`. |
 | `search_suggest` | `query`, `limit` (d20) | `suggestions[]` of `text, bucket_num`, `total_count`, `count`, `source: search_suggest` |
-| `search_batch` | `queries[]` (1–20; each `query` plus `pages` 1–10 d1, `limit` 1–300 d60, `detail` d0, `topup_pages` d0, and the same filters as `search_items`), `compact` (dtrue), `sort`, `title_max_len` (0 or 40–500, d120), `timeout_s` (5–600, d180, bounds the whole list), `attempts` (1–5, d2 per query), `per_query_timeout_s` (10–300, d60), `new_only` (dfalse) | `data.queries[]` of `index, query, ok, status` (`success`/`empty`/`partial`/`error`/`skipped`), `count, ms, source, via, pages_fetched`, `items`, `price_stats`, and on failure `error_type`/`message`/`retryable`/`retry_after_s`/`reason`; `totals` (`requested, ok, empty, partial, failed, skipped, listings, unique_listings, duplicates`, plus `new_listings`/`known_listings`), `failed_queries`, `stop_reason`, `throttle_reason`, `partial`, `history`. One call, one envelope, one failed query does not fail the rest. See [bulk scans](#bulk-scans). |
+| `search_items` | `query`, `limit` (d120), `attempts` (d4), `pages` (d1), `topup_pages` (d2), `detail` (d0), `timeout_s` / `deadline_s` (one, not both), `match_mode` (dall), `expand_synonyms` (dtrue), the filters above, `cursor`, `compact` (dfalse), `sort`, `title_max_len` (d120), `new_only` (dfalse), `include_meta` (dfalse) | `items[]`, `count`, `price_stats`, `matched_by`, `match_mode_used`, `relaxed` when the OR-relax ran, `diagnostics` (`tokens`, `unmatched_tokens`, `suggested_queries`, `titles_inspected`, `inventory`), `freshness`, `cache`, `next_cursor`, `detail_report` when `detail` was asked for. See [search controls](#search-controls). |
+| `search_batch` | `queries[]` (1–20; each `query` plus `pages` 1–10 d1, `limit` 1–300 d60, `detail` d0, `topup_pages` d0, `match_mode` per query, and the same filters as `search_items`), `compact` (dtrue), `sort`, `title_max_len` (0 or 40–500, d120), `timeout_s` / `deadline_s` (5–600, d180, bounds the whole list), `attempts` (1–5, d2 per query), `per_query_timeout_s` (10–300, d30), `new_only` (dfalse), `include_meta` (dfalse) | `data.queries[]` of `index, query, ok, status` (`success`/`empty`/`partial`/`timeout`/`error`/`skipped`), `count, ms, source, via, pages_fetched, cache {hit, age_s}`, `matched_by`, `match_mode_used`, `relaxed`, `unmatched_tokens`, `titles_inspected`, `suggested_queries`, `items`, `price_stats`, and on failure `error_type`/`message`/`retryable`/`retry_after_s`/`reason`; `totals` (`requested, ok, empty, partial, failed, skipped, listings, unique_listings, duplicates`, plus `new_listings`/`known_listings`), `failed_queries`, `stop_reason`, `throttle_reason`, `partial`, `history`. One call, one envelope, one failed query does not fail the rest. See [bulk scans](#bulk-scans). |
+| `item_view` | `item_id`, `compact` (dfalse: the shortlist projection), `fields` (whitelist over the projection), `include_meta` (dfalse) | one listing: title, price/`price_amount`, description, gallery, the tag/attribute block, quantity, status, shipping and the seller's numbers, plus `source`, `cache`, `fields_present`/`fields_missing`, `typed`/`missing`. Each seller carries `seller_user_id` (numeric) when the detail read was reached, beside any opaque `seller_id` a card had. See [`item_view`](#item_view-calls-the-detail-api-and-reads-the-pages-call-when-it-cannot). |
+| `item_view_batch` | `item_ids` (1–20), `compact` (dtrue), `fields`, `concurrency` (1–3, d2), `timeout_s` (5–600), `include_meta` (dfalse) | `items[]` (the projection, in request order), `reports[]` of `index, item_id, ok, ms, source, cached, cache_age_s` and per-id failures (`error_type`, `message`, `reason`, `retryable`, `retry_after_s`), `requested`, `count`, `failed`, `duplicates_skipped`. One dead id is a row; a `reason: "timeout"` row is an id the deadline never reached. |
 | `seller_profile` | `user_id` **or** `item_id` (exactly one) | `display_name, avatar_url, signature, seller_credit, buyer_credit, level, level_score, praise_ratio, review_count, listings_count, ratings_count, followers, following, verified_real_name, verified_real_person, verified_zhima`, plus `city, tenure_years, items_sold, items_listed, positive_rate, reply_rate_24h, last_active` **only when given an `item_id`**, `profile_url`, `item_id`, `fields_present` / `fields_missing`, and `source`: **`idle_user_page_head`** (given a `user_id`, one mtop call, no page load) or **`item_detail+idle_user_page_head`** (given an `item_id`, one item page load). A seller that does not exist raises `DetailUnavailableError`; a throttle raises `GatedError`. See [seller tools](#the-two-seller-tools). |
 | `seller_items` | `user_id` **or** `item_id` (exactly one), `limit` (d20), `page` (1–50, d1) | `items[]` of `rank, item_id, title, price, category_id, want_count, tags, image_urls, url` (plus the tag facts and shipping evidence it can derive: `condition`, `badges`, `price_drop`, `attributes`, `free_shipping`, `shipping_source`), `has_more` (from goofish's own `nextPage` -- walk `page`, do not assume 20), `raw_cards`, `count`, `profile_url`, `source: idle_xyh_item_list`. An empty shop and a page past the end are both `count: 0`, not an error; a payload carrying none of the endpoint's own keys is a `ParseError`. goofish serves at most 50 pages of 20, so walk `has_more` rather than asking for a page number up front. |
 
@@ -190,12 +208,30 @@ The query sent to Goofish remains the requested string. `diagnostics.tokens` rep
 and title match counts; `unmatched_tokens` names misses. 服务器/工控 and 显卡/计算卡 are related-query
 suggestions, not automatic equivalents.
 
+`match_mode` chooses the rule that decides whether a title matched, and it applies to `search_items`
+and to each `search_batch` query:
+
+| `match_mode` | admits a title when | `matched_by` |
+|---|---|---|
+| `all` (default) | every query term is present, in any order | `phrase`, `all_terms` or `synonym_terms` |
+| `any` | at least one query term is present | `any_terms` |
+| `phrase` | the whole query is present as one run (case, spaces and punctuation normalised) | `phrase` |
+
+The relevance floor is the same for all three: at least a fifth of the page's cards must match (never
+fewer than one), so "any" cannot turn a recommendation rail into results. The answer says which rule
+actually ran in `match_mode_used`, and an explicit `any`/`phrase` never relaxes to a different rule.
+The default mode has one automatic relaxation, described next.
+
 Goofish’s own search is fuzzy: `E5 2680 v4` can return a page of E5 parts of which two are the CPU,
 and the strict rule — every query term in the title, on at least a fifth of the fetched cards —
 would refuse that page. With relaxed matching on (the default), a set the strict rule refuses is kept
 down to the titles that carry at least 60% of the query’s terms (never fewer than two), best matches
-first. Such an answer says so: `matched_by` is `"partial_terms"` and `partial_relevance` is `true`,
-so a loose match is never indistinguishable from an exact one. For a set the strict rule accepts,
+first. Such an answer says so: `matched_by` is `"partial_terms"`, `partial_relevance` is `true` and
+`relaxed: true`, so a loose match is never indistinguishable from an exact one. When that rescue finds
+nothing, the automatic **OR-relax** tries the same floor under `any`: `4U 服务器 机箱` returns the
+titles carrying any one of the three words with `matched_by: "any_terms"`, `match_mode_used: "any"`
+and `relaxed: true`, instead of an empty refusal. `diagnostics.unmatched_tokens` names the terms
+nobody listed, so a caller can see which half of the query was not there. For a set the strict rule accepts,
 `matched_by` names what admitted it: `"phrase"` when every kept title contains the query as one
 phrase, `"all_terms"` when every term is present in some other order, and `"synonym_terms"` when the
 match needed the Xeon/至强 equivalence. Recommendation rails and pages with no query terms are
@@ -329,9 +365,13 @@ about whether a failure ended the scan. `search_batch` puts that in one call:
 It runs 1–20 queries **in order on the same page**, and answers once. Every query reports its own
 `ok`, `status`, `count`, `ms` and the route that answered (`source`, `via`, `pages_fetched`, plus
 `stop_reason` and `retry_after_s` when one applies), with its `items` and `price_stats` shaped exactly
-as `search_items` shapes them. **A failed query does not fail the call**: the queries after it still
-run, and its row carries `error_type`, `message`, `retryable`, `retry_after_s` and, when the tool can
-name it, `reason`; the cards that query had already validated are still in its `items`. A query the
+as `search_items` shapes them, and its own `match_mode` where one was asked for. A row also carries the
+relevance facts flat -- `matched_by`, `match_mode_used`, `relaxed`, `unmatched_tokens`,
+`titles_inspected`, `suggested_queries` -- so a scan can decide whether to retry the words without
+opening anything. Its `cache` block is the two facts a row is read for: `{hit, age_s}` (`search_items`
+keeps the per-page block). **A failed query does not fail the call**: the queries after it still run,
+and its row carries `error_type`, a one-sentence `message`, `retryable`, `retry_after_s` and, when the
+tool can name it, `reason`; the cards that query had already validated are still in its `items`. A query the
 call never reached — the deadline, a throttle, or this process's cooldown — is `skipped: true` with
 `status: "skipped"`, `stop_reason` and `reason` naming `timeout` or `cooldown`, and `error_type`
 `XianyuError` (a published type: a batch row never invents an error class). So `ok: false` always
@@ -361,9 +401,11 @@ The defaults are the batch's own, and they are not `search_items`':
   and pays for no others, because the second page of sixty is bought for a price comparison rather
   than for a complete inventory. Pass `topup_pages` on a query to get the single-search behaviour
   back.
-- `timeout_s: 180` bounds the **whole** list, `per_query_timeout_s: 60` bounds one query and is
-  clipped to whatever is left of the call above a 5s reserve, and `attempts: 2` is the per-query
-  retry count. The batch's own deadline is itself 5s inside the envelope's, so a query is only
+- `timeout_s: 180` bounds the **whole** list (`deadline_s` is accepted as the same name, and giving
+  both is refused), `per_query_timeout_s: 30` bounds one query and is clipped to whatever is left of
+  the call above a 5s reserve, and `attempts: 2` is the per-query retry count. A query that overruns
+  its own budget is reported `status: "timeout"` (not `error`) with `reason: "timeout"` and a coherent
+  retry hint, and the queries after it still run. The batch's own deadline is itself 5s inside the envelope's, so a query is only
   started when its 10s floor fits above both reserves: a list that nears its deadline answers
   `partial` with the remaining queries `skipped: true` instead of being cut off mid-search, and a
   `timeout_s` of 20s or less therefore runs nothing and says so. If the envelope's deadline still
@@ -468,6 +510,17 @@ Passing both is refused rather than one quietly winning: a caller who passes bot
 the envelope which one was ignored. Passing neither gets the same treatment. The four fields in the
 bottom row are named in `fields_missing` when you passed a `user_id`, because the profile endpoint has
 no answer for them at all and a blank there would read as "this seller has no history".
+
+**`item_id` is the bridge between the two seller ids.** A search card carries `seller_id`, which is
+opaque -- goofish's encrypted card value, deliberately *not* the numeric id, and `page.head` refuses
+it. A detail read (`item_view`, or `search_items` with `detail`) carries the plain integer as
+`seller_user_id`, which is what `seller_profile({user_id})` and `seller_items({user_id})` take. So a
+scan can go from a card to the seller's other listings either way: keep the card's `item_id` and call
+`seller_profile({item_id})` / `seller_items({item_id})` (one page load, as the table above says), or
+read the listing once, take the numeric `seller_user_id`, and call the same tools with `user_id` (one
+mtop call, no page load). The two names never collapse into one: `seller_id` stays opaque and
+`seller_user_id` is a number, because one name over two values would change type and meaning between a
+card and its detail merge.
 
 The profile endpoint is reached in a way worth knowing. `mtop.idle.web.user.page.head` is the
 endpoint goofish's own `/personal?userId=` page calls, and this server reads it by *issuing* it through
@@ -992,6 +1045,32 @@ strips on a page whose listing was a nail gun.
 The card route is keyed on `item_id`, not on a query, so it cannot return a similarly-named listing.
 It is the *last* resort rather than the first, now that the page itself is fast; it replaced a fallback
 that ran up to eight whole keyword searches, each a fresh 10–25s page load.
+
+`compact: true` publishes the **shortlist projection** instead of the envelope: `item_id`, a
+`title` truncated to 120 characters with `title_len`, `price_amount`, `quantity`, `item_status`
+(plus `item_status_token`), the `seller` block (`name`, `city`, `positive_rate`, `good_rate`,
+`reply_rate_24h` and its raw words when the site printed a floor, `tenure_years`, `items_sold`,
+`items_listed`, `zhima_verified`, `user_id`), `free_shipping`/`shipping_fee`, `want_count`,
+`published_at` and `url`. It is ~1KB per listing: a shortlist compares twenty of them without paying
+for descriptions or the typed block. `source`, `cache` and `attempt_log` stay on the envelope, because
+they are about the call rather than the listing. `fields` is a whitelist over those names; `item_id`
+is always kept, and a name the projection does not publish is refused rather than silently dropped --
+a caller who asked for a field and got an envelope without it cannot tell a typo from an absent fact.
+
+`item_view_batch` is the same read for 1–20 ids in one call: `item_ids` (digits or item URLs;
+duplicates are read once and counted in `duplicates_skipped`, and `index` is the position in the de-duplicated order), `compact` (default `true`), `fields`,
+`concurrency` (1–3, default 2: how many detail pages are read at once; `1` is a serial walk on the
+shared page) and `timeout_s`, which bounds the whole list. `data.items[]` are the projections in
+request order; `data.reports[]` carry `index`, `item_id`, `ok`, `ms`, `source`, `cached`,
+`cache_age_s` and, on failure, `error_type`, `message`, `reason`, `retryable`, `retry_after_s`. One
+dead listing is a row, never the end of the call, and an id the deadline never reached is a
+`reason: "timeout"` row. The fan-out leases the same bounded detail-pool pages `search_items`'
+`detail` argument uses, so it is not twenty `Promise.all` navigations of one page.
+
+Each listing also carries both seller ids where the route has them: a card's `seller_id` is opaque
+(goofish's encrypted card value, which `seller_profile` refuses) and a detail read's
+`seller_user_id` is the plain integer the `/personal` page and both seller tools take. They are
+never one name over two meanings; see [the seller tools](#the-two-seller-tools).
 
 If none of them find it, the error quotes what goofish actually said -- most often that this id is
 sold, removed, or too old to still be live, since goofish answers a dead id with no listing rather than

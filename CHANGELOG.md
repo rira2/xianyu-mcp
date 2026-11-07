@@ -47,6 +47,46 @@ The Python implementation this is a port of is not in this history at all: it li
   (numeric) rather than overwriting the card's opaque `seller_id` meaning; `seller_reply_rate_24h` is a
   number or null, with `seller_reply_rate_24h_raw` carrying the site's words when it printed a floor
   such as `"低于50"`.
+- **Meta is slim by default.** Every tool except `capabilities` publishes `build: {version, commit}`
+  (~70B) instead of the ~756B full block; `include_meta: true` returns the full block (implementation
+  identity, runtime fingerprint, dirty state, deploy verdict, base commit, freshness), and
+  `capabilities` always publishes it. The rest of the envelope is unchanged.
+- **`item_view` gains a shortlist projection and a batch tool.** `compact: true` publishes ~1KB per
+  listing (`item_id`, a 120-character `title` with `title_len`, `price_amount`, `quantity`,
+  `item_status`/`item_status_token`, the `seller` block with `good_rate`/`reply_rate_24h`/`tenure_years`/
+  `items_sold`/`listed`/`zhima_verified`/`user_id`, `free_shipping`/`shipping_fee`, `want_count`,
+  `published_at`, `url`) instead of the page prose, and `fields` is a whitelist over it (`item_id`
+  always kept; an unknown name is refused). New tool `item_view_batch` reads 1-20 ids in one call with
+  a per-id `reports[]` (one dead listing is a row, never the call), `concurrency` 1-3 bounded by the
+  existing detail pool, its own `timeout_s`, and `reason: "timeout"` rows for ids the deadline never
+  reached.
+- **Failed-query diagnostics are structured.** `message` is one sentence; the last attempt's verdict
+  (`diagnostics.last_attempt`), the page text (`page_text_preview`), the terms nobody carried
+  (`unmatched_tokens`) and the next queries worth trying (`suggested_queries`, built only from the
+  caller's own words) are fields. A `search_batch` row carries `suggested_queries`,
+  `unmatched_tokens`, `matched_by`, `match_mode_used`, `relaxed` and `titles_inspected` at the top
+  level, and its `cache` block is now `{hit, age_s}` (`search_items` keeps the per-page block).
+- **`match_mode`: `all` (default), `any`, `phrase`** on `search_items` and each batch query, with
+  `match_mode_used`/`matched_by` on every answer. When the default rule finds fewer than the relevance
+  floor but "at least one term" clears it, the answer is accepted with `relaxed: true` and
+  `match_mode_used: "any"` -- `4U 服务器 机箱` returns the one-word titles instead of nothing -- and
+  `XIANYU_RELAX_MATCH=0` still turns both relaxed paths off. An explicit `any`/`phrase` never relaxes.
+- **Retry hints are coherent on every path.** `retryable: true` now always carries a positive
+  `retry_after_s` unless `reason` is the documented zero-wait `timeout`, and the request-shaped
+  reasons (`query_mismatch`, `invalid_arguments`, `unexpected_payload`) are never retryable. A plain
+  `XianyuError` is invalid_arguments even when its wording names a timeout or deadline (that
+  misclassification was found by the alias test below).
+- **Per-query fail-fast.** `search_batch`'s `per_query_timeout_s` default drops 60 -> 30, `deadline_s`
+  is accepted as an alias for `timeout_s` (one name, not both), and a query that overruns its budget
+  is a `status: "timeout"` row counting in `totals.failed` while the batch continues. Because a 30s
+  grant is below the replay gate's old 35s (20s attempt + 15s typed reserve), the **search** replay
+  entry gate is now the typed route's reserve plus a second of fetch; the in-attempt fetch is still
+  capped to `left - reserve` and the detail gate is unchanged, so a default batch row still takes the
+  1-3s signed-replay route instead of the 15-45s typed one.
+- **Seller-id bridging is documented and pinned.** Cards keep the opaque `seller_id`; a detail read
+  publishes the numeric `seller_user_id` beside it (never instead of it), and `item_view` publishes
+  that number so `seller_profile({user_id})`/`seller_items({user_id})` can follow a card to its seller
+  without the opaque id. `seller_profile({item_id})`/`seller_items({item_id})` remain the one-hop path.
 - A failed search now says why nothing was returned: `diagnostics.empty_reason` is `rejected` when
   Goofish refused the page, `page_unavailable` when nothing was inspected, or `no_relevant_results`
   when titles were read and none matched, and `diagnostics.titles_inspected` counts the titles that
