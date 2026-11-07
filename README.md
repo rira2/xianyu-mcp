@@ -103,6 +103,8 @@ full answer, base ref and fetch included, is what it runs when it has to rebuild
 | `XIANYU_SELLER_PROFILE_BUDGET_S` | 90 | wall-clock budget for the item-page hop `seller_profile` / `seller_items` make when given an `item_id` (5–600s). A lookup by `user_id` runs no loop and spends none of it |
 | `XIANYU_SEARCH_MAX_ITEMS` | 300 | ceiling for one `search_items` call, in listings -- clamps both `limit` and how deep the pager walk goes (30–300), so a huge walk stays inside `XIANYU_SEARCH_BUDGET_S` |
 | `XIANYU_REPLAY` | `1` | `0` turns the signed in-page mtop replay off entirely: `search_items` types into the SPA and `item_view` loads the item page, exactly as before the fast path existed. Read per call, no restart -- see [the replay route](#search-by-replay-and-the-keystroke-as-fallback). |
+| `XIANYU_HISTORY` | `1` | `0` turns the process-local listing history off: no `is_new` / `first_seen_age_s` on cards, no `history` block, and `new_only` has nothing to filter against (it returns the unfiltered listings rather than refusing). Read per call -- see [repeated scans](#repeated-scans). |
+| `XIANYU_RELAX_MATCH` | `1` | `0` restores the strict relevance guard: a result set that does not contain the query terms is refused instead of kept down to the titles carrying ≥ 60% of them, and `matched_by` never reports `partial_terms`. Read per call -- see [search controls](#search-controls). |
 | `XIANYU_DETAIL_FANOUT` | 2 | how many listing pages `detail` loads at once (0–4), `0` reads them one at a time -- see [the detail fan-out](#detail-reads-two-listings-at-a-time-and-says-when-it-stops) |
 | `XIANYU_CACHE` | `1` | `0` turns the item-detail / search-page cache off entirely, no restart -- see [the cache](#repeat-views-are-cached-and-the-cache-says-so) |
 | `XIANYU_CACHE_ITEM_TTL_S` | 45 | how long a listing read in full may be served again (1–600) |
@@ -149,6 +151,7 @@ their own data.
 | `browse_feed` | `page_number` (1–10000, d1), `pages` (1–25, d1), `limit` (≤500, d60) | `items[]` of `rank, item_id, title, price, original_price, city, seller, want_count, image_count, image_urls, is_video, category_id, url`; `page_reports`, `raw_cards`, `unique_items`, `count`, `source: homepage_feed`. Every item also carries `typed` + `missing`; see [the typed block](#the-typed-block-every-listing-carries) |
 | `search_count` | `query` | `match_count`, `has_matches`, `source: filter_hitnum`. Zero is an answer, not an error, but only when the site said zero: a `hitnum` that is missing, null, a string or carries a thousands separator is a `ParseError`, never `match_count: 0`. |
 | `search_suggest` | `query`, `limit` (d20) | `suggestions[]` of `text, bucket_num`, `total_count`, `count`, `source: search_suggest` |
+| `search_batch` | `queries[]` (1–20; each `query` plus `pages` 1–10 d1, `limit` 1–300 d60, `detail` d0, `topup_pages` d0, and the same filters as `search_items`), `compact` (dtrue), `sort`, `timeout_s` (5–600, d180, bounds the whole list), `attempts` (1–5, d2 per query), `per_query_timeout_s` (10–300, d60), `new_only` (dfalse) | `data.queries[]` of `index, query, ok, status` (`success`/`empty`/`partial`/`error`/`skipped`), `count, ms, source, via, pages_fetched`, `items`, `price_stats`, and on failure `error_type`/`message`/`retryable`/`retry_after_s`/`reason`; `totals` (`requested, ok, empty, partial, failed, skipped, listings, unique_listings, duplicates`, plus `new_listings`/`known_listings`), `failed_queries`, `stop_reason`, `throttle_reason`, `partial`, `history`. One call, one envelope, one failed query does not fail the rest. See [bulk scans](#bulk-scans). |
 | `seller_profile` | `user_id` **or** `item_id` (exactly one) | `display_name, avatar_url, signature, seller_credit, buyer_credit, level, level_score, praise_ratio, review_count, listings_count, ratings_count, followers, following, verified_real_name, verified_real_person, verified_zhima`, plus `city, tenure_years, items_sold, items_listed, positive_rate, reply_rate_24h, last_active` **only when given an `item_id`**, `profile_url`, `item_id`, `fields_present` / `fields_missing`, and `source`: **`idle_user_page_head`** (given a `user_id`, one mtop call, no page load) or **`item_detail+idle_user_page_head`** (given an `item_id`, one item page load). A seller that does not exist raises `DetailUnavailableError`; a throttle raises `GatedError`. See [seller tools](#the-two-seller-tools). |
 | `seller_items` | `user_id` **or** `item_id` (exactly one), `limit` (d20), `page` (1–50, d1) | `items[]` of `rank, item_id, title, price, category_id, want_count, tags, image_urls, url`, `has_more` (from goofish's own `nextPage` -- walk `page`, do not assume 20), `raw_cards`, `count`, `profile_url`, `source: idle_xyh_item_list`. An empty shop and a page past the end are both `count: 0`, not an error; a payload carrying none of the endpoint's own keys is a `ParseError`. goofish serves at most 50 pages of 20, so walk `has_more` rather than asking for a page number up front. |
 
@@ -298,19 +301,35 @@ The defaults are the batch's own, and they are not `search_items`':
   its deadline answers `partial` with the remaining queries `skipped: true` instead of being cut off
   mid-search; a `timeout_s` under 10 therefore runs nothing and says so.
 
-Measured against the built server, one `search_batch` of six two-page queries answered 6/6 in **25.4s**
-and 156KB (263 listings, 262 unique, one duplicate), every page from the signed replay — the first
-query paid for the browser launch (15s) and the rest answered in 1.6–2.7s each. Replaying is a route,
-not a promise: on a later run Goofish refused it with `RGV587_ERROR` and the same six queries answered
-6/6 through the typed fallback in 99–109s, the first query paying a page load and a typed search. So a
-scan that cares about its wall clock should read `via` on each row. `npm run bench` runs the same thing
-from a spec file; see [Development](#development).
+Measured against the built server (2026-11-07, [full record](docs/benchmark-2026-11-07.md)), one
+`search_batch` of six two-page queries answered 6/6 in **20.6s** and 152,739B (240 listings, 239
+unique, one duplicate), every page from the signed replay — the first query paid the replay page's
+warm-up (12.3s) and the rest answered in 1.5–1.9s each. Twelve two-page queries answered 12/12 in
+**41.3s** and 330,616B (re-measured on the final build: 54.8s / 351,167B). Replaying is a route, not a
+promise: in the same afternoon goofish refused it
+for four of five single calls (13.9–121.3s typed) and, on another pass, rate-limited a scan with its
+own `RGV587_ERROR` after eight queries — the batch answered `status: "partial"` with
+`throttle_reason: "rate_limited"`, one per-query error and three `skipped` rows instead of failing the
+call. So a scan that cares about its wall clock should read `via` on each row.
+
+The same list from a spec file, against the built server:
+
+```bash
+npm run bench -- scripts/bench-spec.json --tool search_batch --out /tmp/xianyu-scan
+```
+
+See [Development](#development) for the harness flags. Six queries of two pages is the batch at its
+default shape; the acceptance run's twelve-query list is in the benchmark record above.
 
 ## Repeated scans
 
 A deal scan is usually run again: the same keywords a minute, an hour or a day later, asking what is
 new and what got cheaper. The server remembers both questions in memory, per process, so the second
-pass is cheap and the answer is comparable to the first.
+pass answers what changed instead of asking the caller to diff two payloads. It is **not** cheaper to
+fetch: the search-page cache holds 16 pages, and a scan that asks for more than that (twelve queries
+× two pages is 24) re-reads them from goofish — measured, 52.2s against 54.8s for the same twelve
+queries. What `new_only` cuts is the payload: the same twelve queries returned **16,367B** on the
+second pass against **351,167B** on the first, for 13 new listings out of 556.
 
 Every card `search_items` and `search_batch` return carries two more fields:
 
@@ -459,7 +478,10 @@ search.
 Pagination is the payload's own `pageNumber`, re-signed and re-posted, so a second page is a call and
 not a click. `search_items` answers `via: "search_replay"` and `source: "search_api"` when the replay
 answered, and its `attempt_log` names every page it fetched (`via: "search_replay"`, page, items, ms).
-Replay pages go through the same cache the typed route writes, so a deeper walk reuses them. The
+Replay pages are written into the same search-page cache the typed route reads, and the cache is
+consulted before either route is chosen: a later search that asks only for pages still held answers
+`via: "cache"` without asking goofish (the store holds 16 pages; see
+[the cache](#repeat-views-are-cached-and-the-cache-says-so)). The
 answer is held to exactly the same relevance guard and filters: a replay page that is really the
 recommendation rail is refused, and the typed route takes its place.
 
@@ -520,6 +542,8 @@ three sometimes returned items already seen on pages one and two. `pages` is the
 ceiling: if the pages it walked leave fewer than `limit` matches, up to two more are walked. That bounds
 a thin market at about 14s extra rather than letting a degraded page silently under-deliver -- and
 `pages_fetched` and `count` are both in the envelope, so what you actually got is never a guess.
+`topup_pages` (0–2, default 2) says how many of those extra pages the walk may take, so 0 walks
+exactly the pages asked for; a `search_batch` query defaults to 0.
 
 | | scanned | matches | time |
 |---|---|---|---|
@@ -636,9 +660,13 @@ step past the first). Both are cached in the process for a TTL, so the ordinary 
 what looks interesting, open it again, page deeper -- pays for the page load once.
 
 A search whose `(query, page)` set is already cached answers with **no page, no keystroke and no mtop
-call at all**: `via: "cache"`, `attempts: 0`. A deeper walk reuses the pages it already has and clicks
-only the new ones. `detail` is unaffected by where the cards came from -- a cached search still reads
-its top N in full, from the listing cache where it can and from goofish where it cannot.
+call at all**: `via: "cache"`, `attempts: 0`. The check runs before either search route is chosen, and
+it only pays off when *every* page the call asks for is still held — the store holds 16 search pages,
+so a twelve-query two-page scan (24 pages) cannot be answered from it and its second pass re-asks
+goofish (measured 52.2s against 54.8s; `new_only` then shrinks the *payload*, not the fetching). A
+deeper walk within those 16 pages reuses the pages it already has and clicks only the new ones.
+`detail` is unaffected by where the cards came from -- a cached search still reads its top N in full,
+from the listing cache where it can and from goofish where it cannot.
 
 Nothing else is cached, and one thing deliberately is not. `browse_feed` is not: two identical
 feed calls return completely disjoint inventory -- goofish serves each visitor a randomised slice -- so
@@ -749,7 +777,9 @@ Set `XIANYU_HEADLESS=1` to opt back in; the cost is the DOM tools.
 
 Measured live on 2026-09-29, headed, on a shared 4-core box at load ~12 (one goofish page load is
 10–25s here, Chromium launch is ~5s). One process, one browser: the first row is the cold start, every
-other figure is that same warm session. Treat these as order of magnitude, not a benchmark.
+other figure is that same warm session. Treat these as order of magnitude, not a benchmark. The two
+`search_items` rows are the **typed** route — the signed replay did not exist yet; the replay figures
+are measured below.
 
 | tool | warm | result |
 |---|---|---|
@@ -759,8 +789,8 @@ other figure is that same warm session. Treat these as order of magnitude, not a
 | `search_suggest` | 0.4s | 10 suggestions |
 | `related_items` | 2.2s | 20 listings, `item_web_recommend` |
 | `browse_feed` | 1.5s | 20 listings, `homepage_feed` |
-| `search_items` -- first of a session | 20.9s | 10 matches, `search_api` |
-| `search_items` -- later, warm page | 13.6–14.9s | 10 matches, `search_api` |
+| `search_items` -- first of a session, typed | 20.9s | 10 matches, `searchbox` |
+| `search_items` -- later, warm page, typed | 13.6–14.9s | 10 matches, `searchbox` |
 | `item_view` | 6.4–9.5s | 5/5 live listings, `item_detail_api`, `fields_missing: []` |
 | `item_view` -- signed replay, warm | 0.6–1.2s | `item_detail_replay`, `attempts: 0`, `fields_missing: []` |
 | `recommendations` | 17.7s | 20 real listings, `dom_recommendation` |
@@ -802,6 +832,23 @@ homepage replay page's warm-up; the third is the steady state and it is two API 
 reply-first table above: 40.5s / 12.4s / 16.0s for the same three queries on the typed route with the
 same output shape.
 
+The bulk-scan acceptance run measured the same floor across five separate processes on 2026-11-07
+([the full record](docs/benchmark-2026-11-07.md)):
+
+| run | wall | route | result |
+|---|---|---|---|
+| one warm `search_items`, `pages: 1, limit: 60` | **2.1–2.7s** | `search_replay` | 60 listings, 40–43.5KB compact |
+| the same, when goofish refuses the replay | 13.9–15.3s (36.9–121.3s while the replay attempt hung) | `searchbox` | 60 listings |
+| the first call of a process | 9.8–34.1s | `search_replay` | pays the replay page's warm-up, then 1.5–1.9s a page |
+| six two-page queries, one `search_batch` | **20.6s** | 6/6 `search_replay` | 240 listings, 152,739B |
+| twelve two-page queries, one `search_batch` | **41.3s** (54.8s on the final build) | 12/12 `search_replay` | 526 listings, 330,616B (556 / 351,167B) |
+| the twelve again, same process, `new_only: true` | 52.2s | 12/12 `search_replay` | 13 new listings, 16,367B vs 351,167B |
+
+The replay route is not a promise. In under an hour it answered every call of the batch runs — the
+six- and twelve-query lists and both `new_only` passes — was refused for four of five single calls in
+another run, and answered again with a 34.1s first page in a diagnostic. The typed fallback's measured 13.9–121.3s is why `via` is on every answer
+and every batch row: the route is the caller's to see, not something this file can promise.
+
 Each MCP call now has a total deadline, including time in the DOM queue. `search_items.timeout_s`
 overrides the default; browser waits and navigation are capped by the remaining time. Expired work
 cannot start another page load. Response scheduling and serialization can add a small overhead.
@@ -824,7 +871,7 @@ and `FAIL_SYS_SESSION_EXPIRED::Session过期` for `loginuser.get` -- so the sess
 dom_recommendation`, in both modes, with the login dialog up -- on three of four runs; the fourth fell
 back to `source: homepage_feed` with a `fallback_reason`, which is the designed behaviour when the rail
 will not paint, and is live listings either way. The MCP server itself was driven over
-stdio: `initialize`, `tools/list` returning all ten with their schemas and the no-account note on each,
+stdio: `initialize`, `tools/list` returning all eleven with their schemas and the no-account note on each,
 and a live `search_count` returning `{"ok":true,...,"match_count":28846}`.
 
 ### `item_view` calls the detail API, and reads the page's call when it cannot
@@ -988,8 +1035,12 @@ protocol a client does, runs the spec's queries in order and prints a line per q
 never retries -- a failed query is data -- and it exits 2 instead of reporting a number when the
 harness or the protocol breaks. `--out DIR` keeps `summary.json` and each raw envelope
 (`<slug>.json`, or one `batch.json` for `--tool search_batch`) in DIR; without it, `summary.json`
-lands in the current directory. `--timeout` sets one call's budget (default 180s). Build first: the
-harness refuses to run against a missing `dist/index.js`.
+lands in the current directory. `--timeout` sets one call's budget (default 180s). `--tool
+search_batch` runs the whole spec as one batch call, and `--repeat N` (batch only, up to 5) runs the
+same list N times against that same server process — the only way to observe process-local history,
+which is where a second pass's `totals.new_listings` / `known_listings` comes from. Build first: the
+harness refuses to run against a missing `dist/index.js`. The measured acceptance run, with every
+command line and the site's state, is [docs/benchmark-2026-11-07.md](docs/benchmark-2026-11-07.md).
 
 ## License
 

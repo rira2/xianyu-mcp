@@ -82,7 +82,11 @@ The Python implementation this is a port of is not in this history at all: it li
   listings, 262 unique, one duplicate), every page from the signed replay -- the first query paid
   for the browser launch (~15s) and the rest answered in 1.6-2.7s each. When Goofish refuses the
   replay route the same list falls back to the typed search per query: 6/6 in 99-109s on a later,
-  throttled run, and each row's `via` says which route it paid for.
+  throttled run, and each row's `via` says which route it paid for. The 2026-11-07 acceptance run
+  measured the same six at 20.6s / 152,739B, twelve two-page queries at 41.3s / 330,616B (12/12),
+  and an immediate second pass that Goofish rate-limited after eight queries: `status: "partial"`,
+  `throttle_reason: "rate_limited"`, one per-query `SearchUnavailableError` and three `skipped` rows
+  -- the latch firing on the site's own `RGV587_ERROR` rather than on a guess.
 - Add `topup_pages` (0-2, default 2) to `search_items`: 0 walks exactly the pages asked for, so a
   caller comparing a few pages stops paying for the ones it did not ask for. The default behaviour --
   up to two extra pages while the kept set is short of `limit` -- is unchanged, and a batch query
@@ -102,6 +106,17 @@ The Python implementation this is a port of is not in this history at all: it li
   refusal. The pooled API/cache path and the rendered-page fallback read the same switch.
   Recommendation rails and pages carrying none of the query terms are refused in both states, and
   the README documents what each `matched_by` value means.
+- Add a benchmark harness (`scripts/bench-scan.mjs`, `npm run bench -- <spec.json>`) that measures the
+  bulk-scan workflow against the built server over the same MCP stdio protocol a client speaks: one
+  `node dist/index.js`, the spec's queries in order, a line per query plus totals, and no retries -- a
+  failed query is data. `--tool search_batch` runs the spec as one batch call, `--repeat N` re-runs the
+  list against the same process (the only way to observe the process-local history), `--out DIR` keeps
+  every raw envelope, and a harness or protocol fault exits 2 instead of printing a number. It is what
+  produced the figures above -- six two-page queries in 20.6s, twelve in 41.3s, the second pass that
+  was throttled at 92.8s -- and it is what records the route sensitivity honestly: the same day's
+  single-query runs answered from `search_replay` in 2.1-2.7s when goofish accepted it and from the
+  typed route in 13.9-121.3s when it did not. Every command line and raw number is in
+  `docs/benchmark-2026-11-07.md`.
 
 ## [0.2.1] — 2026-10-08
 
