@@ -145,6 +145,20 @@ test('a query is granted only what remains before the batch deadline, less the r
  *  are the real ones. */
 const served = (run: (args: any) => Promise<Record<string, any>>) => ({ ...TOOLS.find((t) => t.name === 'search_batch')!, run });
 
+test('a batch answer pays the slim build block by default, and include_meta buys the full one', async () => {
+  // The full block carries the runtime fingerprint, the deploy verdict and the base commit; on a scan
+  // envelope that is ~0.7KB of meta a caller reads once, if ever. The default is the two fields an
+  // agent cannot reconstruct: which version, which commit.
+  const run = served((args) => runBatch(args, async () => answer(['1']), { deadline: Date.now() + 60_000, cooldown: noCooldown }));
+  const slim = await executeTool(run, { queries: [{ query: 'alpha' }] });
+  assert.deepEqual(Object.keys(slim.build).sort(), ['commit', 'version']);
+  const full = await executeTool(run, { queries: [{ query: 'alpha' }], include_meta: true });
+  assert.match(full.build.runtime_fingerprint, /^[a-f0-9]{64}$/);
+  const saved = Buffer.byteLength(JSON.stringify(full)) - Buffer.byteLength(JSON.stringify(slim));
+  assert.ok(saved >= 600, `the slim default saved ${saved}B, not the ~700B of the full build block`);
+  assert.equal(slim.count, full.count, 'the metashape changed, not the answer');
+});
+
 test('a query that no longer fits ends the list as a partial with its completed rows, never a deadline error', async (t) => {
   t.mock.timers.enable({ apis: ['Date'] });
   const asked: string[] = [];
@@ -295,7 +309,7 @@ test('a failed query keeps the cards the search had already validated', async ()
   }, opts());
   const row = out.queries[0];
   assert.equal(row.ok, false, 'the query still failed');
-  assert.equal(row.status, 'error');
+  assert.equal(row.status, 'timeout', 'its own clock ran out, which is named apart from a refusal');
   assert.equal(row.count, 2, 'but the listings it had already validated are not thrown away');
   assert.deepEqual(row.items.map((i: any) => i.item_id), ['1', '2']);
   assert.equal(row.price_stats.count, 2);
@@ -346,4 +360,58 @@ test('an empty query list is refused before anything is asked', async () => {
   let asked = 0;
   await assert.rejects(runBatch({ queries: [] }, async () => { asked++; return answer([]); }, opts()), (e: any) => e instanceof XianyuError && /queries/.test(e.message));
   assert.equal(asked, 0);
+});
+
+test('a batch row publishes a slim cache verdict: whether any page was cached, and how old it was', async () => {
+  // `search_items` keeps the per-page block, because a single search's pages can be read at different
+  // moments and the envelope should say which. A scan row is read for a price comparison in one go,
+  // so all it needs is the two facts a caller acts on -- was goofish asked, and how old is the answer.
+  const observed = new Date(Date.now() - 12_000).toISOString();
+  const out = await runBatch({ queries: [{ query: 'alpha' }] }, async () => answer(['1'], {
+    cache: { enabled: true, hits: 1, misses: 1, ttl_s: 120, note: 'one of two pages was served from cache, and this note is long enough to be the reason the block was slimmed',
+      pages: [{ page: 1, hit: false, age_s: null, observed_at: new Date().toISOString() }, { page: 2, hit: true, age_s: 12, observed_at: observed }] },
+  }), opts());
+  assert.deepEqual(out.queries[0].cache, { hit: true, age_s: 12 }, 'no pages[], no note, no ttl: the row answer only');
+  const live = await runBatch({ queries: [{ query: 'alpha' }] }, async () => answer(['1'], { cache: { enabled: true, hits: 0, misses: 1, ttl_s: 120, pages: [{ page: 1, hit: false, age_s: null }] } }), opts());
+  assert.deepEqual(live.queries[0].cache, { hit: false, age_s: null }, 'a row read live says so rather than arriving without the block');
+});
+
+test('the per-query default is 30s, not 60: a 13-query scan is bounded by the call, not one slow row', async () => {
+  // The batch's own deadline already stops starting queries, but one query granted 60s can sit inside
+  // that budget for a minute before the next row starts. 30s is the published default now, and a
+  // caller who wants the old long leash asks for it explicitly.
+  const seen: any[] = [];
+  const out = await runBatch({ queries: [{ query: 'alpha' }] }, async (args) => { seen.push(args.timeout_s); return answer(['1']); }, opts());
+  assert.deepEqual(seen, [30], 'the default grant');
+  assert.equal(out.queries[0].status, 'success');
+  const explicit: any[] = [];
+  await runBatch({ queries: [{ query: 'alpha' }], per_query_timeout_s: 60 }, async (args) => { explicit.push(args.timeout_s); return answer(['1']); }, opts({ deadline: Date.now() + 120_000 }));
+  assert.deepEqual(explicit, [60], 'an explicit budget is still honoured');
+});
+
+test('a query that overruns its own budget is a timeout row, and the batch continues', async () => {
+  // The query's own clock ran out: that is a different fact from "goofish refused it" and from "the
+  // list never reached it". Its status is `timeout`, its retry hint is coherent (zero wait, timeout
+  // reason), and the next query still runs -- one slow row must not end the scan.
+  const asked: string[] = [];
+  const out = await runBatch({ queries: [{ query: 'slow' }, { query: 'next' }] }, async (args) => {
+    asked.push(args.query);
+    if (args.query === 'slow') throw Object.assign(new XianyuError('goofish never served a usable result set for "slow"'), { details: { reason: 'timeout', retryable: true, retry_after_s: 0 } });
+    return answer(['1']);
+  }, opts());
+  assert.deepEqual(asked, ['slow', 'next'], 'the query after the timeout still ran');
+  const slow = out.queries[0];
+  assert.equal(slow.status, 'timeout');
+  assert.equal(slow.ok, false);
+  assert.equal(slow.reason, 'timeout');
+  assert.equal(slow.retryable, true);
+  assert.equal(slow.retry_after_s, 0, 'timeout is the documented zero-wait reason');
+  assert.match(slow.message, /result set/);
+  assert.equal(out.queries[1].status, 'success');
+  assert.equal(out.totals.failed, 1, 'a timeout row is a failed query in the totals');
+  assert.equal(out.totals.ok, 1);
+  assert.equal(out.totals.requested, 2);
+  assert.equal(out.totals.ok + out.totals.empty + out.totals.partial + out.totals.failed + out.totals.skipped, 2);
+  assert.deepEqual(out.failed_queries, [0]);
+  assert.equal(out.partial, true);
 });

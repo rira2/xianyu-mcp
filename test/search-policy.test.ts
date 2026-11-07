@@ -57,3 +57,29 @@ test('explicit virtual display takes precedence, then DISPLAY, then automatic st
   assert.equal(displaySetting({ XIANYU_DISPLAY: ':7', DISPLAY: ':0' }), ':7');
   assert.equal(displaySetting({ DISPLAY: ':0' }), ':0'); assert.equal(displaySetting({}), '');
 });
+
+test('a failed query suggests only its own words: the unmatched token dropped, or an explicit equivalent', async () => {
+  // The `32G 2400 RECC` shape from the field report: three terms, the last one not in the titles.
+  // Suggestions stay inside what the caller typed -- drop the term that never appeared, spell a term
+  // the glossary knows under its other name, or name the related category the glossary records. No
+  // synonym is invented beyond those tables, and the query itself is never offered back.
+  const { suggestedQueries } = await import('../src/search-policy.ts');
+  const memory = suggestedQueries('32G 2400 RECC', ['recc']);
+  assert.ok(memory.includes('32G 2400'), `the dropped-token form is the obvious next query: ${JSON.stringify(memory)}`);
+  assert.equal(memory.includes('32G 2400 RECC'), false, 'the query that just failed is not a suggestion');
+  assert.deepEqual(suggestedQueries('32G 2400 RECC', ['recc']).length, new Set(memory).size, 'no duplicates');
+  // An equivalent the glossary already owns, and a related category that is explicitly a suggestion.
+  assert.deepEqual(suggestedQueries('Xeon E5 2680 v4', []), ['至强 E5 2680 v4']);
+  assert.deepEqual(suggestedQueries('服务器', []), ['工控']);
+  // A single-term query has nothing it can drop, and inventing a shorter one would be a different
+  // question: the answer is an empty list, not a guess.
+  assert.deepEqual(suggestedQueries('RECC', ['recc']), []);
+  assert.deepEqual(suggestedQueries('recc', []), []);
+});
+
+test('diagnostics carry the suggested queries beside the unmatched tokens', async () => {
+  const d = queryDiagnostics('32G 2400 RECC', [{ title: '三星 32G 2400 内存' }, { title: '海力士 32G 2400 内存条' }]);
+  assert.deepEqual(d.unmatched_tokens, ['recc'], 'no title carried the third term');
+  assert.deepEqual(d.suggested_queries, ['32G 2400'], 'computed from the unmatched token, on the same block');
+  assert.equal(d.titles_inspected, 2);
+});

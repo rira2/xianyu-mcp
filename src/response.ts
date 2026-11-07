@@ -12,11 +12,49 @@ export const OUTPUT_SCHEMA = {
   diagnostics: z.record(z.string(), z.unknown()), build: z.record(z.string(), z.unknown()),
   schema_version: z.number().int(), elapsed_ms: z.number().nonnegative(),
 };
+/** The reasons where a zero wait is honest: the work stopped on this call's own clock, so there is
+ *  nothing to wait *for* -- the site was never asked, or asked and never answered. Every other
+ *  retryable reason publishes a positive wait, because "retryable" without a "when" is a hint the
+ *  caller cannot act on. */
+export const ZERO_WAIT_REASONS = ['timeout'];
+/** The reasons that describe the caller's request rather than the site: an identical call gets the
+ *  same refusal, so publishing them as retryable is the incoherence this rule exists to prevent. */
+export const REQUEST_REASONS = ['query_mismatch', 'invalid_arguments', 'unexpected_payload'];
+/** The conservative wait given to a retryable failure that named none. Five seconds is the smallest
+ *  wait this server already uses for a network retry, and a caller that ignores it loses nothing. */
+export const RETRY_FALLBACK_S = 5;
+/**
+ * One rule for every published retry hint, applied where the hint is built rather than checked at the
+ * edge: `retryable: true` carries a positive `retry_after_s` unless the reason is one of the
+ * documented zero-wait ones, and a request-shaped reason is never retryable at all. Both halves are
+ * needed -- the first stops a "retry now" that means nothing, the second stops a caller retrying a
+ * query Goofish will refuse identically.
+ */
+export const coherentRetry = (given: { reason?: unknown; retryable?: unknown; retry_after_s?: unknown }): { retryable: boolean; retry_after_s: number } => {
+  const reason = typeof given.reason === 'string' ? given.reason : '';
+  const wait = Number(given.retry_after_s);
+  if (given.retryable !== true || REQUEST_REASONS.includes(reason)) return { retryable: false, retry_after_s: 0 };
+  if (Number.isFinite(wait) && wait > 0) return { retryable: true, retry_after_s: wait };
+  if (ZERO_WAIT_REASONS.includes(reason)) return { retryable: true, retry_after_s: 0 };
+  return { retryable: true, retry_after_s: RETRY_FALLBACK_S };
+};
 export const failureDetails = (e: unknown): Record<string, any> => {
   const { error_type, message } = describe(e);
   let explicit: any;
   try { explicit = (e as any)?.details; } catch { /* a thrown getter cannot erase the failure */ }
-  if (explicit && typeof explicit === 'object') { try { return structuredClone(explicit); } catch { /* opaque diagnostic values do not erase errors */ } }
+  if (explicit && typeof explicit === 'object') {
+    try {
+      const cloned = structuredClone(explicit);
+      // A tool's own details are the diagnosis, but the retry hint is a contract the envelope owns:
+      // an explicit `retryable: true` with no wait, or a retryable `invalid_arguments`, is normalised
+      // here rather than published as-is.
+      return { ...cloned, ...coherentRetry(cloned) };
+    } catch { /* opaque diagnostic values do not erase errors */ }
+  }
+  // Our own refusal is a statement about the request, and no word inside it makes it a site
+  // condition: `XianyuError('give timeout_s or deadline_s, not both')` used to be read as a timeout by
+  // the text rules below, which published a retryable zero-wait hint for a call that could never work.
+  if (error_type === 'XianyuError') return { reason: 'invalid_arguments', retryable: false, retry_after_s: 0 };
   const text = message.toLowerCase();
   if (/rgv587|被挤爆|too many requests|rate.?limit/.test(text)) return { reason: 'rate_limited', retryable: true, retry_after_s: 60 };
   if (/非法访问|正常浏览器|risk.control|illegal_access/.test(text)) return { reason: 'risk_control', retryable: true, retry_after_s: 60 };
@@ -54,13 +92,24 @@ type Definition = { name: string; schema: z.ZodRawShape; run: (args: any) => Pro
    *  leave `timeout_s` optional and let `XIANYU_CALL_TIMEOUT_S` through. */
   default_timeout_s?: number };
 export const executeTool = async (tool: Definition, input: unknown) => {
-  const started = Date.now(), build = buildBlock();
-  const common = { schema_version: 2, build };
+  const started = Date.now(), full = buildBlock();
+  // Meta is a per-response cost paid on every row of a scan, so the default is the two fields a
+  // caller cannot reconstruct (which version, which commit) and `include_meta: true` buys the full
+  // block: implementation, runtime fingerprint, dirty state, deploy verdict. `capabilities` always
+  // carries the full one -- it is the tool that exists to answer "which build is answering", and a
+  // diagnostic that cannot name its own modules cannot be audited. A call that fails before its
+  // arguments parse has no `include_meta` to read, so it publishes the slim block.
+  const slim = { version: full.version, commit: full.commit };
+  const buildFor = (meta: unknown) => (tool.name === 'capabilities' || meta === true ? full : slim);
+  // Typed as a record because the property's shape depends on a runtime switch: a caller reading
+  // `runtime_fingerprint` off the slim block is reading an absent key, not a type error about it.
+  const common: { schema_version: number; build: Record<string, any> } = { schema_version: 2, build: buildFor(undefined) };
   let args: any;
   try {
     const parsed = z.strictObject(tool.schema).safeParse(input);
     if (!parsed.success) throw new XianyuError(parsed.error.issues.map(i => `${i.path.join('.')}: ${i.message}`).join('; '));
     args = parsed.data;
+    common.build = buildFor(args.include_meta);
     const wait = cooldown().retry_after_s;
     if (wait && !(tool.name === 'capabilities' && args.probe === false)) {
       throw Object.assign(new XianyuError(`Goofish cooldown active; retry in ${wait}s.`), { details: { reason: 'rate_limited', retryable: true, retry_after_s: wait, cooldown: cooldown() } });
@@ -69,7 +118,12 @@ export const executeTool = async (tool: Definition, input: unknown) => {
     const configuredSearch = Number(process.env.XIANYU_SEARCH_BUDGET_S);
     const fallback = tool.default_timeout_s ?? (tool.name === 'search_items' && Number.isInteger(configuredSearch) && configuredSearch >= 5 ? Math.min(600, configuredSearch) : searchDefault);
     const envBudget = Number(process.env.XIANYU_CALL_TIMEOUT_S);
-    const timeout = args.timeout_s ?? (Number.isInteger(envBudget) && envBudget >= 1 ? Math.min(600, envBudget) : fallback);
+    // `deadline_s` is the same budget under the field report's name. Two names in one call is a
+    // caller who has not said which budget they meant, so it is refused rather than resolved.
+    if (args.timeout_s !== undefined && args.deadline_s !== undefined) {
+      throw new XianyuError('give timeout_s or deadline_s, not both: deadline_s is an alias for timeout_s');
+    }
+    const timeout = args.timeout_s ?? args.deadline_s ?? (Number.isInteger(envBudget) && envBudget >= 1 ? Math.min(600, envBudget) : fallback);
     const data = await withDeadline(Math.max(0.001, timeout - (Date.now() - started) / 1000), () => tool.run(args));
     if (!data || typeof data !== 'object' || Array.isArray(data) || !Object.keys(data).length) throw Object.assign(new XianyuError('Tool returned an empty or invalid response.'), { details: { reason: 'unexpected_payload', retryable: false, retry_after_s: 0 } });
     try { JSON.stringify(data); } catch { throw Object.assign(new XianyuError('Tool returned a response that cannot be serialized.'), { details: { reason: 'unexpected_payload', retryable: false, retry_after_s: 0 } }); }
@@ -79,8 +133,12 @@ export const executeTool = async (tool: Definition, input: unknown) => {
     refreshObservationAge(data);
     if (data.partial) observeThrottle(data.stop_reason);
     if (data.partial && cooldown().retry_after_s) data.retry_after_s = cooldown().retry_after_s;
+    // The reason a partial answer stopped is the data's own `stop_reason`; the retry hint published
+    // beside it follows the same one rule as a failure's, so `partial: true` with an unexplained zero
+    // wait cannot happen either.
+    const retry = coherentRetry({ reason: data.stop_reason, retryable: Boolean(data.partial), retry_after_s: data.retry_after_s });
     return { ...common, ok: true, status, count, data, error_type: null, message: null,
-      retryable: Boolean(data.partial), retry_after_s: data.retry_after_s ?? 0, diagnostics: { ...(data.diagnostics ?? {}), cooldown: cooldown() }, elapsed_ms: Date.now() - started };
+      retryable: retry.retryable, retry_after_s: retry.retry_after_s, diagnostics: { ...(data.diagnostics ?? {}), cooldown: cooldown() }, elapsed_ms: Date.now() - started };
   } catch (e) {
     const details = failureDetails(e);
     if (details.reason === 'rate_limited' || details.reason === 'risk_control') {

@@ -360,7 +360,8 @@ test('search_items never hands back the recommendation rail as results', async (
     // The refusal must name the rail and the evidence, not the mechanism that produced it. The old
     // wording ("declined per page load") described direct-URL navigation, which the searchbox rewrite
     // replaced; what still has to be true is that the rail was seen, and refused.
-    assert.match(e.message, /"rail":"猜你喜欢"/);
+    assert.equal(e.details?.last_attempt.rail, '猜你喜欢', 'the rail is evidence in diagnostics, not prose in the message');
+    assert.doesNotMatch(e.message, /[{}"]/);
     return true;
   });
   assert.equal(s.opened.length, 3, 'it retried with fresh loads before giving up');
@@ -373,7 +374,7 @@ test('search_items never hands back the recommendation rail as results', async (
   // was under, which is why both scrapers now take the same marker list.)
   const railish = (hits: number, cards: number) => ({ rendered: true, cards_scanned: cards, rail: '', says_no_results: false, text_preview: '小闲鱼', query_hits: hits, items: Array.from({ length: cards }, (_, i) => ({ item_id: String(900 + i), title: i < hits ? 'iPhone 15 Pro 1TB' : '木瓜丝 广西特产', price: '9', condition: '', brand: '', city: '南宁', url: 'u', matches_query: i < hits })) });
   const weak = use(makeSession({ scrape: [railish(1, 40)] }));
-  await assert.rejects(run('search_items')({ query: '1', attempts: 1 }), (e: any) => e instanceof SearchUnavailableError && /"min_query_hits":8/.test(e.message));
+  await assert.rejects(run('search_items')({ query: '1', attempts: 1 }), (e: any) => e instanceof SearchUnavailableError && e.details?.last_attempt.min_query_hits === 8);
   assert.equal(weak.opened.length, 1);
   // and the same page is accepted once enough of it really matches
   const strong = use(makeSession({ scrape: [railish(20, 40)] }));
@@ -439,7 +440,8 @@ test('search_items over-asks the scraper, so leading non-matching cards cannot f
   // ...and the guard still has teeth: a page carrying only some of the terms is a rail, not results.
   domSession(Array.from({ length: 8 }, (_, i) => `机械硬盘 台式机内存条 ${i}`));
   await assert.rejects(run('search_items')({ query: '机械硬盘4t', attempts: 1 }), (e: any) => e instanceof SearchUnavailableError
-    && /"query_hits":0/.test(e.message) && /"token_hits":0/.test(e.message) && /"scraped_cards":8/.test(e.message) && /\b1 attempt\(s\)/.test(e.message));
+    && e.details?.last_attempt.query_hits === 0 && e.details?.last_attempt.token_hits === 0
+    && e.details?.last_attempt.scraped_cards === 8 && /\b1 attempt\(s\)/.test(e.message));
 });
 
 test('every DOM read re-checks the URL first, so a page moved off goofish mid-call is refused', async () => {
@@ -529,7 +531,7 @@ test('a wall-clock budget stops search_items instead of letting it hold the call
   dead.open = async () => { opens++; await new Promise((r) => setTimeout(r, 700)); throw new BrowserError('net::ERR_ADDRESS_UNREACHABLE'); };
   process.env.XIANYU_SEARCH_BUDGET_S = '5';
   const began = Date.now();
-  await assert.rejects(run('search_items')({ query: 'x220', attempts: 10 }), (e: any) => e instanceof SearchUnavailableError && /ERR_ADDRESS_UNREACHABLE/.test(e.message));
+  await assert.rejects(run('search_items')({ query: 'x220', attempts: 10 }), (e: any) => e instanceof SearchUnavailableError && e.details?.reason === 'network');
   const spent = Date.now() - began;
   assert.ok(opens < 10 && spent < 9000, `${opens} page loads in ${spent}ms: the budget did not bind the load-failure path`);
 });
@@ -1435,7 +1437,8 @@ test('a partial-term result set is accepted with matched_by partial_terms, unles
   resetCaches();
   session();
   await assert.rejects(run('search_items')({ query: 'E5 2680 v4', attempts: 1 }), (e: any) => e instanceof SearchUnavailableError
-    && /irrelevant_api_results/.test(e.message));
+    && e.details?.attempt_log.some((entry: any) => entry.retryable === 'irrelevant_api_results')
+    && e.details?.last_attempt.titles_inspected === 30);
 });
 
 // The fuzzy page a typed search gets back: two exact CPUs, twelve E5 parts carrying two of the
@@ -1469,7 +1472,7 @@ test('XIANYU_RELAX_MATCH=0 refuses the same DOM fallback page instead of relaxin
   resetCaches();
   use(makeSession({ scrape: [domFuzzyPage()] }));
   await assert.rejects(run('search_items')({ query: 'E5 2680 v4', limit: 30, attempts: 1 }), (e: any) => e instanceof SearchUnavailableError
-    && e.details?.reason === 'unavailable' && /"min_query_hits":6/.test(e.message) && /"scraped_cards":30/.test(e.message));
+    && e.details?.reason === 'unavailable' && e.details.last_attempt.min_query_hits === 6 && e.details.last_attempt.scraped_cards === 30);
 });
 
 test('the mtop-only tools do not queue behind a search on the shared page', async () => {
@@ -2809,4 +2812,162 @@ test('topup_pages: 0 walks exactly the pages asked for; without it the walk stil
   assert.deepEqual(topped, [1, 2, 3], 'one page asked for, and the shortfall topped up to the two-page bound');
   assert.equal(deep.pages_fetched, 3);
   assert.equal(deep.count, 90);
+});
+
+test('a failed search publishes a coherent retry hint for every reason it can name', async () => {
+  // Finding 6's rule at the search level: `retryable: true` always says when, except for the documented
+  // zero-wait reason (`timeout`), and a query mismatch -- which describes the request, not the site --
+  // is never retryable. These are the three reasons a search really names, driven end to end.
+  resetCaches(); resetCooldown();
+  const def = TOOLS.find((t) => t.name === 'search_items')!;
+  // (1) titles were read and none carried the query: retrying the same words is the same refusal.
+  const unrelated = { rendered: true, cards_scanned: 30, rail: '', says_no_results: false, blocked: false, text_preview: 'x', query_hits: 0, token_hits: 0,
+    items: Array.from({ length: 16 }, (_, i) => ({ item_id: `90${i}`, title: `木瓜丝 广西特产 ${i}`, price: '9', city: '南宁', url: `u90${i}`, matches_query: false })) };
+  use(makeSession({ scrape: [unrelated] }));
+  const mismatch = await executeTool(def, { query: 'thinkpad x220', attempts: 1, timeout_s: 10 });
+  assert.equal(mismatch.ok, false);
+  assert.equal(mismatch.diagnostics.reason, 'query_mismatch');
+  assert.equal(mismatch.retryable, false, 'a query mismatch is not worth retrying');
+  assert.equal(mismatch.retry_after_s, 0);
+  resetCooldown();
+  // (2) a rail page was served instead of a search: the site answered nothing, so retry -- with a wait.
+  resetCaches();
+  use(makeSession({ scrape: [SEARCH_RAIL] }));
+  const unavailable = await executeTool(def, { query: 'thinkpad x220', attempts: 1, timeout_s: 10 });
+  assert.equal(unavailable.diagnostics.reason, 'unavailable');
+  assert.deepEqual([unavailable.retryable, unavailable.retry_after_s], [true, 5], 'a retryable reason that names no wait gets the conservative one');
+  resetCooldown();
+  // (3) the call's own clock stopped it: zero wait is the documented exception.
+  resetCaches();
+  use(makeSession());
+  let release!: () => void;
+  const held = exclusive(() => new Promise<void>((r) => { release = r; }));
+  await new Promise((r) => setImmediate(r));
+  const timeout = await executeTool(def, { query: 'P100', timeout_s: 1 });
+  assert.deepEqual([timeout.ok, timeout.diagnostics.reason, timeout.retryable, timeout.retry_after_s], [false, 'timeout', true, 0]);
+  release(); await held; await exclusive(async () => {});
+  resetCooldown(); resetCaches();
+});
+
+test('deadline_s is an alias for timeout_s, and giving both is refused rather than one silently winning', async () => {
+  // The field report asked for the name it thinks in. The alias is resolved in one place (the
+  // envelope), so the tools' own internal budgets read the same number the deadline was set from.
+  resetCaches(); resetCooldown();
+  const replayed = use(makeSession({ replay: async (api: string, data: any) => replayAnswer(data) }));
+  replayed.runRealNormalizer = true;
+  const batch = TOOLS.find((t) => t.name === 'search_batch')!;
+  const aliased = await executeTool(batch, { queries: [{ query: 'thinkpad x220' }], deadline_s: 60 });
+  assert.equal(aliased.ok, true); assert.equal(aliased.status, 'success');
+  assert.equal(aliased.count, 30, 'the alias set the real budget and the query ran');
+  const both = await executeTool(batch, { queries: [{ query: 'thinkpad x220' }], timeout_s: 60, deadline_s: 60 });
+  assert.equal(both.ok, false);
+  assert.equal(both.diagnostics.reason, 'invalid_arguments');
+  assert.match(both.message ?? '', /not both/);
+  // Sending a deadline the call cannot fit is still a partial with named skips, exactly as timeout_s.
+  resetCaches(); resetCooldown();
+  use(makeSession());
+  const tooShort = await executeTool(batch, { queries: [{ query: 'thinkpad x220' }], deadline_s: 5 });
+  assert.equal(tooShort.status, 'partial');
+  assert.equal((tooShort.data as any).stop_reason, 'timeout');
+
+  // The same alias on a single search: `timeout_s: 2` and `deadline_s: 2` refuse the same call the
+  // same way (the query is queued behind the lock, so no browser is touched).
+  resetCaches(); resetCooldown();
+  const search = TOOLS.find((t) => t.name === 'search_items')!;
+  let release!: () => void;
+  const held = exclusive(() => new Promise<void>((r) => { release = r; }));
+  await new Promise((r) => setImmediate(r));
+  const named = await executeTool(search, { query: 'P100', deadline_s: 1 });
+  assert.equal(named.ok, false); assert.equal(named.diagnostics.reason, 'timeout');
+  const namedBoth = await executeTool(search, { query: 'P100', timeout_s: 1, deadline_s: 1 });
+  console.log('DEBUGBOTH', JSON.stringify(namedBoth).slice(0, 500));
+  assert.equal(namedBoth.ok, false); assert.equal(namedBoth.diagnostics.reason, 'invalid_arguments');
+  assert.match(namedBoth.message ?? '', /not both/);
+  release(); await held; await exclusive(async () => {});
+  resetCooldown(); resetCaches();
+});
+
+test('a default batch row still reaches the signed replay under the 30s per-query budget', async () => {
+  // The interaction that a per-query default alone would have broken: the replay gate used to demand a
+  // full 20s attempt *plus* the typed route's 15s reserve (35s), so a 30s grant could never start it
+  // and every default scan row would have fallen back to the 15-45s typed walk. The gate is now the
+  // reserve plus a second of fetch (the fetch itself is still capped to `left - reserve`), so a 30s
+  // query takes the measured 1-3s route and the row says so.
+  resetCaches(); resetCooldown();
+  const s = use(makeSession({ replay: async (api: string, data: any) => replayAnswer(data) }));
+  s.runRealNormalizer = true;
+  const started = Date.now();
+  const out = await executeTool(TOOLS.find((t) => t.name === 'search_batch')!, { queries: [{ query: 'thinkpad x220' }] });
+  assert.equal(out.ok, true);
+  const row = out.data!.queries[0];
+  assert.equal(row.via, 'search_replay');
+  assert.equal(row.source, 'search_api');
+  assert.equal(row.count, 30);
+  assert.ok(Date.now() - started < 5000, `the typed route was taken: ${Date.now() - started}ms`);
+  assert.equal(s.search.value, '', 'nothing was typed into the page');
+  resetCooldown(); resetCaches();
+});
+
+test('a failed query publishes its evidence as diagnostics, not as JSON pasted into the message', async () => {
+  // The field report's complaint: `message` was a sentence plus `JSON.stringify` of the last attempt
+  // and the page text, so an agent had to parse prose to find out what was read. The diagnosis now
+  // lives where a caller can act on it; the message is one sentence.
+  process.env.XIANYU_RELAX_MATCH = '0';
+  resetCaches(); resetCooldown();
+  const memoryPage = { rendered: true, cards_scanned: 30, rail: '', says_no_results: false, blocked: false, text_preview: '小闲鱼 内存条',
+    query_hits: 0, token_hits: 0,
+    items: Array.from({ length: 30 }, (_, i) => ({ item_id: `7${i}`, title: `三星 32G 2400 内存条 ${i}`, price: '300', city: '深圳', url: `u7${i}`, matches_query: false })) };
+  use(makeSession({ scrape: [memoryPage] }));
+  const out = await executeTool(TOOLS.find((t) => t.name === 'search_items')!, { query: '32G 2400 RECC', attempts: 1, timeout_s: 10 });
+  assert.equal(out.ok, false);
+  assert.equal(out.diagnostics.reason, 'query_mismatch');
+  assert.deepEqual(out.diagnostics.unmatched_tokens, ['recc']);
+  assert.deepEqual(out.diagnostics.suggested_queries, ['32G 2400'], 'the next query is on the diagnostics, built from the caller\'s own words');
+  assert.equal(out.diagnostics.titles_inspected, 30);
+  assert.equal(out.diagnostics.last_attempt.scraped_cards, 30, 'the last attempt is structured, not stringified');
+  assert.equal(out.diagnostics.last_attempt.min_query_hits, 6);
+  assert.equal(out.diagnostics.page_text_preview, '小闲鱼 内存条');
+  assert.equal(typeof out.message, 'string');
+  assert.doesNotMatch(out.message!, /[{}"]/, 'no JSON in the message');
+  assert.ok(out.message!.length < 220, `the message is ${out.message!.length} chars: ${out.message}`);
+  assert.match(out.message!, /32G 2400 RECC/);
+  delete process.env.XIANYU_RELAX_MATCH;
+  resetCooldown();
+});
+
+test('a batch row carries the same diagnostics flat: suggested_queries, unmatched_tokens, titles_inspected', async () => {
+  // The acceptance case. `XIANYU_RELAX_MATCH=0` is what makes this a refusal rather than a
+  // partial-term answer, which is exactly when the suggestion is the useful part of the row.
+  process.env.XIANYU_RELAX_MATCH = '0';
+  resetCaches(); resetCooldown();
+  const memoryPage = { rendered: true, cards_scanned: 30, rail: '', says_no_results: false, blocked: false, text_preview: '小闲鱼',
+    query_hits: 0, token_hits: 0,
+    items: Array.from({ length: 30 }, (_, i) => ({ item_id: `8${i}`, title: `三星 32G 2400 内存条 ${i}`, price: '300', city: '深圳', url: `u8${i}`, matches_query: false })) };
+  const okPage = { rendered: true, cards_scanned: 4, rail: '', says_no_results: false, blocked: false, text_preview: 'thinkpad',
+    query_hits: 2, token_hits: 2,
+    items: [
+      { item_id: '1', title: '联想 ThinkPad X220 笔记本', price: '300', condition: '', brand: '', city: '北京', url: 'u1', matches_query: true },
+      { item_id: '2', title: 'ThinkPad X220 屏幕', price: '100', condition: '', brand: '', city: '北京', url: 'u2', matches_query: true },
+      { item_id: '3', title: '木瓜丝', price: '9', condition: '', brand: '', city: '南宁', url: 'u3', matches_query: false },
+      { item_id: '4', title: '键盘', price: '50', condition: '', brand: '', city: '广州', url: 'u4', matches_query: false },
+    ] };
+  use(makeSession({ scrape: [memoryPage, okPage] }));
+  const out = await executeTool(TOOLS.find((t) => t.name === 'search_batch')!, {
+    queries: [{ query: '32G 2400 RECC' }, { query: 'thinkpad x220' }], attempts: 1, timeout_s: 60,
+  });
+  try {
+    assert.equal(out.status, 'partial');
+    const failed = out.data!.queries[0];
+    assert.equal(failed.ok, false);
+    assert.deepEqual(failed.unmatched_tokens, ['recc'], 'per-row, top level, no diagnostics object to open');
+    assert.deepEqual(failed.suggested_queries, ['32G 2400']);
+    assert.equal(failed.titles_inspected, 30);
+    assert.equal(failed.reason, 'query_mismatch');
+    assert.doesNotMatch(failed.message, /[{}"]/, 'the row message is a sentence, not JSON');
+    const answered = out.data!.queries[1];
+    assert.equal(answered.ok, true);
+    assert.equal(answered.matched_by, 'phrase', 'an answered row says which rule admitted it: both titles carry the whole query');
+    assert.equal(answered.titles_inspected, 4);
+    assert.deepEqual(answered.unmatched_tokens, []);
+  } finally { delete process.env.XIANYU_RELAX_MATCH; resetCaches(); resetCooldown(); }
 });

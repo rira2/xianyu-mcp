@@ -12,10 +12,10 @@ import { DETAIL_POOL_MAX, type DomSurface, type MtopTap, type MtopReply } from '
 import { ensureGoofishUrl, evaluate, exclusive, getSession, HOME, reloadFresh, settle } from './browser.ts';
 import { compact, filterRows, matchesGroups, queryDiagnostics, readCursor, relaxMatch, saveCursor, termGroups, type Filters } from './search-policy.ts';
 import { checkpoint, recordPartial, remainingBudgetMs, remainingMs } from './runtime.ts';
-import { cooldown, failureDetails, observeThrottle } from './response.ts';
+import { coherentRetry, cooldown, failureDetails, observeThrottle } from './response.ts';
 import { shapeSearchData } from './output.ts';
 import { detailListing, enrichListing, FEED_NORMALIZE_JS, ITEM_SCRAPE_JS, PAGER_CLICK_JS, PAGER_STATE_JS, queryTerms, RAIL_MARKERS, SCROLL_TO_JS, SCRAPE_CARDS_JS, searchListings, SEARCH_INPUT_JS, SEARCH_MARK, SEARCH_STATE_JS, sellerListings, sellerProfileOf } from './extract.ts';
-import { DETAIL_API, SEARCH_API, detailPayload, replayEnabled, replayMinBudgetMs, searchPayload } from './replay.ts';
+import { DETAIL_API, SEARCH_API, detailPayload, replayEnabled, replayMinBudgetMs, replayStartBudgetMs, searchPayload } from './replay.ts';
 type Data = Record<string, any>;
 // Endpoints observed in goofish bundles. DETAIL_API and SEARCH_API are re-issued by the signed replay
 // (`replay.ts`) and tapped from page requests as well, so either can answer; the seller endpoints are
@@ -534,8 +534,8 @@ const searchItems = async (args: SearchArgs): Promise<Data> => {
     // reserve can consume the deadline the typed route needs, and the caller sees "Call deadline
     // reached" where the pre-replay search answered.
     const left = deadline - Date.now();
-    if (left < replayMinBudgetMs('search')) {
-      log.push({ attempt: attemptNo, via: 'search_replay', ok: false, why: `the replay was not attempted: the call has ${Math.max(0, Math.round(left / 1000))}s left, less than the ${Math.round(replayMinBudgetMs('search') / 1000)}s it needs and the typed route's reserve` });
+    if (left < replayStartBudgetMs('search')) {
+      log.push({ attempt: attemptNo, via: 'search_replay', ok: false, why: `the replay was not attempted: the call has ${Math.max(0, Math.round(left / 1000))}s left, less than the ${Math.round(replayStartBudgetMs('search') / 1000)}s it needs (one second of fetch above the typed route's reserve)` });
       return null;
     }
     const payloads: any[] = [], pageLines: { page: number; hit: boolean; age_s: number | null; observed_at: string }[] = [];
@@ -816,10 +816,17 @@ const searchItems = async (args: SearchArgs): Promise<Data> => {
   const reason = /RGV587|被挤爆/.test(evidence) ? 'rate_limited' : /"blocked":true|risk_control/.test(evidence) ? 'risk_control'
     : /ERR_TUNNEL|ERR_ADDRESS|could not load/.test(evidence) ? 'network' : Date.now() >= deadline ? 'timeout'
     : diagnostics.titles_inspected > 0 && diagnostics.unmatched_tokens?.length && !declared ? 'query_mismatch' : 'unavailable';
-  const error = new SearchUnavailableError(`goofish never served a usable result set for ${JSON.stringify(q)} in ${Math.round((Date.now() - started) / 1000)}s, over ${attemptsMade} attempt(s) of which ${typed} typed the query. Last attempt: ${JSON.stringify(last)}. ${JSON.stringify(payload.text_preview || '')}`);
+  // One sentence. The evidence a caller acts on -- what the last attempt did, what the page said,
+  // which tokens missed, which queries are worth trying -- is `details`, where it can be read without
+  // parsing prose. `JSON.stringify` in a message is how the field report got a 2KB error string.
+  const error = new SearchUnavailableError(`goofish never served a usable result set for ${q} in ${Math.round((Date.now() - started) / 1000)}s, over ${attemptsMade} attempt(s) of which ${typed} typed the query`);
+  const retry = coherentRetry({ reason, retryable: reason !== 'query_mismatch', retry_after_s: ['rate_limited', 'risk_control'].includes(reason) ? 60 : 0 });
   Object.assign(error, { details: { reason, empty_reason: emptyReasonOf(reason, Number(diagnostics.titles_inspected) || 0),
-    retryable: reason !== 'query_mismatch', retry_after_s: ['rate_limited', 'risk_control'].includes(reason) ? 60 : 0,
-    ...diagnostics, attempt_log: log, next_cursor: continuation(startPage), effective_limit: cap, effective_max_items: searchCap(), requested_limit: limit } });
+    ...retry,
+    ...diagnostics, attempt_log: log,
+    // The last attempt's own verdict and the page text it saw, structured rather than interpolated.
+    last_attempt: last, page_text_preview: String(payload.text_preview || ''),
+    next_cursor: continuation(startPage), effective_limit: cap, effective_max_items: searchCap(), requested_limit: limit } });
   if (pageProgress) Object.assign(error, { partial: pageProgress });
   throw error;
 };
@@ -1326,7 +1333,7 @@ const capabilities = async ({ probe = true }: Args<typeof CAP_ARGS> = {}): Promi
  * batch) when the caller did not name a budget. A direct `run()` call gets the same default.
  */
 const searchBatch = async (args: BatchArgs): Promise<Data> => {
-  const left = remainingMs((args.timeout_s ?? BATCH_TIMEOUT_S) * 1000);
+  const left = remainingMs((args.timeout_s ?? args.deadline_s ?? BATCH_TIMEOUT_S) * 1000);
   const result = await runBatch(args, searchItems, {
     deadline: Date.now() + Math.max(1, left - BATCH_DEADLINE_MARGIN_MS),
     cooldown,
@@ -1348,9 +1355,14 @@ const searchBatch = async (args: BatchArgs): Promise<Data> => {
 // same shape, so a renamed or retyped argument is a type error rather than a silent drift. `Partial`
 // because the defaults live in the schema.
 type Args<S extends z.ZodRawShape> = Partial<z.infer<z.ZodObject<S>>>;
-const FEED_ARGS = { page_number: z.number().int().min(1).max(MAX_PAGE_NUMBER).default(1), pages: z.number().int().min(1).max(MAX_PAGES).default(1), limit: z.number().int().min(1).max(MAX_LIMIT).default(60) };
-const COUNT_ARGS = { query: z.string().min(1) };
-const SUGGEST_ARGS = { query: z.string().min(1), limit: z.number().int().min(1).max(MAX_LIMIT).default(20) };
+// Meta cost, one switch, on every tool except `capabilities`: the envelope's `build` block is the
+// slim `{version, commit}` by default and `include_meta: true` buys the full one (implementation,
+// runtime fingerprint, dirty state, deploy verdict). It is a payload control, not a search control,
+// which is why it lives beside the shared filter shapes rather than inside any handler.
+const META_ARGS = { include_meta: z.boolean().default(false) };
+const FEED_ARGS = { page_number: z.number().int().min(1).max(MAX_PAGE_NUMBER).default(1), pages: z.number().int().min(1).max(MAX_PAGES).default(1), limit: z.number().int().min(1).max(MAX_LIMIT).default(60), ...META_ARGS };
+const COUNT_ARGS = { query: z.string().min(1), ...META_ARGS };
+const SUGGEST_ARGS = { query: z.string().min(1), limit: z.number().int().min(1).max(MAX_LIMIT).default(20), ...META_ARGS };
 // The post-fetch filters, in one shape, because `search_batch` publishes the same filter contract per
 // query as `search_items` publishes at the top level: two copies of it would be two contracts.
 const SEARCH_FILTERS = {
@@ -1378,6 +1390,10 @@ const SEARCH_ARGS = {
     // the width (0-4, default 2) and each listing reports its own `ms` and `via`.
   detail: z.number().int().min(0).max(MAX_SEARCH_DETAIL).default(0),
   timeout_s: z.number().int().min(1).max(600).optional(),
+// `timeout_s` under the name a caller thinks in. Both are accepted and giving both is refused: a
+  // call that named two budgets has not said which one it meant, and guessing would answer a
+  // different call than the one asked for.
+  deadline_s: z.number().int().min(1).max(600).optional(),
   expand_synonyms: z.boolean().default(true),
   ...SEARCH_FILTERS,
   cursor: z.string().min(1).max(100).optional(),
@@ -1397,6 +1413,7 @@ const SEARCH_ARGS = {
     // which is why a compact card still works (`item_id` and `price_amount` survive); needs history on
     // (`XIANYU_HISTORY=0` disables both the marks and the filter).
   new_only: z.boolean().default(false),
+  ...META_ARGS,
 };
 // One query of a bulk scan: the search controls a batch sets per query, and the same filters
 // `search_items` takes. `topup_pages` is 0 here, the opposite of the single-search default: a bulk
@@ -1423,21 +1440,25 @@ const BATCH_ARGS = {
   // still raise the envelope when the caller did not name a budget; `searchBatch` applies the 180s
   // default itself, and the tool definition below publishes the same number as the envelope fallback.
   timeout_s: z.number().int().min(5).max(600).optional(),
+// The alias `search_items` takes, with this tool's own floor. See the note above the batch's
+  // `per_query_timeout_s`: a query is clipped to what is left of whichever name was used.
+  deadline_s: z.number().int().min(5).max(600).optional(),
   attempts: z.number().int().min(1).max(5).default(2),
-  per_query_timeout_s: z.number().int().min(10).max(300).default(60),
+  per_query_timeout_s: z.number().int().min(10).max(300).default(30),
 // The same novelty control `search_items` takes, applied per query against one process-wide store:
   // `totals.new_listings`/`known_listings` say what the scan saw, and `new_only` keeps only the new
   // cards in each row (a second pass of the same list is then mostly empty).
   new_only: z.boolean().default(false),
+  ...META_ARGS,
 };
-const RELATED_ARGS = { item_id: z.string().optional(), limit: z.number().int().min(1).max(MAX_LIMIT).default(30), page: z.number().int().min(1).max(MAX_PAGE_NUMBER).default(1) };
-const ITEM_ARGS = { item_id: z.string().min(1) };
-const RECO_ARGS = { limit: z.number().int().min(1).max(MAX_LIMIT).default(30), url: z.string().optional() };
+const RELATED_ARGS = { item_id: z.string().optional(), limit: z.number().int().min(1).max(MAX_LIMIT).default(30), page: z.number().int().min(1).max(MAX_PAGE_NUMBER).default(1), ...META_ARGS };
+const ITEM_ARGS = { item_id: z.string().min(1), ...META_ARGS };
+const RECO_ARGS = { limit: z.number().int().min(1).max(MAX_LIMIT).default(30), url: z.string().optional(), ...META_ARGS };
 // Both seller tools take the same two alternatives and neither is required: which is missing is the
 // question, and making one required would push that message into every caller's error handling.
 // `resolveSeller` asks. `item_id` is looser on purpose -- an empty string is how a caller says "not
 // this one", which is a better answer than a validation error.
-const SELLER_ARGS = { user_id: z.string().optional(), item_id: z.string().optional() };
+const SELLER_ARGS = { user_id: z.string().optional(), item_id: z.string().optional(), ...META_ARGS };
 const SELLER_ITEMS_ARGS = { ...SELLER_ARGS, limit: z.number().int().min(1).max(SELLER_PAGE_SIZE).default(SELLER_PAGE_SIZE), page: z.number().int().min(1).max(MAX_SELLER_PAGE).default(1) };
 type FeedArgs = Args<typeof FEED_ARGS>; type CountArgs = Args<typeof COUNT_ARGS>; type SuggestArgs = Args<typeof SUGGEST_ARGS>;
 type SearchArgs = Args<typeof SEARCH_ARGS>; type RelatedArgs = Args<typeof RELATED_ARGS>; type ItemArgs = Args<typeof ITEM_ARGS>; type RecoArgs = Args<typeof RECO_ARGS>;

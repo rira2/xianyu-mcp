@@ -30,7 +30,7 @@ import { BrowserError, NavigationError } from './errors.ts';
 import { acquireDisplay, stopDisplay } from './display.ts';
 import { checkpoint, remainingBudgetMs, remainingMs } from './runtime.ts';
 import { MTOP_CALL_JS, MTOP_READY_JS, REPLAY_JS, REPLAY_READY_JS } from './extract.ts';
-import { DETAIL_API, H5API_ORIGIN, REPLAY_ATTEMPT_MS, REPLAY_RESERVE_MS, replayEnabled, replayMinBudgetMs, replaySign, replayTokenFailure, replayUrl, validateReplayReply } from './replay.ts';
+import { DETAIL_API, H5API_ORIGIN, REPLAY_ATTEMPT_MS, REPLAY_RESERVE_MS, replayEnabled, replayMinBudgetMs, replaySign, replayStartBudgetMs, replayTokenFailure, replayUrl, validateReplayReply } from './replay.ts';
 const ALLOWED_HOSTS = ['www.goofish.com', 'goofish.com'];
 
 // The values here are URL parts, so they carry their separators ('https:').
@@ -645,8 +645,13 @@ export class Session {
     if (!replayEnabled()) return verdict(false, '', null, 'the replay fast path is off (XIANYU_REPLAY=0)');
     const pausedUntil = this.replayPaused.get(kind) ?? 0;
     if (Date.now() < pausedUntil) return verdict(false, '', null, `the ${kind} replay is paused for ${Math.ceil((pausedUntil - Date.now()) / 1000)}s more after a failed attempt; the typed route is answering instead`);
-    const minBudget = replayMinBudgetMs(kind), left = remainingBudgetMs();
-    if (left < minBudget) return verdict(false, '', null, `the call has ${Math.max(0, Math.round(left / 1000))}s left, less than the ${Math.round(minBudget / 1000)}s a ${kind} replay needs (${Math.round(REPLAY_ATTEMPT_MS[kind] / 1000)}s attempt + ${Math.round(REPLAY_RESERVE_MS / 1000)}s reserve for the typed route); the typed route answers instead`);
+    const minBudget = replayMinBudgetMs(kind), startBudget = replayStartBudgetMs(kind), left = remainingBudgetMs();
+    if (left < startBudget) {
+      const need = kind === 'detail'
+        ? `${Math.round(startBudget / 1000)}s a detail replay needs (${Math.round(REPLAY_ATTEMPT_MS[kind] / 1000)}s attempt + ${Math.round(REPLAY_RESERVE_MS / 1000)}s reserve for the page route)`
+        : `${Math.round(startBudget / 1000)}s a search replay needs (a second of fetch above the ${Math.round(REPLAY_RESERVE_MS / 1000)}s reserve for the typed route)`;
+      return verdict(false, '', null, `the call has ${Math.max(0, Math.round(left / 1000))}s left, less than the ${need}; the typed route answers instead`);
+    }
     const run = this.replayChain.then(async () => {
       try { return await this.replayAttempt(kind, api, data, opts, verdict); }
       catch (e) {

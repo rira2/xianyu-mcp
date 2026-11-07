@@ -24,14 +24,54 @@ export const matchesGroups = (title: unknown, groups: string[][]): boolean => {
  * turns it off, so an empty or misspelled value cannot silently change what a refusal means.
  */
 export const relaxMatch = (env: NodeJS.ProcessEnv = process.env): boolean => env.XIANYU_RELAX_MATCH !== '0';
+/**
+ * The words a suggestion is rebuilt from: the caller's own spellings where the whitespace split lines
+ * up with the query terms, and the normalised terms otherwise. `32G` stays `32G` and does not come
+ * back as `32g`; a query cut at a CJK/Latin boundary (`机械硬盘4t`) has no whitespace to preserve, so
+ * the terms are what is left.
+ */
+const termSpellings = (query: string, terms: string[]): string[] => {
+  const words = String(query ?? '').normalize('NFKC').trim().split(/[\s\u3000]+/).filter(Boolean);
+  return words.length === terms.length && words.every((w, i) => compact(w) === terms[i]) ? words : terms;
+};
+/**
+ * The queries worth trying after this one returned nothing relevant, built only from the caller's own
+ * words: drop each term that matched no title, spell a term the glossary already equates under its
+ * other name, or name a related category the glossary records as a suggestion. Nothing else is
+ * invented -- a single-term query that failed has no honest shorter form, so the list is empty rather
+ * than a guess -- and the query that just failed is never offered back.
+ */
+export const suggestedQueries = (query: string, unmatched: string[] = [], aliases = true): string[] => {
+  const terms = queryTerms(query), spellings = termSpellings(query, terms);
+  const phrase = (parts: string[]) => parts.join(' ').trim();
+  const out: string[] = [];
+  const add = (value: string) => {
+    const v = value.trim();
+    if (v && compact(v) !== compact(query) && !out.some((x) => compact(x) === compact(v))) out.push(v);
+  };
+  // A dropped term only means something when another term is left: `RECC` minus `RECC` is not a query.
+  if (terms.length > 1) for (const token of unmatched) {
+    const at = terms.findIndex((t) => compact(t) === compact(token));
+    if (at >= 0) add(phrase(spellings.filter((_, i) => i !== at)));
+  }
+  for (let i = 0; i < terms.length; i++) {
+    if (aliases) for (const alt of ALIASES[terms[i]] ?? []) if (compact(alt) !== terms[i]) add(phrase(spellings.map((w, k) => (k === i ? alt : w))));
+    for (const related of QUERY_SUGGESTIONS[terms[i]] ?? []) add(phrase(spellings.map((w, k) => (k === i ? related : w))));
+  }
+  return out.slice(0, 5);
+};
 export const queryDiagnostics = (query: string, rows: any[], aliases = true) => {
   const groups = termGroups(query, aliases);
   const tokens = groups.map((alternatives, i) => ({ token: queryTerms(query)[i], alternatives,
     matching_titles: rows.filter(row => matchesGroups(row.title, [alternatives])).length }));
-  return { tokens, unmatched_tokens: tokens.filter(t => t.matching_titles === 0).map(t => t.token),
+  const unmatched_tokens = tokens.filter(t => t.matching_titles === 0).map(t => t.token);
+  return { tokens, unmatched_tokens,
+    // The next queries to try, computed from the same evidence the unmatched list reports: a failure
+    // that names what did not match but not what might is half an answer.
+    suggested_queries: suggestedQueries(query, unmatched_tokens, aliases),
     titles_inspected: rows.length, sample_titles: rows.slice(0, 5).map(r => String(r.title ?? '')),
     suggestions: [...new Set(queryTerms(query).flatMap(t => QUERY_SUGGESTIONS[t] ?? []))],
-    note: 'Title matching ignores case, spaces and punctuation. Only explicit equivalents (Xeon/至强) expand automatically; related product categories are suggestions.' };
+    note: 'Title matching ignores case, spaces and punctuation. Only explicit equivalents (Xeon/至强) expand automatically; related product categories are suggestions. suggested_queries are variations built from the query\'s own words, not a second search.' };
 };
 
 export type Filters = { min_price?: number; max_price?: number; city?: string; province?: string; exclude_keywords?: string[];

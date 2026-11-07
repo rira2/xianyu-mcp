@@ -242,26 +242,26 @@ test('the published argument names and defaults are exactly these', () => {
   const published: Record<string, any> = {
     // `probe: true` by default, and it exists at all so the freshness answer does not have to wait
     // for a browser launch -- see capabilities in tools.ts.
-    capabilities: { probe: true },
-    browse_feed: { page_number: 1, pages: 1, limit: 60 },
-    search_count: { query: '<required>' },
-    search_suggest: { query: '<required>', limit: 20 },
-    search_items: { query: '<required>', limit: 120, attempts: 4, pages: 1, topup_pages: 2, detail: 0, timeout_s: '<optional>', expand_synonyms: true, min_price: '<optional>', max_price: '<optional>', city: '<optional>', province: '<optional>', exclude_keywords: '<optional>', form_factor: '<optional>', bare_card_only: '<optional>', cursor: '<optional>', compact: false, sort: 'relevance', title_max_len: 120, new_only: false },
+    capabilities: { probe: true },   // always full meta; `include_meta` is not part of its contract
+    browse_feed: { page_number: 1, pages: 1, limit: 60, include_meta: false },
+    search_count: { query: '<required>', include_meta: false },
+    search_suggest: { query: '<required>', limit: 20, include_meta: false },
+    search_items: { query: '<required>', limit: 120, attempts: 4, pages: 1, topup_pages: 2, detail: 0, timeout_s: '<optional>', deadline_s: '<optional>', expand_synonyms: true, min_price: '<optional>', max_price: '<optional>', city: '<optional>', province: '<optional>', exclude_keywords: '<optional>', form_factor: '<optional>', bare_card_only: '<optional>', cursor: '<optional>', compact: false, sort: 'relevance', title_max_len: 120, new_only: false, include_meta: false },
     // A bulk scan is the one place the depth default is 0: the pages a query asks for are what it
     // pays for, and the top-up exists for a single search's completeness rather than a scan's speed.
     // `queries` publishes as one required array argument even though each element has its own shape.
     // `timeout_s` is optional rather than 180 at parse time so `XIANYU_CALL_TIMEOUT_S` can set the
     // envelope; the 180 default is applied inside `searchBatch` and republished as the tool's
     // `default_timeout_s` (pinned by the search_batch tests).
-    search_batch: { queries: '<required>', compact: true, sort: 'relevance', title_max_len: 120, timeout_s: '<optional>', attempts: 2, per_query_timeout_s: 60, new_only: false },
-    related_items: { item_id: '<optional>', limit: 30, page: 1 },
-    item_view: { item_id: '<required>' },
-    recommendations: { limit: 30, url: '<optional>' },
+    search_batch: { queries: '<required>', compact: true, sort: 'relevance', title_max_len: 120, timeout_s: '<optional>', deadline_s: '<optional>', attempts: 2, per_query_timeout_s: 30, new_only: false, include_meta: false },
+    related_items: { item_id: '<optional>', limit: 30, page: 1, include_meta: false },
+    item_view: { item_id: '<required>', include_meta: false },
+    recommendations: { limit: 30, url: '<optional>', include_meta: false },
     // Both seller tools take two alternatives and neither is required: which one is missing is the
     // question, and a schema that forced one would push the "give exactly one of these" message into
     // every caller's error handling instead of the envelope.
-    seller_profile: { user_id: '<optional>', item_id: '<optional>' },
-    seller_items: { user_id: '<optional>', item_id: '<optional>', limit: 20, page: 1 },
+    seller_profile: { user_id: '<optional>', item_id: '<optional>', include_meta: false },
+    seller_items: { user_id: '<optional>', item_id: '<optional>', limit: 20, page: 1, include_meta: false },
   };
   assert.deepEqual(Object.fromEntries(TOOLS.map((t) => [t.name, shape(t)])), published);
   // The one arg whose default left the schema keeps its published number on the tool itself.

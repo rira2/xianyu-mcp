@@ -40,7 +40,8 @@ export type BatchArgs = {
   queries: BatchQuery[]; compact?: boolean; sort?: 'relevance' | 'price_asc' | 'price_desc' | 'newest';
   /** How much of each compact card's title to keep (see `output.ts`): 0 for the whole title. */
   title_max_len?: number;
-  timeout_s?: number; attempts?: number; per_query_timeout_s?: number;
+  timeout_s?: number; /** `timeout_s` under the field report's name; `tools.ts` resolves it. */ deadline_s?: number;
+  attempts?: number; per_query_timeout_s?: number;
   /** The tool's novelty filter. `runBatch` never reads it: history is process state and the rows'
    *  items are already shaped, so `tools.ts` annotates the finished envelope (`annotateBatchData`)
    *  rather than teaching this orchestration module about memory it does not own. */
@@ -51,8 +52,8 @@ export type SearchOne = (args: any) => Promise<Record<string, any>>;
 
 // The defaults a direct `runBatch` call gets when nobody parsed the schema first. They mirror
 // `BATCH_ARGS` in tools.ts and live here so a test or a script driving this module directly gets the
-// same batch the tool publishes: one page, sixty listings, no top-up, two attempts, sixty seconds.
-const BATCH_PAGES = 1, BATCH_LIMIT = 60, BATCH_DETAIL = 0, BATCH_TOPUP_PAGES = 0, BATCH_ATTEMPTS = 2, PER_QUERY_TIMEOUT_S = 60;
+// same batch the tool publishes: one page, sixty listings, no top-up, two attempts, thirty seconds per query.
+const BATCH_PAGES = 1, BATCH_LIMIT = 60, BATCH_DETAIL = 0, BATCH_TOPUP_PAGES = 0, BATCH_ATTEMPTS = 2, PER_QUERY_TIMEOUT_S = 30;
 // A per-query budget below this is a refusal rather than a budget: one search's own retry loop and a
 // page load do not fit in less, and the search tool would spend the call learning that. It is also
 // the smallest slice of the call's budget that can start another query at all.
@@ -93,7 +94,41 @@ const skippedRow = (index: number, query: string, cause: SkipCause, wait: number
     index, query, ok: false, status: 'skipped', skipped: true, count: 0, ms: 0,
     error_type: 'XianyuError', message, stop_reason: reason, reason,
     retryable: true, retry_after_s: cause === 'deadline' ? 0 : wait,
+    // A query the call never reached inspected nothing, and says so rather than leaving the keys out
+    // of some rows and not others.
+    unmatched_tokens: [], titles_inspected: 0, suggested_queries: [],
     items: [], price_stats: null,
+  };
+};
+
+/**
+ * The cache verdict a batch row publishes: `{hit, age_s}` and nothing else. `search_items` keeps the
+ * per-page block because a single search's pages can be read at different moments; a scan row is one
+ * price comparison, so it needs the two facts a caller acts on -- was goofish asked for this row, and
+ * how old is the oldest page behind it. `age_s` is the oldest cached page, so the number is an upper
+ * bound on the row's staleness rather than a flattering average.
+ */
+const slimCache = (cache: any): { hit: boolean; age_s: number | null } => {
+  const pages = Array.isArray(cache?.pages) ? cache.pages : [];
+  const ages = pages.filter((p: any) => p?.hit).map((p: any) => Number(p.age_s)).filter((n: number) => Number.isFinite(n));
+  const hit = ages.length > 0 || cache?.hit === true || Number(cache?.hits) > 0;
+  const age = ages.length ? Math.max(...ages) : Number.isFinite(Number(cache?.age_s)) ? Number(cache.age_s) : null;
+  return { hit, age_s: hit ? age : null };
+};
+
+/**
+ * The relevance evidence a row publishes flat, lifted out of the search's own diagnostics. A batch row
+ * has no `diagnostics` block to open -- it is one line of a scan -- so the four facts that decide
+ * whether to retry the words or the call travel at the top level of the row. They are read from the
+ * shaped answer's diagnostics, which every route populates, and from the failure details on a row that
+ * threw. Absent facts are omitted rather than published as zeros.
+ */
+const relevanceFacts = (diag: any): Record<string, any> => {
+  const d = diag && typeof diag === 'object' ? diag : {};
+  return {
+    ...(Array.isArray(d.unmatched_tokens) ? { unmatched_tokens: d.unmatched_tokens } : {}),
+    ...(Number.isFinite(d.titles_inspected) ? { titles_inspected: d.titles_inspected } : {}),
+    ...(Array.isArray(d.suggested_queries) ? { suggested_queries: d.suggested_queries } : {}),
   };
 };
 
@@ -112,7 +147,14 @@ const answeredRow = (index: number, query: string, data: Record<string, any>, ms
     // A partial search publishes the wait it wants observed; keep it so a throttle-latched batch
     // carries goofish's own number instead of the fallback.
     ...(Number.isFinite(shaped.retry_after_s) ? { retry_after_s: Number(shaped.retry_after_s) } : {}),
-    ...(shaped.cache ? { cache: shaped.cache } : {}),
+    ...(shaped.cache ? { cache: slimCache(shaped.cache) } : {}),
+    // Which rule admitted the set, and the evidence behind it. `matched_by` is the search's own word
+    // (`phrase`/`all_terms`/`synonym_terms`/`partial_terms`/`any_terms`), `match_mode_used` names the
+    // rule that actually ran, and `relaxed` says the answer is weaker than the mode asked for.
+    ...(shaped.matched_by ? { matched_by: shaped.matched_by } : {}),
+    ...(shaped.match_mode_used ? { match_mode_used: shaped.match_mode_used } : {}),
+    ...(shaped.relaxed === true ? { relaxed: true } : {}),
+    ...relevanceFacts(shaped.diagnostics),
     items, price_stats: shaped.price_stats ?? null,
   };
 };
@@ -132,9 +174,18 @@ const failedRow = (index: number, query: string, e: unknown, ms: number, compact
   const items = kept && Array.isArray(kept.items) ? kept.items : [];
   const reason = typeof details.reason === 'string' ? details.reason : undefined;
   return {
-    index, query, ok: false, status: 'error', count: items.length, ms, error_type, message,
+    index, query, ok: false,
+    // `timeout` is the query's own clock running out, which is neither a refusal nor a query the call
+    // never reached. Naming it on the row is what lets a caller tell "raise per_query_timeout_s" apart
+    // from "goofish said no".
+    status: reason === 'timeout' ? 'timeout' : 'error', count: items.length, ms, error_type, message,
+    // The details arrive already coherent (`failureDetails` normalises the hint), so the row cannot
+    // publish a retryable `true` with no wait and no zero-wait reason.
     retryable: Boolean(details.retryable), retry_after_s: Number(details.retry_after_s) || 0,
-    ...(reason ? { reason } : {}), items, price_stats: kept?.price_stats ?? null,
+    ...(reason ? { reason } : {}),
+    ...(typeof details.matched_by === 'string' ? { matched_by: details.matched_by } : {}),
+    ...relevanceFacts(details),
+    items, price_stats: kept?.price_stats ?? null,
   };
 };
 
@@ -250,13 +301,16 @@ const partialOf = (asked: BatchQuery[], rows: Record<string, any>[], stopCause: 
 const totalsFor = (requested: number, rows: Record<string, any>[], stopCause: SkipCause | null, throttleReason: string | null, ms: number): Record<string, any> => {
   const withStatus = (status: string) => rows.filter((row) => row.status === status).length;
   const failed = rows.filter((row) => !row.ok).map((row) => row.index);
+  // A `timeout` row answered with an error (its own clock), so it counts with the failures: the five
+  // row statuses still sum to `requested`.
+  const answeredErrors = rows.filter((row) => !row.ok && !row.skipped).length;
   const listings = rows.reduce((sum, row) => sum + row.count, 0);
   const unique = new Set<string>();
   for (const row of rows) for (const item of row.items) if (item?.item_id) unique.add(String(item.item_id));
   return {
     queries: rows,
     totals: {
-      requested, ok: withStatus('success'), empty: withStatus('empty'), failed: withStatus('error'), skipped: withStatus('skipped'), partial: withStatus('partial'),
+      requested, ok: withStatus('success'), empty: withStatus('empty'), failed: answeredErrors, skipped: withStatus('skipped'), partial: withStatus('partial'),
       listings, unique_listings: unique.size, duplicates: listings - unique.size, ms,
     },
     failed_queries: failed,

@@ -269,10 +269,13 @@ test('Session.replay will not start on a budget that cannot also pay the typed r
   await withDeadline(1, async () => {
     const search = await s.replay(SEARCH_API, searchPayload('x', 1));
     assert.equal(search.ok, false);
-    assert.match(String(search.why), /attempt \+ \d+s reserve/i, 'the entry gate names the attempt it could not pay for');
+    // A search's gate is the typed route's 15s reserve plus a second of fetch (the fetch itself is
+    // capped to `left - reserve`), so the message names the reserve it could not leave.
+    assert.match(String(search.why), /reserve for the typed route/i, 'the entry gate names the reserve it could not leave');
+    assert.match(String(search.why), /second of fetch/i);
     const detail = await s.replay(DETAIL_API, detailPayload('1'));
     assert.equal(detail.ok, false);
-    assert.match(String(detail.why), /attempt \+ \d+s reserve/i);
+    assert.match(String(detail.why), /attempt \+ \d+s reserve/i, 'a detail replay still has to pay for its page preparation');
   });
   assert.equal(page.calls.length, 0, 'no fetch was issued when the call could not afford it');
 });
