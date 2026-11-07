@@ -1141,10 +1141,6 @@ const itemView = async ({ item_id, compact = false, fields }: ItemArgs): Promise
   // no item pages to logged-out visitors. It does: the detail API answers SUCCESS anonymously with
   // title, gallery, description and seller statistics.
   const session = getSession(), read = await readListing(session, item, deadline);
-  // The replay attempt travels with the answer, whether it answered or not: a caller comparing two
-  // listings should not have to infer from `attempts: 0` that a signed API call happened instead of a
-  // page load.
-  const attemptLog = read.replay ? [{ attempt: 1, via: 'detail_replay', ...read.replay }] : [];
   if (read.listing) {
     const l = read.listing, full = itemViewAnswer(l, item, read);
     // The shortlist projection, for a caller comparing twenty listings rather than reading one: the

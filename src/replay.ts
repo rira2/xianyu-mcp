@@ -40,9 +40,11 @@ export const REPLAY_ATTEMPT_MS = { search: 20_000, detail: 12_000 } as const;
  *  load plus a keystroke (measured 15-60s) and an item page 4-10s; this is the floor that keeps a
  *  failed fast path from turning an answer into "Call deadline reached". */
 export const REPLAY_RESERVE_MS = 15_000;
-/** The smallest remaining call budget a replay of `kind` may start on: one full attempt plus the
- *  reserve the typed route needs. 35s for a search, 27s for a detail. `Session.replay` and both tool
- *  call sites read this one number, so the gate cannot drift from the bound it must leave room for. */
+/** A full attempt plus the reserve the typed route needs: 35s for a search, 27s for a detail. It is
+ *  the bound `Session.replay` applies to its own retry-and-reload decisions, and the start gate for a
+ *  detail replay -- preparing an item page is a separate surface that may reload, and `item_view`'s
+ *  default budget (90s) can afford the full attempt. */
+export const replayMinBudgetMs = (kind: 'search' | 'detail'): number => REPLAY_ATTEMPT_MS[kind] + REPLAY_RESERVE_MS;
 /** One second of fetch is the smallest attempt worth starting; below it there is nothing to sign. */
 export const REPLAY_MIN_FETCH_MS = 1_000;
 /**
@@ -53,14 +55,11 @@ export const REPLAY_MIN_FETCH_MS = 1_000;
  * typed route's 15-45s. The reserve is not dropped by lowering the entry gate: inside the attempt the
  * in-page fetch is still capped to `left - REPLAY_RESERVE_MS`, so the typed route keeps exactly its
  * 15 seconds and a full 20s attempt only happens on a call that can pay for it. A 30s query therefore
- * gets 15s of replay before the reserve begins, which is 5-15x the measured 1-3s answer.
- *
- * Detail keeps the larger gate: preparing an item page is a separate surface that may reload, and
- * `item_view`'s own default budget (90s) can afford it.
+ * gets 15s of replay before the reserve begins, which is 5-15x the measured 1-3s answer. Detail keeps
+ * the larger `replayMinBudgetMs` gate.
  */
 export const replayStartBudgetMs = (kind: 'search' | 'detail'): number =>
   kind === 'detail' ? replayMinBudgetMs(kind) : REPLAY_RESERVE_MS + REPLAY_MIN_FETCH_MS;
-export const replayMinBudgetMs = (kind: 'search' | 'detail'): number => REPLAY_ATTEMPT_MS[kind] + REPLAY_RESERVE_MS;
 
 /** The page's own search payload. A fresh object every call, including the nested ones: the payload is
  *  stringified to sign it, so a shared nested object would make one call's mutation another's
